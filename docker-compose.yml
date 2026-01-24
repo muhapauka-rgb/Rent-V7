@@ -1,0 +1,64 @@
+services:
+  db:
+    image: postgres:15
+    container_name: rent_db
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+    ports:
+      - "5433:5432"
+    volumes:
+      - rent_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  ocr-service:
+    build: ./ocr-service
+    container_name: rent_ocr
+    env_file: .env
+    ports:
+      - "8002:8000"
+    restart: unless-stopped
+
+  api:
+    build: ./api
+    container_name: rent_api
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Europe/Moscow}
+      # ВАЖНО: внутри docker-сети ходим по имени сервиса
+      OCR_URL: http://ocr-service:8000/recognize
+    ports:
+      - "8001:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      ocr-service:
+        condition: service_started
+    restart: unless-stopped
+
+  telegram-bot:
+    build: ./telegram-bot
+    container_name: rent_bot
+    env_file: .env
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+  web:
+    build: ./web
+    container_name: rent_web
+    ports:
+      - "8080:80"
+    depends_on:
+      api:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  rent_pg: {}
