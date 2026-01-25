@@ -126,7 +126,7 @@ def ensure_tables() -> None:
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS address TEXT NULL;"))
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS note TEXT NULL;"))
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS electric_expected INTEGER NOT NULL DEFAULT 3;"))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTAMPTZ NOT NULL DEFAULT now();"))
+        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
 
 
         # --- tariffs ---
@@ -1286,7 +1286,6 @@ def _set_month_extra_state(conn, apartment_id: int, ym: str, pending: bool, snap
         {"aid": apartment_id, "ym": ym, "p": bool(pending), "s": snapshot},
     )
 
-
 def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     """
     Возвращает:
@@ -1299,13 +1298,20 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     """
     ym = (ym or "").strip()
     if not is_ym(ym):
-        return {"is_complete_photos": False, "total_rub": None, "missing": ["invalid_ym"], "reason": "missing_photos", "electric_expected": 3, "extra_pending": False}
+        return {
+            "is_complete_photos": False,
+            "total_rub": None,
+            "missing": ["invalid_ym"],
+            "reason": "missing_photos",
+            "electric_expected": 3,
+            "extra_pending": False,
+        }
 
     electric_expected = _get_apartment_electric_expected(conn, apartment_id)
     extra_state = _get_month_extra_state(conn, apartment_id, ym)
     extra_pending = bool(extra_state.get("pending"))
 
-    # текущие показания
+    # текущие показания (ВАЖНО: вода хранится с meter_index=1)
     cur = conn.execute(
         text(
             "SELECT meter_type, meter_index, value "
@@ -1322,17 +1328,15 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         cur_map.setdefault(mt, {})[mi] = r["value"]
 
     missing: List[str] = []
-    if cur_map.get("cold", {}).get(0) is None:
+    if cur_map.get("cold", {}).get(1) is None:
         missing.append("cold")
-    if cur_map.get("hot", {}).get(0) is None:
+    if cur_map.get("hot", {}).get(1) is None:
         missing.append("hot")
     for i in range(1, electric_expected + 1):
         if cur_map.get("electric", {}).get(i) is None:
             missing.append(f"electric_{i}")
 
     is_complete_photos = len(missing) == 0
-
-    # если не хватает фото — сразу возвращаем
     if not is_complete_photos:
         return {
             "is_complete_photos": False,
@@ -1343,7 +1347,6 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
             "extra_pending": extra_pending,
         }
 
-    # если есть “лишние” электрические данные — блокируем расчёт до решения админа
     if extra_pending:
         return {
             "is_complete_photos": True,
@@ -1354,7 +1357,6 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
             "extra_pending": True,
         }
 
-    # прошлый месяц
     prev_ym = add_months(ym, -1)
     prev = conn.execute(
         text(
@@ -1371,23 +1373,19 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         mi = int(r["meter_index"] or 0)
         prev_map.setdefault(mt, {})[mi] = r["value"]
 
-    # тарифы (берём актуальные на этот месяц)
     tariff = effective_tariff_for_month(conn, ym)
 
-    # дельты
-    dc = safe_delta(cur_map["cold"].get(0), prev_map["cold"].get(0))
-    dh = safe_delta(cur_map["hot"].get(0), prev_map["hot"].get(0))
+    dc = safe_delta(cur_map["cold"].get(1), prev_map["cold"].get(1))
+    dh = safe_delta(cur_map["hot"].get(1), prev_map["hot"].get(1))
 
     # Водоотведение: если отдельного счётчика нет — считаем как ХВС+ГВС
     ds = safe_delta(
-        cur_map.get("sewer", {}).get(0),
-        prev_map.get("sewer", {}).get(0),
+        cur_map.get("sewer", {}).get(1),
+        prev_map.get("sewer", {}).get(1),
     )
     if ds is None:
         ds = (dc or 0) + (dh or 0)
 
-    # Электро: считаем только те индексы, которые “ожидаем”
-    # Тарифы: idx1->electric_t1, idx2->electric_t2, idx3->electric_t3 (если есть в БД)
     def elec_tariff(idx: int) -> float:
         base = float(tariff.get("electric") or 0)
         if idx == 1:
@@ -1409,25 +1407,22 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     rh = (dh or 0) * float(tariff.get("hot") or 0)
     rs = (ds or 0) * float(tariff.get("sewer") or 0)
 
-    # если прошлого месяца нет ни по одному счётчику — отдаём reason, но без падения
-    if prev_ym and prev is not None:
-        any_prev = (
-            prev_map["cold"].get(0) is not None
-            or prev_map["hot"].get(0) is not None
-            or any(prev_map["electric"].get(i) is not None for i in range(1, electric_expected + 1))
-        )
-        if not any_prev:
-            return {
-                "is_complete_photos": True,
-                "total_rub": None,
-                "missing": [],
-                "reason": "no_prev_month",
-                "electric_expected": electric_expected,
-                "extra_pending": False,
-            }
+    any_prev = (
+        prev_map["cold"].get(1) is not None
+        or prev_map["hot"].get(1) is not None
+        or any(prev_map["electric"].get(i) is not None for i in range(1, electric_expected + 1))
+    )
+    if not any_prev:
+        return {
+            "is_complete_photos": True,
+            "total_rub": None,
+            "missing": [],
+            "reason": "no_prev_month",
+            "electric_expected": electric_expected,
+            "extra_pending": False,
+        }
 
     total = rc + rh + rs + re_sum
-
     return {
         "is_complete_photos": True,
         "total_rub": round(total, 2),
@@ -1437,6 +1432,31 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         "extra_pending": False,
     }
 
+def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int, new_value: float) -> int:
+    """Пишем электро строго в заданный meter_index (1..3), без пересортировки по величине."""
+    try:
+        meter_index = int(meter_index)
+    except Exception:
+        return 0
+    meter_index = max(1, min(3, meter_index))
+
+    expected = _get_apartment_electric_expected(conn, apartment_id)
+
+    conn.execute(
+        text(
+            "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+            "VALUES(:aid,:ym,'electric',:idx,:val,'ocr',:ocr) "
+            "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+            " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+        ),
+        {"aid": int(apartment_id), "ym": ym, "idx": int(meter_index), "val": float(new_value), "ocr": float(new_value)},
+    )
+
+    # если прислали индекс “выше ожидания” (например ожидаем 1 фото, а пришел idx=2) — блокируем расчет до решения админа
+    if int(meter_index) > int(expected) and int(expected) < 3:
+        _set_month_extra_state(conn, int(apartment_id), str(ym), True, int(expected))
+
+    return int(meter_index)
 
 
 def _assign_and_write_electric_sorted(apartment_id: int, ym: str, new_value: float) -> int:
@@ -1788,10 +1808,49 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 diag["warnings"].append({"duplicate_check_failed": str(e)})
 
             if kind == "electric":
-                assigned_meter_index = _assign_and_write_electric_sorted(int(apartment_id), ym, float(value_float))
+                # Если клиент явно передал meter_index (бот/админ), пишем строго в этот индекс.
+                # Если meter_index не передан — оставляем авто-логику (sorted) для совместимости.
+                if raw_meter_index is not None:
+                    with engine.begin() as conn:
+                        assigned_meter_index = _write_electric_explicit(
+                            conn,
+                            int(apartment_id),
+                            ym,
+                            int(meter_index),
+                            float(value_float),
+                        )
+                else:
+                    assigned_meter_index = _assign_and_write_electric_sorted(
+                        int(apartment_id),
+                        ym,
+                        float(value_float),
+                    )
             else:
-
                 assigned_meter_index = 1
+                with engine.begin() as conn:
+                    conn.execute(
+                        text("""
+                            INSERT INTO meter_readings
+                                (apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+                            VALUES
+                                (:aid, :ym, :meter_type, 1, :value, 'ocr', :ocr_value)
+                            ON CONFLICT (apartment_id, ym, meter_type, meter_index)
+                            DO UPDATE SET
+                                value = EXCLUDED.value,
+                                source = 'ocr',
+                                ocr_value = EXCLUDED.ocr_value,
+                                updated_at = now()
+                        """),
+                        {
+                            "aid": int(apartment_id),
+                            "ym": ym,
+                            "meter_type": kind,
+                            "value": float(value_float),
+                            "ocr_value": float(value_float),
+                        },
+                    )
+
+
                 with engine.begin() as conn:
                     conn.execute(
                         text("""
@@ -2334,32 +2393,43 @@ def upsert_tariff(payload: TariffIn):
     if not ym_from:
         raise HTTPException(status_code=400, detail="month_from is required")
 
-    # electricity: if tier tariffs are provided, they override payload.electric
-    e1 = payload.electric_t1 if payload.electric_t1 is not None else payload.electric
+    # В таблице tariffs.electric NOT NULL, значит базовый тариф должен быть всегда
+    if payload.electric is None and payload.electric_t1 is None:
+        raise HTTPException(status_code=400, detail="electric or electric_t1 is required")
+
+    electric_base = payload.electric if payload.electric is not None else payload.electric_t1
+
+    # tier-тарифы: если передали — пишем их, иначе будут NULL и в расчетах возьмется base
+    e1 = payload.electric_t1 if payload.electric_t1 is not None else electric_base
     e2 = payload.electric_t2
     e3 = payload.electric_t3
+
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
 
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
-                INSERT INTO tariffs(ym_from, cold, hot, electric, electric_t1, electric_t2, electric_t3, sewer)
-                VALUES(:ym_from, :cold, :hot, :electric, :e1, :e2, :e3, :sewer)
-                ON CONFLICT(ym_from) DO UPDATE SET
+                INSERT INTO tariffs(month_from, cold, hot, electric, electric_t1, electric_t2, electric_t3, sewer, updated_at)
+                VALUES(:month_from, :cold, :hot, :electric, :e1, :e2, :e3, :sewer, now())
+                ON CONFLICT(month_from) DO UPDATE SET
                   cold=EXCLUDED.cold,
                   hot=EXCLUDED.hot,
                   electric=EXCLUDED.electric,
                   electric_t1=EXCLUDED.electric_t1,
                   electric_t2=EXCLUDED.electric_t2,
                   electric_t3=EXCLUDED.electric_t3,
-                  sewer=EXCLUDED.sewer
+                  sewer=EXCLUDED.sewer,
+                  updated_at=now()
                 """
             ),
             {
-                "ym_from": ym_from,
+                "month_from": ym_from,
                 "cold": float(payload.cold),
                 "hot": float(payload.hot),
-                "electric": float(payload.electric) if payload.electric is not None else None,
+                "electric": float(electric_base),
                 "e1": float(e1) if e1 is not None else None,
                 "e2": float(e2) if e2 is not None else None,
                 "e3": float(e3) if e3 is not None else None,
@@ -2367,6 +2437,7 @@ def upsert_tariff(payload: TariffIn):
             },
         )
     return {"ok": True}
+
 
 @app.get("/admin/ui/apartments/{apartment_id}/history")
 def ui_apartment_history(apartment_id: int):
