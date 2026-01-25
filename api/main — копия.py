@@ -4,7 +4,6 @@ from typing import Optional, Dict, Any, List, Literal, Tuple
 from fastapi.responses import JSONResponse
 import os
 import json
-import re
 import requests
 import hashlib
 from datetime import datetime
@@ -53,7 +52,7 @@ def ydisk_put(path: str, content: bytes) -> None:
         data=content,
         auth=ydisk_auth(),
         headers={"Content-Type": "application/octet-stream"},
-        timeout=60,
+        timeout=20,
     )
     if r.status_code not in (201, 204):
         raise RuntimeError(f"Upload failed {r.status_code}: {r.text}")
@@ -1267,60 +1266,6 @@ def ym_prev(ym: str) -> str:
     return f"{y:04d}-{m:02d}"
 
 
-# -------------------------
-# YM helpers (YYYY-MM)
-# -------------------------
-
-_YM_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
-
-def is_ym(ym: str) -> bool:
-    """Validate year-month string in format YYYY-MM."""
-    if ym is None:
-        return False
-    ym = str(ym).strip()
-    return bool(_YM_RE.match(ym))
-
-def add_months(ym: str, delta_months: int) -> str:
-    """Add delta months to YYYY-MM and return YYYY-MM."""
-    if not is_ym(ym):
-        return month_now()
-    y, m = map(int, ym.split("-"))
-    m0 = (y * 12 + (m - 1)) + int(delta_months)
-    y2 = m0 // 12
-    m2 = (m0 % 12) + 1
-    return f"{y2:04d}-{m2:02d}"
-
-def safe_delta(current: Optional[float], previous: Optional[float]) -> Optional[float]:
-    if current is None or previous is None:
-        return None
-    try:
-        return float(current) - float(previous)
-    except Exception:
-        return None
-
-def effective_tariff_for_month(conn, ym: str) -> dict:
-    """Return tariff dict for month. Falls back to the most recent earlier tariff, or defaults."""
-    t = _get_tariff_for_month(conn, ym)
-    if not isinstance(t, dict):
-        t = {}
-    return {
-        "water_cold": float(t.get("water_cold", 0) or 0),
-        "water_hot": float(t.get("water_hot", 0) or 0),
-        "sewer": float(t.get("sewer", 0) or 0),
-        "electric_t1": float(t.get("electric_t1", 0) or 0),
-        "electric_t2": float(t.get("electric_t2", 0) or 0),
-        "electric_t3": float(t.get("electric_t3", 0) or 0),
-    }
-
-def find_apartment_for_chat(conn, chat_id: int) -> Optional[dict]:
-    """Return apartment dict bound to chat_id, or None."""
-    try:
-        return find_apartment_by_chat(conn, int(chat_id))
-    except Exception:
-        return None
-
-
-
 def _get_tariff_for_month(conn, ym: str) -> Optional[Dict[str, float]]:
     row = conn.execute(
         text("""
@@ -2064,6 +2009,20 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 # -----------------------
 
 @app.get("/bot/chats/{chat_id}/bill")
+import re
+
+_YM_RE = re.compile(r"^\d{4}-(0[1-9]|1[0-2])$")
+
+def is_ym(value: str) -> bool:
+    """
+    Validate year-month string in format YYYY-MM.
+    Example: 2026-01
+    """
+    if value is None:
+        return False
+    s = str(value).strip()
+    return bool(_YM_RE.match(s))
+
 def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
     """Используется ботом для проверки “что ещё нужно” и/или выдачи суммы после всех фото.
     Не привязано к UI, работает без фронтенда.
@@ -2083,151 +2042,148 @@ def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
 
 
 
-# -------------------------
-# BOT endpoints (manual + duplicate resolution)
-# -------------------------
+# -----------------------
+# Bot: manual entry + duplicate resolve
+# -----------------------
 
-class BotManualReadingIn(BaseModel):
+class ManualReadingIn(BaseModel):
     chat_id: str
     ym: str
-    meter_type: str
+    meter_type: Literal["cold", "hot", "electric"]
     meter_index: int = 1
     value: float
 
-class BotDuplicateResolveIn(BaseModel):
-    photo_event_id: int
-    action: str  # "ok" | "repeat"
-
-
 @app.post("/bot/manual-reading")
-def bot_manual_reading(payload: BotManualReadingIn):
-    """Write a meter reading manually for the chat's bound apartment."""
+def bot_manual_reading(payload: ManualReadingIn):
+    """Ручной ввод показаний из Telegram.
+    Пишем source='manual'. Возвращаем обновлённый bill.
+    """
     if not db_ready():
-        raise HTTPException(status_code=503, detail="DB not ready")
+        raise HTTPException(status_code=503, detail="db disabled")
 
     chat_id = str(payload.chat_id).strip()
-    ym = str(payload.ym).strip()
-    meter_type = str(payload.meter_type).strip()
-    try:
-        meter_index = int(payload.meter_index or 1)
-    except Exception:
-        meter_index = 1
-    meter_index = max(1, min(3, meter_index))
-
+    ym = str(payload.ym).strip() or current_ym()
     if not is_ym(ym):
-        raise HTTPException(status_code=400, detail="Invalid ym, expected YYYY-MM")
+        raise HTTPException(status_code=400, detail="ym must be YYYY-MM")
 
-    try:
-        value = float(payload.value)
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid value")
+    meter_type = str(payload.meter_type).strip()
+    meter_index = int(payload.meter_index or 1)
+    value = float(payload.value)
 
-    # Normalize meter_type
-    if meter_type in ("electric_t1", "electric_1", "t1"):
-        meter_type = "electric"
+    if value <= 0:
+        raise HTTPException(status_code=400, detail="value must be > 0")
+
+    if meter_type in ("cold", "hot"):
         meter_index = 1
-    elif meter_type in ("electric_t2", "electric_2", "t2"):
-        meter_type = "electric"
-        meter_index = 2
-    elif meter_type in ("electric_t3", "electric_3", "t3"):
-        meter_type = "electric"
-        meter_index = 3
-
-    if meter_type not in ("cold", "hot", "electric", "sewer"):
-        raise HTTPException(status_code=400, detail="Invalid meter_type")
+    elif meter_type == "electric":
+        meter_index = max(1, min(3, meter_index))
+    else:
+        raise HTTPException(status_code=400, detail="meter_type invalid")
 
     with engine.begin() as conn:
-        apt_id = find_apartment_by_chat(chat_id)
-        if not apt_id:
-            return {"ok": False, "reason": "not_bound", "bill": None}
+        apt = find_apartment_for_chat(conn, chat_id)
+        if not apt:
+            return {"ok": False, "reason": "not_bound", "ym": ym}
 
-        add_meter_reading(conn, int(apt_id), ym, meter_type, meter_index, value)
+        aid = int(apt["id"])
 
-        # mark source as manual (best effort)
-        try:
-            conn.execute(
-                text("""
-                    UPDATE meter_readings
-                    SET source='manual', updated_at=NOW()
-                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:t AND meter_index=:i
-                """),
-                {"aid": int(apt_id), "ym": ym, "t": meter_type, "i": int(meter_index)},
-            )
-        except Exception:
-            pass
+        conn.execute(
+            text("""
+                INSERT INTO meter_readings
+                    (apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+                VALUES
+                    (:aid, :ym, :mt, :mi, :val, 'manual', NULL)
+                ON CONFLICT (apartment_id, ym, meter_type, meter_index)
+                DO UPDATE SET
+                    value = EXCLUDED.value,
+                    source = 'manual',
+                    ocr_value = NULL,
+                    updated_at = now()
+            """),
+            {"aid": aid, "ym": ym, "mt": meter_type, "mi": meter_index, "val": value},
+        )
 
-        bill = _calc_month_bill(conn, int(chat_id), ym)
-        return {"ok": True, "bill": bill}
+        bill = _calc_month_bill(conn, aid, ym)
 
+    return {"ok": True, "apartment_id": aid, "ym": ym, "bill": bill}
+
+
+class DuplicateResolveIn(BaseModel):
+    photo_event_id: int
+    action: Literal["ok", "repeat"]
 
 @app.post("/bot/duplicate/resolve")
-def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
-    """Resolve a possible duplicate warning coming from /events/photo."""
+def bot_duplicate_resolve(payload: DuplicateResolveIn):
+    """Решение по возможному дублю: ok = оставить, repeat = откатить запись и попросить другое фото."""
     if not db_ready():
-        raise HTTPException(status_code=503, detail="DB not ready")
-
-    action = str(payload.action or "").strip().lower()
-    if action not in ("ok", "repeat"):
-        raise HTTPException(status_code=400, detail="Invalid action")
+        raise HTTPException(status_code=503, detail="db disabled")
 
     peid = int(payload.photo_event_id)
+    action = str(payload.action)
 
     with engine.begin() as conn:
         row = conn.execute(
             text("""
-                SELECT id, chat_id, apartment_id, ym, meter_type, meter_index
+                SELECT id, apartment_id, ym, meter_kind, meter_index, meter_value
                 FROM photo_events
                 WHERE id=:id
-                LIMIT 1
             """),
             {"id": peid},
-        ).fetchone()
+        ).mappings().first()
 
         if not row:
-            return {"ok": False, "reason": "photo_event_not_found", "bill": None}
+            raise HTTPException(status_code=404, detail="photo_event not found")
 
-        chat_id = int(row[1])
-        apartment_id = int(row[2])
-        ym = str(row[3])
-        meter_type = str(row[4] or "")
-        meter_index = int(row[5] or 1)
+        aid = row.get("apartment_id")
+        ym = row.get("ym") or month_now()
+        mt = row.get("meter_kind")
+        mi = int(row.get("meter_index") or 1)
+        mv = row.get("meter_value")
 
-        if action == "repeat":
-            # mark the reading as missing again (do not delete the row to keep uniqueness)
+        if not aid or not mt or mv is None:
+            # Нечего откатывать — просто помечаем решение
             conn.execute(
                 text("""
-                    UPDATE meter_readings
-                    SET value=NULL, source='duplicate_repeat', updated_at=NOW()
-                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:t AND meter_index=:i
+                    UPDATE photo_events
+                    SET stage=:stage, stage_updated_at=now()
+                    WHERE id=:id
                 """),
-                {"aid": apartment_id, "ym": ym, "t": meter_type, "i": meter_index},
+                {"id": peid, "stage": "duplicate_ok" if action == "ok" else "duplicate_repeat"},
             )
-            try:
-                conn.execute(
-                    text("""
-                        UPDATE photo_events
-                        SET status='dup_repeat', updated_at=NOW()
-                        WHERE id=:id
-                    """),
-                    {"id": peid},
-                )
-            except Exception:
-                pass
-        else:
-            try:
-                conn.execute(
-                    text("""
-                        UPDATE photo_events
-                        SET status='dup_ok', updated_at=NOW()
-                        WHERE id=:id
-                    """),
-                    {"id": peid},
-                )
-            except Exception:
-                pass
+            bill = _calc_month_bill(conn, int(aid), str(ym)) if aid else None
+            return {"ok": True, "bill": bill}
 
-        bill = _calc_month_bill(conn, chat_id, ym)
-        return {"ok": True, "bill": bill}
+        if action == "repeat":
+            # Откатить запись показаний, сделанную этим событием (самый безопасный вариант: удалить текущую запись)
+            conn.execute(
+                text("""
+                    DELETE FROM meter_readings
+                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                """),
+                {"aid": int(aid), "ym": str(ym), "mt": str(mt), "mi": int(mi)},
+            )
+            conn.execute(
+                text("""
+                    UPDATE photo_events
+                    SET meter_written=false, stage='duplicate_repeat', stage_updated_at=now()
+                    WHERE id=:id
+                """),
+                {"id": peid},
+            )
+        else:
+            conn.execute(
+                text("""
+                    UPDATE photo_events
+                    SET stage='duplicate_ok', stage_updated_at=now()
+                    WHERE id=:id
+                """),
+                {"id": peid},
+            )
+
+        bill = _calc_month_bill(conn, int(aid), str(ym))
+
+    return {"ok": True, "bill": bill}
+
 
 
 
