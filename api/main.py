@@ -196,6 +196,8 @@ def ensure_tables() -> None:
         conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_pending BOOLEAN NOT NULL DEFAULT FALSE"))
         conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_expected_snapshot INTEGER"))
         conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_resolved_at TIMESTAMPTZ"))
+        conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'open'"))
+        conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS closed_at TIMESTAMPTZ"))
 
 
         # --- meter_readings (единая схема) ---
@@ -238,7 +240,6 @@ def ensure_tables() -> None:
                 status TEXT NOT NULL DEFAULT 'unassigned',
                 apartment_id BIGINT NULL,
                 ocr_json JSONB NULL,
-                ym TEXT NULL,
 
                 meter_index INTEGER NOT NULL DEFAULT 1,
 
@@ -257,7 +258,6 @@ def ensure_tables() -> None:
         """))
 
         # Soft migrations
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ym TEXT NULL;"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_index INTEGER NOT NULL DEFAULT 1;"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'received';"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
@@ -1023,6 +1023,38 @@ def _upsert_month_statuses(apartment_id: int, ym: str, patch: UIStatusesPatch) -
 
 
 @app.get("/admin/ui/apartments")
+def _is_month_closed(conn, apartment_id: int, ym: str) -> bool:
+    try:
+        row = conn.execute(
+            text("SELECT status FROM apartment_month_statuses WHERE apartment_id=:aid AND ym=:ym"),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        ).fetchone()
+        if not row:
+            return False
+        st = (row[0] or "").strip().lower()
+        return st == "completed"
+    except Exception:
+        return False
+
+
+def _close_month(conn, apartment_id: int, ym: str) -> None:
+    # Помечаем месяц как завершённый: больше не принимаем фото/значения за этот месяц
+    conn.execute(
+        text(
+            '''
+            INSERT INTO apartment_month_statuses (apartment_id, ym, rent_paid, meters_photo, meters_paid, status, closed_at)
+            VALUES (:aid, :ym, false, true, false, 'completed', now())
+            ON CONFLICT (apartment_id, ym)
+            DO UPDATE SET
+                meters_photo = true,
+                status = 'completed',
+                closed_at = now(),
+                updated_at = now()
+            '''
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    )
+
 def ui_list_apartments(ym: Optional[str] = None):
     if not db_ready():
         raise HTTPException(status_code=503, detail="db_disabled")
@@ -1518,8 +1550,6 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
         return 0
     meter_index = max(1, min(3, meter_index))
 
-    ym = month_now()
-
     expected = _get_apartment_electric_expected(conn, apartment_id)
 
     conn.execute(
@@ -1680,6 +1710,8 @@ def _assign_and_write_electric_sorted(apartment_id: int, ym: str, new_value: flo
 async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
 
+    duplicate_detected = False
+
     form = await request.form()
     chat_id = form.get("chat_id") or "unknown"
     telegram_username = form.get("telegram_username") or None
@@ -1693,7 +1725,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         diag["warnings"].append({"invalid_meter_index": str(raw_meter_index)})
 
     meter_index = max(1, min(3, meter_index))
-
     ym = month_now()
 
     if file is None:
@@ -1727,6 +1758,21 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     kind = _ocr_to_kind(ocr_type)
     value_float = _parse_reading_to_float(ocr_reading)
+    ocr_failed = False
+    if kind is None or value_float is None:
+        ocr_failed = True
+    else:
+        try:
+            if float(value_float) <= 0:
+                ocr_failed = True
+                value_float = None
+        except Exception:
+            ocr_failed = True
+            value_float = None
+
+    if ocr_failed:
+        diag["warnings"].append({"ocr_unreadable": True})
+
 
     if kind != "electric":
         meter_index = 1
@@ -1746,6 +1792,24 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 bind_chat(str(chat_id), int(apartment_id))
         except Exception as e:
             diag["errors"].append({"apartment_match_error": str(e)})
+
+    # 2.5) если месяц уже закрыт — не принимаем новые фото/значения
+    if db_ready() and apartment_id:
+        try:
+            with engine.begin() as conn:
+                if _is_month_closed(conn, int(apartment_id), ym):
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "status": "ok",
+                            "ok": False,
+                            "reason": "month_closed",
+                            "ym": ym,
+                            "apartment_id": apartment_id,
+                        },
+                    )
+        except Exception as e:
+            diag["warnings"].append({"month_closed_check_failed": str(e)})
 
     # 3) upload to ydisk
     ydisk_path = None
@@ -1774,6 +1838,9 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         status = "ydisk_error"
         stage = "received"
 
+    if ocr_failed:
+        stage = "ocr_failed"
+
     # 5) insert photo_event
     photo_event_id = None
     if db_ready():
@@ -1787,7 +1854,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         INSERT INTO photo_events
                         (
                             chat_id, telegram_username, phone, original_filename, ydisk_path,
-                            status, apartment_id, ocr_json, ym,
+                            status, apartment_id, ocr_json,
                             meter_index,
                             stage, stage_updated_at,
                             file_sha256, ocr_type, ocr_reading,
@@ -1799,7 +1866,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             :chat_id, :username, :phone, :orig, :path,
                             :status, :apartment_id,
                             CASE WHEN :ocr_json IS NULL THEN NULL ELSE CAST(:ocr_json AS JSONB) END,
-                            :ym,
                             :meter_index,
                             :stage, now(),
                             :file_sha256, :ocr_type, :ocr_reading,
@@ -1825,7 +1891,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         "meter_kind": (str(kind) if kind is not None else None),
                         "meter_value": (float(value_float) if value_float is not None else None),
                         "diag_json": diag_json_str,
-                        "ym": str(ym),
                     },
                 ).scalar_one()
 
@@ -1834,8 +1899,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 6) write meter_readings + statuses
     wrote_meter = False
+    ym = month_now()
     assigned_meter_index = int(meter_index)
-    has_possible_duplicate = False
 
     if db_ready() and apartment_id and kind and (value_float is not None):
         try:
@@ -1911,7 +1976,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     ).fetchone()
 
                 if row:
-                    has_possible_duplicate = True
                     existing_mt = str(row[0])
                     existing_mi = int(row[1])
                     diag["warnings"].append(
@@ -1926,6 +1990,17 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             }
                         }
                     )
+            
+
+                    duplicate_detected = True
+                    try:
+                        # помечаем событие как ожидающее решения по дублю
+                        conn.execute(
+                            text("UPDATE photo_events SET stage='duplicate_pending', stage_updated_at=now() WHERE id=:id"),
+                            {"id": int(photo_event_id)},
+                        )
+                    except Exception:
+                        pass
             except Exception as e:
                 diag["warnings"].append({"duplicate_check_failed": str(e)})
 
@@ -1963,7 +2038,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     meter_index = :meter_index,
                                     meter_kind = COALESCE(meter_kind, :meter_kind),
                                     meter_value = COALESCE(meter_value, :meter_value),
-                                    stage = :stage,
+                                    stage = 'meter_written',
                                     stage_updated_at = now(),
                                     diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
                                 WHERE id = :id
@@ -1974,7 +2049,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 "meter_kind": str(kind),
                                 "meter_value": float(value_float),
                                 "diag_json": diag_json_str,
-                                "stage": ("duplicate_pending" if has_possible_duplicate else "meter_written"),
                             },
                         )
                 except Exception as e:
@@ -1986,10 +2060,21 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 7) bill (для бота и web)
     bill = None
+    month_closed = False
     if db_ready() and apartment_id:
         try:
             with engine.begin() as conn:
                 bill = _calc_month_bill(conn, int(apartment_id), ym)
+                # если все показания получены и нет блокировок — закрываем месяц (больше не принимаем данные за этот ym)
+                if (
+                    isinstance(bill, dict)
+                    and bool(bill.get("is_complete_photos"))
+                    and str(bill.get("reason")) in ("ok", "no_prev_month")
+                    and not bool(bill.get("extra_pending"))
+                    and not bool(ocr_failed)
+                ):
+                    _close_month(conn, int(apartment_id), ym)
+                    month_closed = True
         except Exception as e:
             diag["warnings"].append({"bill_calc_failed": str(e)})
 
@@ -1997,6 +2082,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         status_code=200,
         content={
             "status": "ok",
+            "ok": True,
+            "reason": ("ocr_unreadable" if ocr_failed else None),
+            "ocr_failed": bool(ocr_failed),
+            "month_closed": bool(month_closed),
             "chat_id": str(chat_id),
             "telegram_username": telegram_username,
             "phone": phone,
@@ -2018,6 +2107,223 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 # Dashboard: apartments list
 # -----------------------
 
+class ManualReadingIn(BaseModel):
+    chat_id: str = Field(..., description="Telegram chat id")
+    ym: Optional[str] = Field(None, description="YYYY-MM (если не передан — текущий месяц)")
+    meter_type: Literal["cold", "hot", "electric", "sewer"] = Field(..., description="Тип счётчика")
+    meter_index: int = Field(1, description="Индекс для electricity (1..3); для воды всегда 1")
+    value: float = Field(..., description="Показание (положительное число)")
+
+
+@app.post("/bot/manual-reading")
+def bot_manual_reading(payload: ManualReadingIn):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_not_ready")
+
+    ensure_tables()
+
+    chat_id = (payload.chat_id or "").strip()
+    ym = (payload.ym or month_now()).strip()
+
+    if not is_ym(ym):
+        raise HTTPException(status_code=400, detail="invalid_ym")
+
+    mt = str(payload.meter_type).strip().lower()
+    mi = int(payload.meter_index or 1)
+    if mt != "electric":
+        mi = 1
+    else:
+        mi = max(1, min(3, mi))
+
+    try:
+        val = float(payload.value)
+    except Exception:
+        raise HTTPException(status_code=400, detail="invalid_value")
+    if val <= 0:
+        raise HTTPException(status_code=400, detail="invalid_value")
+
+    with engine.begin() as conn:
+        # 1) resolve apartment by chat_id
+        row = conn.execute(
+            text("SELECT apartment_id FROM chat_bindings WHERE chat_id=:cid"),
+            {"cid": str(chat_id)},
+        ).fetchone()
+        if not row or row[0] is None:
+            return {"ok": False, "reason": "not_bound", "ym": ym}
+
+        apartment_id = int(row[0])
+
+        # 2) месяц закрыт?
+        if _is_month_closed(conn, apartment_id, ym):
+            return {"ok": False, "reason": "month_closed", "ym": ym, "apartment_id": apartment_id}
+
+        # 3) сохранить ocr_value если раньше было распознано, а теперь вводим вручную
+        prev = conn.execute(
+            text(
+                "SELECT value, source, ocr_value FROM meter_readings "
+                "WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi"
+            ),
+            {"aid": apartment_id, "ym": ym, "mt": mt, "mi": mi},
+        ).fetchone()
+
+        ocr_val = None
+        if prev:
+            prev_value = prev[0]
+            prev_source = prev[1]
+            prev_ocr = prev[2]
+            if prev_ocr is not None:
+                ocr_val = float(prev_ocr)
+            elif str(prev_source) == "ocr" and prev_value is not None:
+                ocr_val = float(prev_value)
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO meter_readings (apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+                VALUES (:aid, :ym, :mt, :mi, :val, 'manual', :ocr_val)
+                ON CONFLICT (apartment_id, ym, meter_type, meter_index)
+                DO UPDATE SET
+                    value = EXCLUDED.value,
+                    source = 'manual',
+                    ocr_value = COALESCE(EXCLUDED.ocr_value, meter_readings.ocr_value),
+                    updated_at = now()
+                """
+            ),
+            {"aid": apartment_id, "ym": ym, "mt": mt, "mi": mi, "val": val, "ocr_val": ocr_val},
+        )
+
+        # 4) пересчитать счёт и при необходимости закрыть месяц
+        bill = _calc_month_bill(conn, apartment_id, ym)
+        month_closed = False
+        if (
+            isinstance(bill, dict)
+            and bool(bill.get("is_complete_photos"))
+            and str(bill.get("reason")) in ("ok", "no_prev_month")
+            and not bool(bill.get("extra_pending"))
+        ):
+            _close_month(conn, apartment_id, ym)
+            month_closed = True
+
+        return {
+            "ok": True,
+            "ym": ym,
+            "apartment_id": apartment_id,
+            "meter_type": mt,
+            "meter_index": mi,
+            "value": val,
+            "month_closed": month_closed,
+            "bill": bill,
+        }
+
+
+class DuplicateResolveIn(BaseModel):
+    photo_event_id: int = Field(..., description="ID photo_events")
+    action: Literal["ok", "repeat"] = Field(..., description="ok=оставить, repeat=отклонить как повтор")
+
+
+@app.post("/bot/duplicate/resolve")
+def bot_duplicate_resolve(payload: DuplicateResolveIn):
+    """Решение по дублю, которое нажимает арендатор в Telegram."""
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_not_ready")
+
+    ensure_tables()
+
+    peid = int(payload.photo_event_id)
+    action = str(payload.action or "").strip().lower()
+    if action not in ("ok", "repeat"):
+        raise HTTPException(status_code=400, detail="invalid_action")
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                "SELECT id, apartment_id, ym, meter_kind, meter_index, meter_value, meter_written "
+                "FROM photo_events WHERE id=:id"
+            ),
+            {"id": peid},
+        ).fetchone()
+
+        if not row:
+            return {"ok": False, "reason": "not_found"}
+
+        apartment_id = row[1]
+        ym = row[2]
+        meter_kind = row[3]
+        meter_index = row[4]
+        meter_value = row[5]
+        meter_written = bool(row[6])
+
+        if apartment_id is None or not ym:
+            return {"ok": False, "reason": "not_bound", "photo_event_id": peid}
+
+        apartment_id = int(apartment_id)
+        ym = str(ym)
+        meter_kind = (str(meter_kind) if meter_kind is not None else None)
+        meter_index = int(meter_index or 1)
+
+        # 1) обновляем stage
+        new_stage = "duplicate_confirmed" if action == "ok" else "duplicate_rejected"
+        conn.execute(
+            text("UPDATE photo_events SET stage=:st, stage_updated_at=now() WHERE id=:id"),
+            {"st": new_stage, "id": peid},
+        )
+
+        deleted = 0
+        # 2) если repeat — пробуем безопасно удалить показание (только если оно все ещё совпадает)
+        if action == "repeat" and meter_written and meter_kind and meter_value is not None:
+            mt = str(meter_kind)
+            mi = 1 if mt != "electric" else max(1, min(3, int(meter_index)))
+            try:
+                mv = float(meter_value)
+            except Exception:
+                mv = None
+
+            if mv is not None:
+                if _is_month_closed(conn, apartment_id, ym):
+                    # месяц закрыт — не трогаем данные, просто возвращаем ответ
+                    bill = _calc_month_bill(conn, apartment_id, ym)
+                    return {
+                        "ok": True,
+                        "reason": "month_closed",
+                        "photo_event_id": peid,
+                        "ym": ym,
+                        "apartment_id": apartment_id,
+                        "stage": new_stage,
+                        "bill": bill,
+                    }
+
+                deleted = conn.execute(
+                    text(
+                        "DELETE FROM meter_readings "
+                        "WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi "
+                        "AND source='ocr' AND value=:val"
+                    ),
+                    {"aid": apartment_id, "ym": ym, "mt": mt, "mi": mi, "val": mv},
+                ).rowcount or 0
+
+        # 3) пересчитать счёт и при необходимости закрыть месяц
+        bill = _calc_month_bill(conn, apartment_id, ym)
+        month_closed = False
+        if (
+            isinstance(bill, dict)
+            and bool(bill.get("is_complete_photos"))
+            and str(bill.get("reason")) in ("ok", "no_prev_month")
+            and not bool(bill.get("extra_pending"))
+        ):
+            _close_month(conn, apartment_id, ym)
+            month_closed = True
+
+        return {
+            "ok": True,
+            "photo_event_id": peid,
+            "ym": ym,
+            "apartment_id": apartment_id,
+            "stage": new_stage,
+            "deleted_reading": int(deleted),
+            "month_closed": bool(month_closed),
+            "bill": bill,
+        }
+
 @app.get("/bot/chats/{chat_id}/bill")
 def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
     """Используется ботом для проверки “что ещё нужно” и/или выдачи суммы после всех фото.
@@ -2035,114 +2341,6 @@ def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
 
         bill = _calc_month_bill(conn, int(apt["id"]), ym)
         return {"ok": True, "apartment_id": int(apt["id"]), "ym": ym, "bill": bill}
-
-class DuplicateResolveRequest(BaseModel):
-    photo_event_id: int = Field(..., ge=1)
-    action: Literal["ok", "repeat"]
-
-
-@app.post("/bot/duplicate/resolve")
-def bot_duplicate_resolve(payload: DuplicateResolveRequest):
-    """Решение по “возможному дублю” от арендатора из Telegram.
-    ok     -> пользователь подтвердил, что это разные счётчики (оставляем данные)
-    repeat -> пользователь подтвердил, что это повтор (пытаемся откатить последнее значение)
-    """
-    if not db_ready():
-        raise HTTPException(status_code=500, detail="DB is not configured")
-    ensure_tables()
-
-    peid = int(payload.photo_event_id)
-    action = str(payload.action).strip().lower()
-
-    with engine.begin() as conn:
-        ev = conn.execute(
-            text("""
-                SELECT id, apartment_id, ym, meter_kind, meter_index, meter_value, meter_written, stage
-                FROM photo_events
-                WHERE id = :id
-            """),
-            {"id": peid},
-        ).mappings().fetchone()
-
-        if not ev:
-            raise HTTPException(status_code=404, detail="photo_event_not_found")
-
-        apartment_id = ev.get("apartment_id")
-        ym = (ev.get("ym") or current_ym()).strip()
-        meter_kind = ev.get("meter_kind")
-        meter_index = ev.get("meter_index")
-        meter_value = ev.get("meter_value")
-        meter_written = bool(ev.get("meter_written"))
-
-        if not apartment_id:
-            raise HTTPException(status_code=409, detail="photo_event_not_assigned")
-        if not meter_written or not meter_kind or meter_value is None:
-            raise HTTPException(status_code=409, detail="photo_event_has_no_written_meter")
-        if not is_ym(ym):
-            raise HTTPException(status_code=400, detail="bad_ym")
-
-        # обновляем stage по решению пользователя
-        new_stage = "duplicate_confirmed" if action == "ok" else "duplicate_rejected"
-        conn.execute(
-            text("""
-                UPDATE photo_events
-                SET stage = :stage, stage_updated_at = now()
-                WHERE id = :id
-            """),
-            {"id": peid, "stage": new_stage},
-        )
-
-        deleted = 0
-        meter_deleted = False
-        delete_reason = None
-
-        if action == "repeat":
-            # Пытаемся удалить “сомнительное” значение, но только если оно всё ещё совпадает с тем,
-            # что было записано из этого фото (защита от удаления нового значения).
-            tol = 0.001
-            cur = conn.execute(
-                text("""
-                    SELECT value
-                    FROM meter_readings
-                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
-                """),
-                {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_kind), "mi": int(meter_index)},
-            ).fetchone()
-
-            if cur is not None:
-                cur_val = float(cur[0])
-                if abs(cur_val - float(meter_value)) <= tol:
-                    res = conn.execute(
-                        text("""
-                            DELETE FROM meter_readings
-                            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
-                        """),
-                        {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_kind), "mi": int(meter_index)},
-                    )
-                    deleted = int(getattr(res, "rowcount", 0) or 0)
-                    meter_deleted = deleted > 0
-                else:
-                    delete_reason = "meter_value_changed_after_photo"
-            else:
-                delete_reason = "meter_row_not_found"
-
-        bill = _calc_month_bill(conn, int(apartment_id), str(ym))
-
-        out = {
-            "ok": True,
-            "photo_event_id": peid,
-            "apartment_id": int(apartment_id),
-            "ym": str(ym),
-            "action": action,
-            "stage": new_stage,
-            "meter_deleted": bool(meter_deleted),
-            "deleted_rows": int(deleted),
-            "delete_reason": delete_reason,
-            "bill": bill,
-        }
-        return out
-
-
 
 
 
@@ -2775,8 +2973,6 @@ def add_meter_reading(apartment_id: int, payload: dict = Body(...)):
         meter_index = 1
 
     meter_index = max(1, min(3, meter_index))
-
-    ym = month_now()
 
     if meter_type in {"cold", "hot"}:
         meter_index = 1

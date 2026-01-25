@@ -36,6 +36,12 @@ DUP_PENDING: dict[int, dict] = {}
 # чтобы не отправлять сумму, пока человек не нажал кнопку (chat_id, ym)
 DUP_PENDING_MONTH: set[tuple[int, str]] = set()
 
+# ручной ввод:
+# chat_id -> {"ym": str, "code": str}  (ждём число)
+MANUAL_AWAIT_VALUE: dict[int, dict] = {}
+# chat_id -> {"ym": str}  (ждём выбор типа из missing)
+MANUAL_AWAIT_PICK: dict[int, dict] = {}
+
 
 def _kb_main() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
@@ -52,20 +58,43 @@ def _kb_main() -> ReplyKeyboardMarkup:
 def _kb_duplicate(photo_event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Это разные счётчики (оставить)",
-                    callback_data=f"dup_ok|{photo_event_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Это повтор (пришлю другое фото)",
-                    callback_data=f"dup_repeat|{photo_event_id}",
-                ),
-            ],
+            [InlineKeyboardButton(text="Это разные счётчики (оставить)", callback_data=f"dup_ok|{photo_event_id}")],
+            [InlineKeyboardButton(text="Это повтор (пришлю другое фото)", callback_data=f"dup_repeat|{photo_event_id}")],
         ]
     )
+
+
+def _kb_manual_start(ym: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data=f"mstart|{ym}")],
+        ]
+    )
+
+
+def _kb_manual_pick(ym: str, missing: list[str]) -> InlineKeyboardMarkup:
+    mapping = {
+        "cold": "ХВС",
+        "hot": "ГВС",
+        "electric_1": "Электро T1",
+        "electric_2": "Электро T2",
+        "electric_3": "Электро T3",
+        "electric_t1": "Электро T1",
+        "electric_t2": "Электро T2",
+        "electric_t3": "Электро T3",
+        "sewer": "Водоотведение",
+    }
+    rows = []
+    used = set()
+    for code in (missing or []):
+        code = str(code)
+        if code in used:
+            continue
+        used.add(code)
+        title = mapping.get(code, code)
+        rows.append([InlineKeyboardButton(text=title, callback_data=f"mpick|{ym}|{code}")])
+    rows.append([InlineKeyboardButton(text="Отмена", callback_data="mcancel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _get_meter_index(chat_id: int) -> int:
@@ -137,6 +166,37 @@ def _missing_to_text(missing: list[str]) -> str:
     return ", ".join(out)
 
 
+def _parse_number(text: str) -> float | None:
+    if text is None:
+        return None
+    s = str(text).strip().replace(",", ".")
+    s = s.replace(" ", "")
+    try:
+        v = float(s)
+        if v <= 0:
+            return None
+        return v
+    except Exception:
+        return None
+
+
+def _code_to_manual_payload(code: str) -> tuple[str, int] | None:
+    code = str(code).strip().lower()
+    if code == "cold":
+        return ("cold", 1)
+    if code == "hot":
+        return ("hot", 1)
+    if code == "sewer":
+        return ("sewer", 1)
+    if code in ("electric_1", "electric_t1"):
+        return ("electric", 1)
+    if code in ("electric_2", "electric_t2"):
+        return ("electric", 2)
+    if code in ("electric_3", "electric_t3"):
+        return ("electric", 3)
+    return None
+
+
 async def _fetch_bill(chat_id: int, ym: str) -> dict | None:
     url = f"{API_BASE}/bot/chats/{chat_id}/bill"
     try:
@@ -152,9 +212,30 @@ async def _fetch_bill(chat_id: int, ym: str) -> dict | None:
 async def _resolve_duplicate(photo_event_id: int, action: str) -> dict | None:
     url = f"{API_BASE}/bot/duplicate/resolve"
     try:
+        resp = requests.post(url, json={"photo_event_id": int(photo_event_id), "action": str(action)}, timeout=20)
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
+async def _post_manual_reading(chat_id: int, ym: str, code: str, value: float) -> dict | None:
+    mapped = _code_to_manual_payload(code)
+    if not mapped:
+        return {"ok": False, "reason": "bad_code"}
+    meter_type, meter_index = mapped
+    url = f"{API_BASE}/bot/manual-reading"
+    try:
         resp = requests.post(
             url,
-            json={"photo_event_id": int(photo_event_id), "action": str(action)},
+            json={
+                "chat_id": str(chat_id),
+                "ym": str(ym),
+                "meter_type": str(meter_type),
+                "meter_index": int(meter_index),
+                "value": float(value),
+            },
             timeout=20,
         )
         if resp.status_code != 200:
@@ -162,6 +243,10 @@ async def _resolve_duplicate(photo_event_id: int, action: str) -> dict | None:
         return resp.json()
     except Exception:
         return None
+
+
+def _final_bill_text(ym: str, total_rub: float) -> str:
+    return f"Спасибо за фото, все данные учтены. Сумма оплаты по счётчикам за {ym}: {float(total_rub):.2f} ₽"
 
 
 def _try_send_bill_if_ready(chat_id: int, ym: str, bill: dict):
@@ -188,7 +273,7 @@ def _try_send_bill_if_ready(chat_id: int, ym: str, bill: dict):
             return None
         SENT_BILL.add(key)
         PENDING_NOTICE.discard(key)
-        return (f"Готово. Сумма за {ym}: {float(total_rub):.2f} ₽", None)
+        return (_final_bill_text(ym, float(total_rub)), None)
 
     return None
 
@@ -202,12 +287,13 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
 
     async def _job():
         try:
-            # таймер напоминания = 40 секунд
             await asyncio.sleep(40)
 
             if key in SENT_BILL:
                 return
             if key in DUP_PENDING_MONTH:
+                return
+            if chat_id in MANUAL_AWAIT_VALUE or chat_id in MANUAL_AWAIT_PICK:
                 return
 
             bill = await _fetch_bill(chat_id, ym)
@@ -223,10 +309,7 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
             if not missing:
                 return
 
-            await bot.send_message(
-                chat_id,
-                f"Не хватает фото/показаний: {_missing_to_text(missing)}. Пришлите, пожалуйста, недостающие фото.",
-            )
+            await bot.send_message(chat_id, f"Не хватает фото/показаний: {_missing_to_text(missing)}. Пришлите, пожалуйста, недостающие фото.")
         except asyncio.CancelledError:
             return
         except Exception:
@@ -265,22 +348,69 @@ async def cmd_set_meter(message: types.Message):
 
 @dp.message_handler(content_types=ContentType.TEXT)
 async def on_text(message: types.Message):
-    txt = (message.text or "").strip().lower()
+    chat_id = message.chat.id
+    txt_raw = message.text or ""
+    txt = txt_raw.strip().lower()
 
+    # 0) ждём ручной ввод числа
+    if chat_id in MANUAL_AWAIT_VALUE:
+        ctx = MANUAL_AWAIT_VALUE.get(chat_id) or {}
+        ym = ctx.get("ym")
+        code = ctx.get("code")
+        val = _parse_number(txt_raw)
+        if val is None:
+            await message.reply("Введите, пожалуйста, число (пример: 123.45).")
+            return
+
+        resp = await _post_manual_reading(chat_id, str(ym), str(code), float(val))
+        MANUAL_AWAIT_VALUE.pop(chat_id, None)
+
+        if not resp or not isinstance(resp, dict):
+            await message.reply("Ошибка: не удалось сохранить значение. Попробуйте ещё раз или пришлите фото.")
+            return
+
+        if not resp.get("ok"):
+            reason = resp.get("reason") or "error"
+            if reason == "month_closed":
+                await message.reply("Этот месяц уже закрыт. Обратитесь к администратору.", reply_markup=_kb_main())
+                return
+            if reason == "not_bound":
+                await message.reply("Квартира не привязана. Нажмите «Поделиться контактом».", reply_markup=_kb_main())
+                return
+            await message.reply("Не удалось сохранить значение. Пришлите фото или попробуйте ещё раз.", reply_markup=_kb_main())
+            return
+
+        bill = resp.get("bill")
+        if not bill:
+            bill = await _fetch_bill(chat_id, str(ym))
+
+        if bill:
+            out = _try_send_bill_if_ready(chat_id, str(ym), bill)
+            if out:
+                text, kb = out
+                await bot.send_message(chat_id, text, reply_markup=kb)
+            else:
+                if bill.get("reason") == "missing_photos":
+                    missing = bill.get("missing") or []
+                    if missing:
+                        await bot.send_message(chat_id, "Сейчас не хватает: " + _missing_to_text(missing), reply_markup=_kb_main())
+        return
+
+    # 1) переключатели
     if txt == "электро t1":
-        _set_meter_index(message.chat.id, 1)
+        _set_meter_index(chat_id, 1)
         await message.reply("Ок: Электро T1.", reply_markup=_kb_main())
         return
     if txt == "электро t2":
-        _set_meter_index(message.chat.id, 2)
+        _set_meter_index(chat_id, 2)
         await message.reply("Ок: Электро T2.", reply_markup=_kb_main())
         return
     if txt == "электро t3":
-        _set_meter_index(message.chat.id, 3)
+        _set_meter_index(chat_id, 3)
         await message.reply("Ок: Электро T3.", reply_markup=_kb_main())
         return
     if txt == "вода (хвс/гвс)":
-        _set_meter_index(message.chat.id, 1)
+        _set_meter_index(chat_id, 1)
         await message.reply("Ок: Вода (ХВС/ГВС).", reply_markup=_kb_main())
         return
 
@@ -327,6 +457,27 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         return
 
     ym = js.get("ym") or ""
+    bill = js.get("bill") if isinstance(js.get("bill"), dict) else None
+
+    # месяц закрыт
+    if str(js.get("reason") or "") == "month_closed":
+        await message.reply("Этот месяц уже закрыт. Если нужно внести изменения — обратитесь к администратору.", reply_markup=_kb_main())
+        return
+
+    # OCR не распознал
+    if bool(js.get("ocr_failed")) or str(js.get("reason") or "") == "ocr_unreadable":
+        await message.reply(
+            "Фото получено, но не удалось распознать показания (нечётко/блики/обрезано).\n"
+            "Пожалуйста, пришлите фото лучшего качества.\n\n"
+            "Если удобнее — можно ввести вручную (только для незаполненных полей).",
+            reply_markup=_kb_main(),
+        )
+        if ym:
+            MANUAL_AWAIT_PICK[message.chat.id] = {"ym": str(ym)}
+            await message.reply("Нажмите, чтобы ввести вручную:", reply_markup=_kb_manual_start(str(ym)))
+        return
+
+    # обычный ответ
     assigned = js.get("assigned_meter_index", meter_index)
     ocr = js.get("ocr") or {}
     ocr_type = ocr.get("type")
@@ -337,31 +488,29 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         msg += f"\nРаспознано: {ocr_type or '—'} / {ocr_reading or '—'}"
     await message.reply(msg, reply_markup=_kb_main())
 
+    # дубль
     dup = _extract_duplicate_info(js)
     photo_event_id = js.get("photo_event_id")
-
     if dup and ym and photo_event_id:
         peid = int(photo_event_id)
-        DUP_PENDING[peid] = {"chat_id": message.chat.id, "ym": ym, "dup": dup}
-        DUP_PENDING_MONTH.add((message.chat.id, ym))
-
-        text = (
-            "Похоже, вы прислали одно и то же фото/значение "
-            "для разных счётчиков.\n\n"
-            "Выберите, что делать дальше:"
+        DUP_PENDING[peid] = {"chat_id": message.chat.id, "ym": str(ym), "dup": dup}
+        DUP_PENDING_MONTH.add((message.chat.id, str(ym)))
+        await message.reply(
+            "Похоже, вы прислали одно и то же фото/значение для разных счётчиков.\n\n"
+            "Выберите, что делать дальше:",
+            reply_markup=_kb_duplicate(peid),
         )
-        await message.reply(text, reply_markup=_kb_duplicate(peid))
         return
 
-    bill = js.get("bill")
-    if ym and isinstance(bill, dict):
-        res = _try_send_bill_if_ready(message.chat.id, ym, bill)
+    # bill
+    if ym and bill:
+        res = _try_send_bill_if_ready(message.chat.id, str(ym), bill)
         if res:
             text, kb = res
             await message.reply(text, reply_markup=kb)
         else:
             if bill.get("reason") == "missing_photos":
-                _schedule_missing_reminder(message.chat.id, ym)
+                _schedule_missing_reminder(message.chat.id, str(ym))
 
 
 @dp.message_handler(content_types=ContentType.PHOTO)
@@ -388,6 +537,73 @@ async def on_document(message: types.Message):
         filename=doc.file_name or "file.bin",
         mime_type=doc.mime_type or "application/octet-stream",
     )
+
+
+@dp.callback_query_handler(lambda c: c.data == "mcancel")
+async def on_manual_cancel(call: types.CallbackQuery):
+    chat_id = call.message.chat.id if call.message else None
+    if chat_id is not None:
+        MANUAL_AWAIT_PICK.pop(int(chat_id), None)
+        MANUAL_AWAIT_VALUE.pop(int(chat_id), None)
+    await call.answer("Отменено", show_alert=False)
+    if call.message:
+        await bot.send_message(call.message.chat.id, "Ок. Пришлите фото счётчика.", reply_markup=_kb_main())
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("mstart|"))
+async def on_manual_start(call: types.CallbackQuery):
+    try:
+        _, ym = call.data.split("|", 1)
+        ym = str(ym)
+    except Exception:
+        await call.answer("Ошибка", show_alert=True)
+        return
+
+    chat_id = call.message.chat.id if call.message else None
+    if chat_id is None:
+        await call.answer("Ошибка", show_alert=True)
+        return
+
+    await call.answer("Ок", show_alert=False)
+
+    bill = await _fetch_bill(int(chat_id), ym)
+    if not bill:
+        await bot.send_message(int(chat_id), "Не удалось получить список незаполненных полей. Пришлите фото.", reply_markup=_kb_main())
+        return
+
+    missing = bill.get("missing") or []
+    if not missing:
+        await bot.send_message(int(chat_id), "Сейчас нет незаполненных полей. Если нужно — пришлите фото.", reply_markup=_kb_main())
+        return
+
+    MANUAL_AWAIT_PICK[int(chat_id)] = {"ym": ym}
+    await bot.send_message(
+        int(chat_id),
+        "Выберите, что именно не заполнено (введите только это поле):",
+        reply_markup=_kb_manual_pick(ym, list(missing)),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("mpick|"))
+async def on_manual_pick(call: types.CallbackQuery):
+    try:
+        _, ym, code = call.data.split("|", 2)
+        ym = str(ym)
+        code = str(code)
+    except Exception:
+        await call.answer("Ошибка", show_alert=True)
+        return
+
+    chat_id = call.message.chat.id if call.message else None
+    if chat_id is None:
+        await call.answer("Ошибка", show_alert=True)
+        return
+
+    await call.answer("Ок", show_alert=False)
+    MANUAL_AWAIT_PICK.pop(int(chat_id), None)
+    MANUAL_AWAIT_VALUE[int(chat_id)] = {"ym": ym, "code": code}
+
+    await bot.send_message(int(chat_id), "Введите показание числом (пример: 123.45).", reply_markup=_kb_main())
 
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("dup_ok|"))
@@ -463,11 +679,7 @@ async def on_dup_repeat(call: types.CallbackQuery):
         bill = await _fetch_bill(int(chat_id), str(ym))
         if bill and bill.get("reason") == "missing_photos":
             missing = bill.get("missing") or []
-            await bot.send_message(
-                int(chat_id),
-                "Сейчас не хватает: " + _missing_to_text(missing),
-                reply_markup=_kb_main(),
-            )
+            await bot.send_message(int(chat_id), "Сейчас не хватает: " + _missing_to_text(missing), reply_markup=_kb_main())
 
 
 if __name__ == "__main__":
