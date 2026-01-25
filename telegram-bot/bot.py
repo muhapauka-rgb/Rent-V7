@@ -14,10 +14,13 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_BASE = os.getenv("API_BASE", "http://api:8000").strip()
 
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is empty. Set BOT_TOKEN env var for telegram-bot service.")
+
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 
-# chat_id -> phone
+# chat_id -> phone (в памяти; после рестарта бота забудется)
 CHAT_PHONES: dict[int, str] = {}
 # chat_id -> 1..3 (какой индекс электро ожидаем на следующий файл)
 CHAT_METER_INDEX: dict[int, int] = {}
@@ -28,7 +31,10 @@ PENDING_NOTICE: set[tuple[int, str]] = set()     # (chat_id, ym) — чтобы 
 REMIND_TASKS: dict[tuple[int, str], asyncio.Task] = {}
 
 # подтверждение “похоже, прислали одно и то же”
-DUP_PENDING: dict[tuple[int, str], dict] = {}    # (chat_id, ym) -> info
+# photo_event_id -> {"chat_id": int, "ym": str, "dup": dict}
+DUP_PENDING: dict[int, dict] = {}
+# чтобы не отправлять сумму, пока человек не нажал кнопку (chat_id, ym)
+DUP_PENDING_MONTH: set[tuple[int, str]] = set()
 
 
 def _kb_main() -> ReplyKeyboardMarkup:
@@ -43,14 +49,20 @@ def _kb_main() -> ReplyKeyboardMarkup:
     )
 
 
-def _kb_duplicate(ym: str) -> InlineKeyboardMarkup:
+def _kb_duplicate(photo_event_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Это разные счётчики (оставить)", callback_data=f"dup_ok|{ym}"),
+                InlineKeyboardButton(
+                    text="Это разные счётчики (оставить)",
+                    callback_data=f"dup_ok|{photo_event_id}",
+                ),
             ],
             [
-                InlineKeyboardButton(text="Это повтор (пришлю другое фото)", callback_data=f"dup_repeat|{ym}"),
+                InlineKeyboardButton(
+                    text="Это повтор (пришлю другое фото)",
+                    callback_data=f"dup_repeat|{photo_event_id}",
+                ),
             ],
         ]
     )
@@ -137,11 +149,26 @@ async def _fetch_bill(chat_id: int, ym: str) -> dict | None:
         return None
 
 
+async def _resolve_duplicate(photo_event_id: int, action: str) -> dict | None:
+    url = f"{API_BASE}/bot/duplicate/resolve"
+    try:
+        resp = requests.post(
+            url,
+            json={"photo_event_id": int(photo_event_id), "action": str(action)},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            return None
+        return resp.json()
+    except Exception:
+        return None
+
+
 def _try_send_bill_if_ready(chat_id: int, ym: str, bill: dict):
     if not bill:
         return None
 
-    if (chat_id, ym) in DUP_PENDING:
+    if (chat_id, ym) in DUP_PENDING_MONTH:
         return None
 
     reason = bill.get("reason")
@@ -175,12 +202,12 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
 
     async def _job():
         try:
-            # ВАЖНО: таймер напоминания = 40 секунд (по твоему пункту 3)
+            # таймер напоминания = 40 секунд
             await asyncio.sleep(40)
 
             if key in SENT_BILL:
                 return
-            if key in DUP_PENDING:
+            if key in DUP_PENDING_MONTH:
                 return
 
             bill = await _fetch_bill(chat_id, ym)
@@ -196,7 +223,10 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
             if not missing:
                 return
 
-            await bot.send_message(chat_id, f"Не хватает фото/показаний: {_missing_to_text(missing)}. Пришлите, пожалуйста, недостающие фото.")
+            await bot.send_message(
+                chat_id,
+                f"Не хватает фото/показаний: {_missing_to_text(missing)}. Пришлите, пожалуйста, недостающие фото.",
+            )
         except asyncio.CancelledError:
             return
         except Exception:
@@ -308,13 +338,19 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     await message.reply(msg, reply_markup=_kb_main())
 
     dup = _extract_duplicate_info(js)
-    if dup and ym:
-        DUP_PENDING[(message.chat.id, ym)] = dup
-        await message.reply(
-            "Похоже, вы прислали одно и то же фото/значение для разных счётчиков.\n"
-            "Уточните, пожалуйста:",
-            reply_markup=_kb_duplicate(ym),
+    photo_event_id = js.get("photo_event_id")
+
+    if dup and ym and photo_event_id:
+        peid = int(photo_event_id)
+        DUP_PENDING[peid] = {"chat_id": message.chat.id, "ym": ym, "dup": dup}
+        DUP_PENDING_MONTH.add((message.chat.id, ym))
+
+        text = (
+            "Похоже, вы прислали одно и то же фото/значение "
+            "для разных счётчиков.\n\n"
+            "Выберите, что делать дальше:"
         )
+        await message.reply(text, reply_markup=_kb_duplicate(peid))
         return
 
     bill = js.get("bill")
@@ -357,47 +393,81 @@ async def on_document(message: types.Message):
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("dup_ok|"))
 async def on_dup_ok(call: types.CallbackQuery):
     try:
-        _, ym = call.data.split("|", 1)
+        _, peid_raw = call.data.split("|", 1)
+        photo_event_id = int(peid_raw)
     except Exception:
         await call.answer("Ошибка", show_alert=True)
         return
 
-    key = (call.message.chat.id, ym)
-    DUP_PENDING.pop(key, None)
+    payload = DUP_PENDING.pop(photo_event_id, None) or {}
+    ym = payload.get("ym")
+    chat_id = payload.get("chat_id") or (call.message.chat.id if call.message else None)
+
+    if chat_id and ym:
+        DUP_PENDING_MONTH.discard((int(chat_id), str(ym)))
+
     await call.answer("Ок", show_alert=False)
 
-    bill = await _fetch_bill(call.message.chat.id, ym)
-    if bill:
-        res = _try_send_bill_if_ready(call.message.chat.id, ym, bill)
-        if res:
-            text, kb = res
-            await bot.send_message(call.message.chat.id, text, reply_markup=kb)
+    res = await _resolve_duplicate(photo_event_id, "ok")
+    bill = None
+    if isinstance(res, dict):
+        bill = res.get("bill") or None
+        ym = res.get("ym") or ym
+
+    if ym and not bill and chat_id:
+        bill = await _fetch_bill(int(chat_id), str(ym))
+
+    if ym and bill and chat_id:
+        out = _try_send_bill_if_ready(int(chat_id), str(ym), bill)
+        if out:
+            text, kb = out
+            await bot.send_message(int(chat_id), text, reply_markup=kb)
 
 
 @dp.callback_query_handler(lambda c: c.data and c.data.startswith("dup_repeat|"))
 async def on_dup_repeat(call: types.CallbackQuery):
     try:
-        _, ym = call.data.split("|", 1)
+        _, peid_raw = call.data.split("|", 1)
+        photo_event_id = int(peid_raw)
     except Exception:
         await call.answer("Ошибка", show_alert=True)
         return
 
-    key = (call.message.chat.id, ym)
-    info = DUP_PENDING.pop(key, None)
+    payload = DUP_PENDING.pop(photo_event_id, None) or {}
+    ym = payload.get("ym")
+    chat_id = payload.get("chat_id") or (call.message.chat.id if call.message else None)
+    dup = payload.get("dup") if isinstance(payload, dict) else None
+
+    if chat_id and ym:
+        DUP_PENDING_MONTH.discard((int(chat_id), str(ym)))
+
     await call.answer("Ок", show_alert=False)
 
+    await _resolve_duplicate(photo_event_id, "repeat")
+
     extra = ""
-    if isinstance(info, dict):
-        mt = info.get("meter_type")
-        mi = info.get("meter_index")
-        val = info.get("value")
+    if isinstance(dup, dict):
+        mt = dup.get("meter_type")
+        mi = dup.get("meter_index")
+        val = dup.get("value")
         extra = f"\n(Повтор: {mt} idx={mi}, значение={val})"
 
-    await bot.send_message(
-        call.message.chat.id,
-        "Понял. Тогда пришлите, пожалуйста, другое фото нужного счётчика." + extra,
-        reply_markup=_kb_main(),
-    )
+    if chat_id:
+        await bot.send_message(
+            int(chat_id),
+            "Понял. Тогда пришлите, пожалуйста, другое фото нужного счётчика." + extra,
+            reply_markup=_kb_main(),
+        )
+
+    if ym and chat_id:
+        bill = await _fetch_bill(int(chat_id), str(ym))
+        if bill and bill.get("reason") == "missing_photos":
+            missing = bill.get("missing") or []
+            await bot.send_message(
+                int(chat_id),
+                "Сейчас не хватает: " + _missing_to_text(missing),
+                reply_markup=_kb_main(),
+            )
 
 
 if __name__ == "__main__":

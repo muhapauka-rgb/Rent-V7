@@ -238,6 +238,7 @@ def ensure_tables() -> None:
                 status TEXT NOT NULL DEFAULT 'unassigned',
                 apartment_id BIGINT NULL,
                 ocr_json JSONB NULL,
+                ym TEXT NULL,
 
                 meter_index INTEGER NOT NULL DEFAULT 1,
 
@@ -256,6 +257,7 @@ def ensure_tables() -> None:
         """))
 
         # Soft migrations
+        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ym TEXT NULL;"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_index INTEGER NOT NULL DEFAULT 1;"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'received';"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
@@ -1516,6 +1518,8 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
         return 0
     meter_index = max(1, min(3, meter_index))
 
+    ym = month_now()
+
     expected = _get_apartment_electric_expected(conn, apartment_id)
 
     conn.execute(
@@ -1690,6 +1694,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     meter_index = max(1, min(3, meter_index))
 
+    ym = month_now()
+
     if file is None:
         return JSONResponse(status_code=200, content={"status": "accepted", "error": "no_file", "chat_id": str(chat_id)})
 
@@ -1781,7 +1787,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         INSERT INTO photo_events
                         (
                             chat_id, telegram_username, phone, original_filename, ydisk_path,
-                            status, apartment_id, ocr_json,
+                            status, apartment_id, ocr_json, ym,
                             meter_index,
                             stage, stage_updated_at,
                             file_sha256, ocr_type, ocr_reading,
@@ -1793,6 +1799,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             :chat_id, :username, :phone, :orig, :path,
                             :status, :apartment_id,
                             CASE WHEN :ocr_json IS NULL THEN NULL ELSE CAST(:ocr_json AS JSONB) END,
+                            :ym,
                             :meter_index,
                             :stage, now(),
                             :file_sha256, :ocr_type, :ocr_reading,
@@ -1818,6 +1825,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         "meter_kind": (str(kind) if kind is not None else None),
                         "meter_value": (float(value_float) if value_float is not None else None),
                         "diag_json": diag_json_str,
+                        "ym": str(ym),
                     },
                 ).scalar_one()
 
@@ -1826,8 +1834,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 6) write meter_readings + statuses
     wrote_meter = False
-    ym = month_now()
     assigned_meter_index = int(meter_index)
+    has_possible_duplicate = False
 
     if db_ready() and apartment_id and kind and (value_float is not None):
         try:
@@ -1903,6 +1911,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     ).fetchone()
 
                 if row:
+                    has_possible_duplicate = True
                     existing_mt = str(row[0])
                     existing_mi = int(row[1])
                     diag["warnings"].append(
@@ -1954,7 +1963,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     meter_index = :meter_index,
                                     meter_kind = COALESCE(meter_kind, :meter_kind),
                                     meter_value = COALESCE(meter_value, :meter_value),
-                                    stage = 'meter_written',
+                                    stage = :stage,
                                     stage_updated_at = now(),
                                     diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
                                 WHERE id = :id
@@ -1965,6 +1974,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 "meter_kind": str(kind),
                                 "meter_value": float(value_float),
                                 "diag_json": diag_json_str,
+                                "stage": ("duplicate_pending" if has_possible_duplicate else "meter_written"),
                             },
                         )
                 except Exception as e:
@@ -2025,6 +2035,114 @@ def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
 
         bill = _calc_month_bill(conn, int(apt["id"]), ym)
         return {"ok": True, "apartment_id": int(apt["id"]), "ym": ym, "bill": bill}
+
+class DuplicateResolveRequest(BaseModel):
+    photo_event_id: int = Field(..., ge=1)
+    action: Literal["ok", "repeat"]
+
+
+@app.post("/bot/duplicate/resolve")
+def bot_duplicate_resolve(payload: DuplicateResolveRequest):
+    """Решение по “возможному дублю” от арендатора из Telegram.
+    ok     -> пользователь подтвердил, что это разные счётчики (оставляем данные)
+    repeat -> пользователь подтвердил, что это повтор (пытаемся откатить последнее значение)
+    """
+    if not db_ready():
+        raise HTTPException(status_code=500, detail="DB is not configured")
+    ensure_tables()
+
+    peid = int(payload.photo_event_id)
+    action = str(payload.action).strip().lower()
+
+    with engine.begin() as conn:
+        ev = conn.execute(
+            text("""
+                SELECT id, apartment_id, ym, meter_kind, meter_index, meter_value, meter_written, stage
+                FROM photo_events
+                WHERE id = :id
+            """),
+            {"id": peid},
+        ).mappings().fetchone()
+
+        if not ev:
+            raise HTTPException(status_code=404, detail="photo_event_not_found")
+
+        apartment_id = ev.get("apartment_id")
+        ym = (ev.get("ym") or current_ym()).strip()
+        meter_kind = ev.get("meter_kind")
+        meter_index = ev.get("meter_index")
+        meter_value = ev.get("meter_value")
+        meter_written = bool(ev.get("meter_written"))
+
+        if not apartment_id:
+            raise HTTPException(status_code=409, detail="photo_event_not_assigned")
+        if not meter_written or not meter_kind or meter_value is None:
+            raise HTTPException(status_code=409, detail="photo_event_has_no_written_meter")
+        if not is_ym(ym):
+            raise HTTPException(status_code=400, detail="bad_ym")
+
+        # обновляем stage по решению пользователя
+        new_stage = "duplicate_confirmed" if action == "ok" else "duplicate_rejected"
+        conn.execute(
+            text("""
+                UPDATE photo_events
+                SET stage = :stage, stage_updated_at = now()
+                WHERE id = :id
+            """),
+            {"id": peid, "stage": new_stage},
+        )
+
+        deleted = 0
+        meter_deleted = False
+        delete_reason = None
+
+        if action == "repeat":
+            # Пытаемся удалить “сомнительное” значение, но только если оно всё ещё совпадает с тем,
+            # что было записано из этого фото (защита от удаления нового значения).
+            tol = 0.001
+            cur = conn.execute(
+                text("""
+                    SELECT value
+                    FROM meter_readings
+                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                """),
+                {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_kind), "mi": int(meter_index)},
+            ).fetchone()
+
+            if cur is not None:
+                cur_val = float(cur[0])
+                if abs(cur_val - float(meter_value)) <= tol:
+                    res = conn.execute(
+                        text("""
+                            DELETE FROM meter_readings
+                            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                        """),
+                        {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_kind), "mi": int(meter_index)},
+                    )
+                    deleted = int(getattr(res, "rowcount", 0) or 0)
+                    meter_deleted = deleted > 0
+                else:
+                    delete_reason = "meter_value_changed_after_photo"
+            else:
+                delete_reason = "meter_row_not_found"
+
+        bill = _calc_month_bill(conn, int(apartment_id), str(ym))
+
+        out = {
+            "ok": True,
+            "photo_event_id": peid,
+            "apartment_id": int(apartment_id),
+            "ym": str(ym),
+            "action": action,
+            "stage": new_stage,
+            "meter_deleted": bool(meter_deleted),
+            "deleted_rows": int(deleted),
+            "delete_reason": delete_reason,
+            "bill": bill,
+        }
+        return out
+
+
 
 
 
@@ -2657,6 +2775,8 @@ def add_meter_reading(apartment_id: int, payload: dict = Body(...)):
         meter_index = 1
 
     meter_index = max(1, min(3, meter_index))
+
+    ym = month_now()
 
     if meter_type in {"cold", "hot"}:
         meter_index = 1
