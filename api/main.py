@@ -1756,56 +1756,53 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     if db_ready() and apartment_id and kind and (value_float is not None):
         try:
             # WARNING: возможно прислали то же самое фото (распознано то же значение)
+            # Новая логика: ищем совпадение значения среди ВСЕХ счётчиков этого месяца
+            # (чтобы поймать "одно фото отправили за разные счётчики")
             try:
                 tol = 0.0005
-                dup_idx = None
                 with engine.begin() as conn:
-                    if kind == "electric":
-                        row = conn.execute(
-                            text("""
-                                SELECT meter_index
-                                FROM meter_readings
-                                WHERE apartment_id=:aid
-                                  AND ym=:ym
-                                  AND meter_type='electric'
-                                  AND abs(value - :val) <= :tol
-                                ORDER BY meter_index ASC
-                                LIMIT 1
-                            """),
-                            {"aid": int(apartment_id), "ym": ym, "val": float(value_float), "tol": float(tol)},
-                        ).fetchone()
-                        if row:
-                            dup_idx = int(row[0])
-                    else:
-                        row = conn.execute(
-                            text("""
-                                SELECT meter_index
-                                FROM meter_readings
-                                WHERE apartment_id=:aid
-                                  AND ym=:ym
-                                  AND meter_type=:mt
-                                  AND meter_index=1
-                                  AND abs(value - :val) <= :tol
-                                LIMIT 1
-                            """),
-                            {"aid": int(apartment_id), "ym": ym, "mt": str(kind), "val": float(value_float), "tol": float(tol)},
-                        ).fetchone()
-                        if row:
-                            dup_idx = 1
+                    row = conn.execute(
+                        text("""
+                            SELECT meter_type, meter_index, value
+                            FROM meter_readings
+                            WHERE apartment_id=:aid
+                              AND ym=:ym
+                              AND source IN ('ocr','manual')
+                              AND abs(value - :val) <= :tol
+                              AND NOT (meter_type=:mt AND meter_index=:mi)
+                            ORDER BY meter_type ASC, meter_index ASC
+                            LIMIT 1
+                        """),
+                        {
+                            "aid": int(apartment_id),
+                            "ym": ym,
+                            "val": float(value_float),
+                            "tol": float(tol),
+                            "mt": str(kind),
+                            "mi": int(meter_index),
+                        },
+                    ).fetchone()
 
-                if dup_idx is not None:
+                if row:
+                    existing_mt = str(row[0])
+                    existing_mi = int(row[1])
                     diag["warnings"].append(
                         {
                             "possible_duplicate": {
-                                "meter_type": str(kind),
-                                "meter_index": int(dup_idx),
+                                # существующий счётчик, с которым совпало
+                                "meter_type": existing_mt,
+                                "meter_index": existing_mi,
                                 "ym": str(ym),
                                 "value": float(value_float),
+                                # что пришло сейчас (боту не мешает, но полезно для отладки)
+                                "incoming_meter_type": str(kind),
+                                "incoming_meter_index": int(meter_index),
                             }
                         }
                     )
             except Exception as e:
                 diag["warnings"].append({"duplicate_check_failed": str(e)})
+
 
             if kind == "electric":
                 # Если клиент явно передал meter_index (бот/админ), пишем строго в этот индекс.
