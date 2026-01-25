@@ -118,6 +118,7 @@ def ensure_tables() -> None:
                 tenant_name TEXT NULL,
                 address TEXT NULL,
                 note TEXT NULL,
+                ls_account TEXT NULL,
                 electric_expected INTEGER NOT NULL DEFAULT 3,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()
             );
@@ -125,6 +126,7 @@ def ensure_tables() -> None:
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS tenant_name TEXT NULL;"))
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS address TEXT NULL;"))
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS note TEXT NULL;"))
+        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS ls_account TEXT NULL;"))
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS electric_expected INTEGER NOT NULL DEFAULT 3;"))
         conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
 
@@ -282,6 +284,7 @@ def ensure_tables() -> None:
         """))
 
         # Indexes
+        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_apartments_ls_account ON apartments(ls_account) WHERE ls_account IS NOT NULL;"))
         conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_apartment_contacts_kind_value ON apartment_contacts(kind, value);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_contacts_apartment_id ON apartment_contacts(apartment_id);"))
         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chat_bindings_apartment_id ON chat_bindings(apartment_id);"))
@@ -308,11 +311,56 @@ def ensure_tables() -> None:
 
 
 def norm_phone(p: str) -> str:
-    digits = "".join(ch for ch in p if ch.isdigit())
-    if digits.startswith("8") and len(digits) == 11:
+    """
+    Нормализация телефона для поиска/хранения.
+    Приводим к канону РФ: 11 цифр, начинается с "7".
+
+    Принимаем варианты:
+    - +7XXXXXXXXXX
+    - 8XXXXXXXXXX
+    - 7XXXXXXXXXX
+    - XXXXXXXXXX (10 цифр без кода страны) -> добавляем "7"
+    """
+    digits = "".join(ch for ch in (p or "") if ch.isdigit())
+    if not digits:
+        return ""
+
+    # Часто в логах/контактах могут прилетать хвосты/приставки —
+    # для РФ берём последние 10 цифр как номер и добавляем "7".
+    if len(digits) > 11:
+        tail10 = digits[-10:]
+        if len(tail10) == 10:
+            digits = "7" + tail10
+
+    if len(digits) == 10:
+        digits = "7" + digits
+
+    if len(digits) == 11 and digits.startswith("8"):
         digits = "7" + digits[1:]
+
+    # Если получилось не 11 цифр — возвращаем как есть (но это будет сложнее матчить).
     return digits
 
+
+def _phone_variants(phone: str) -> List[str]:
+    """
+    Возвращает набор вариантов телефона для поиска в БД,
+    чтобы совпадать со старыми/разными форматами записи.
+    """
+    raw_digits = "".join(ch for ch in (phone or "") if ch.isdigit())
+    variants = set()
+    if raw_digits:
+        variants.add(raw_digits)
+        if len(raw_digits) >= 10:
+            variants.add("7" + raw_digits[-10:])
+            variants.add("8" + raw_digits[-10:])
+    n = norm_phone(phone)
+    if n:
+        variants.add(n)
+        if len(n) == 11 and n.startswith("7"):
+            variants.add("8" + n[1:])
+    # Стабильный порядок
+    return [v for v in sorted(variants, key=lambda x: (len(x), x), reverse=True)]
 
 def find_apartment_by_chat(chat_id: str) -> int | None:
     if not db_ready():
@@ -333,18 +381,25 @@ def find_apartment_by_chat(chat_id: str) -> int | None:
 
 
 def find_apartment_by_contact(telegram_username: str | None, phone: str | None) -> int | None:
+    """
+    Поиск квартиры по контактам (telegram username / phone).
+    ВАЖНО: phone матчим по нескольким вариантам (+7/8/7/без кода),
+    чтобы старые записи в базе тоже находились.
+    """
     if not db_ready():
         return None
 
     candidates: list[tuple[str, str]] = []
+
     if telegram_username:
         u = telegram_username.strip().lstrip("@").lower()
         if u:
             candidates.append(("telegram", u))
+
     if phone:
-        ph = norm_phone(phone)
-        if ph:
-            candidates.append(("phone", ph))
+        for ph in _phone_variants(phone):
+            if ph:
+                candidates.append(("phone", ph))
 
     if not candidates:
         return None
@@ -362,8 +417,8 @@ def find_apartment_by_contact(telegram_username: str | None, phone: str | None) 
             ).fetchone()
             if row:
                 return int(row[0])
-    return None
 
+    return None
 
 def bind_chat(chat_id: str, apartment_id: int) -> None:
     """Upsert: chat может меняться, поэтому разрешаем перепривязку."""
@@ -799,6 +854,7 @@ class UIApartmentItem(BaseModel):
     address: Optional[str] = None
     tenant_name: Optional[str] = None
     note: Optional[str] = None
+    ls_account: Optional[str] = None  # Лицевой счет (л/с)
     electric_expected: int = 3
     contacts: UIContacts = UIContacts()
     statuses: UIStatuses = UIStatuses()
@@ -808,6 +864,7 @@ class UIApartmentItem(BaseModel):
 class UIApartmentCreate(BaseModel):
     title: str = Field(..., min_length=1)
     address: Optional[str] = None
+    ls_account: Optional[str] = None  # Лицевой счет (л/с)
 
 
 class UIApartmentPatch(BaseModel):
@@ -815,6 +872,7 @@ class UIApartmentPatch(BaseModel):
     address: Optional[str] = None
     tenant_name: Optional[str] = None
     note: Optional[str] = None
+    ls_account: Optional[str] = None  # Лицевой счет (л/с)
     electric_expected: Optional[int] = Field(None, ge=1, le=3)
     phone: Optional[str] = None
     telegram: Optional[str] = None
@@ -972,7 +1030,7 @@ def ui_list_apartments(ym: Optional[str] = None):
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
-                SELECT id, title, address, tenant_name, note, electric_expected
+                SELECT id, title, address, tenant_name, note, ls_account, electric_expected
                 FROM apartments
                 ORDER BY id DESC
             """)
@@ -991,7 +1049,8 @@ def ui_list_apartments(ym: Optional[str] = None):
                 address=r[2],
                 tenant_name=r[3],
                 note=r[4],
-                electric_expected=int(r[5]) if r[5] is not None else 3,
+                ls_account=r[5],
+                electric_expected=int(r[6]) if r[6] is not None else 3,
                 contacts=UIContacts(phone=phone, telegram=telegram),
                 statuses=statuses,
             ).model_dump()
@@ -1011,14 +1070,20 @@ def ui_create_apartment(body: UIApartmentCreate):
         raise HTTPException(status_code=400, detail="title_required")
 
     with engine.begin() as conn:
-        new_id = conn.execute(
-            text("""
-                INSERT INTO apartments (title, address)
-                VALUES (:title, :address)
-                RETURNING id
-            """),
-            {"title": title, "address": (body.address or None)},
-        ).scalar_one()
+        try:
+            new_id = conn.execute(
+                text("""
+                    INSERT INTO apartments (title, address, ls_account)
+                    VALUES (:title, :address, :ls_account)
+                    RETURNING id
+                """),
+                {"title": title, "address": (body.address or None), "ls_account": (body.ls_account or None)},
+            ).scalar_one()
+        except Exception as e:
+            # Уникальность лицевого счёта (л/с)
+            if "uq_apartments_ls_account" in str(e):
+                raise HTTPException(status_code=409, detail="ls_account_taken")
+            raise
 
     return {"ok": True, "id": int(new_id)}
 
@@ -1047,6 +1112,11 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
         sets.append("note=:note")
         params["note"] = body.note.strip() if body.note.strip() else None
 
+    if body.ls_account is not None:
+        ls = body.ls_account.strip()
+        params["ls_account"] = ls if ls else None
+        sets.append("ls_account=:ls_account")
+
     if body.electric_expected is not None:
         sets.append("electric_expected=:electric_expected")
         params["electric_expected"] = int(body.electric_expected)
@@ -1054,10 +1124,16 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
 
     if sets:
         with engine.begin() as conn:
-            res = conn.execute(
-                text(f"UPDATE apartments SET {', '.join(sets)} WHERE id=:id"),
-                params,
-            )
+            try:
+                res = conn.execute(
+                    text(f"UPDATE apartments SET {', '.join(sets)} WHERE id=:id"),
+                    params,
+                )
+            except Exception as e:
+                if "uq_apartments_ls_account" in str(e):
+                    raise HTTPException(status_code=409, detail="ls_account_taken")
+                raise
+
             if res.rowcount == 0:
                 raise HTTPException(status_code=404, detail="apartment_not_found")
 
@@ -1093,7 +1169,7 @@ def ui_apartment_card(apartment_id: int):
     with engine.begin() as conn:
         apt = conn.execute(
             text("""
-                SELECT id, title, address, tenant_name, note, electric_expected, created_at
+                SELECT id, title, address, tenant_name, note, ls_account, electric_expected, created_at
                 FROM apartments
                 WHERE id=:id
                 LIMIT 1
@@ -1750,63 +1826,15 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 6) write meter_readings + statuses
     wrote_meter = False
-    assigned_meter_index = int(meter_index)
     ym = month_now()
+    assigned_meter_index = int(meter_index)
 
     if db_ready() and apartment_id and kind and (value_float is not None):
         try:
-            # WARNING: возможно прислали то же самое фото (распознано то же значение)
-            # Новая логика: ищем совпадение значения среди ВСЕХ счётчиков этого месяца
-            # (чтобы поймать "одно фото отправили за разные счётчики")
-            try:
-                tol = 0.0005
-                with engine.begin() as conn:
-                    row = conn.execute(
-                        text("""
-                            SELECT meter_type, meter_index, value
-                            FROM meter_readings
-                            WHERE apartment_id=:aid
-                              AND ym=:ym
-                              AND source IN ('ocr','manual')
-                              AND abs(value - :val) <= :tol
-                              AND NOT (meter_type=:mt AND meter_index=:mi)
-                            ORDER BY meter_type ASC, meter_index ASC
-                            LIMIT 1
-                        """),
-                        {
-                            "aid": int(apartment_id),
-                            "ym": ym,
-                            "val": float(value_float),
-                            "tol": float(tol),
-                            "mt": str(kind),
-                            "mi": int(meter_index),
-                        },
-                    ).fetchone()
-
-                if row:
-                    existing_mt = str(row[0])
-                    existing_mi = int(row[1])
-                    diag["warnings"].append(
-                        {
-                            "possible_duplicate": {
-                                # существующий счётчик, с которым совпало
-                                "meter_type": existing_mt,
-                                "meter_index": existing_mi,
-                                "ym": str(ym),
-                                "value": float(value_float),
-                                # что пришло сейчас (боту не мешает, но полезно для отладки)
-                                "incoming_meter_type": str(kind),
-                                "incoming_meter_index": int(meter_index),
-                            }
-                        }
-                    )
-            except Exception as e:
-                diag["warnings"].append({"duplicate_check_failed": str(e)})
-
-
+            # 6.1) СНАЧАЛА пишем показания в meter_readings и получаем assigned_meter_index
             if kind == "electric":
-                # Если клиент явно передал meter_index (бот/админ), пишем строго в этот индекс.
-                # Если meter_index не передан — оставляем авто-логику (sorted) для совместимости.
+                # Если клиент явно передал meter_index (бот/админ) — пишем строго в этот индекс.
+                # Если meter_index не передан — авто-логика (sorted) для совместимости.
                 if raw_meter_index is not None:
                     with engine.begin() as conn:
                         assigned_meter_index = _write_electric_explicit(
@@ -1823,6 +1851,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         float(value_float),
                     )
             else:
+                # water (cold/hot): всегда meter_index=1
                 assigned_meter_index = 1
                 with engine.begin() as conn:
                     conn.execute(
@@ -1841,36 +1870,57 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         {
                             "aid": int(apartment_id),
                             "ym": ym,
-                            "meter_type": kind,
+                            "meter_type": str(kind),
                             "value": float(value_float),
                             "ocr_value": float(value_float),
                         },
                     )
 
-
+            # 6.2) ПОСЛЕ записи проверяем: возможно это одно и то же фото (значение совпало с другим счётчиком)
+            try:
+                tol = 0.0005
                 with engine.begin() as conn:
-                    conn.execute(
+                    row = conn.execute(
                         text("""
-                            INSERT INTO meter_readings
-                                (apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
-                            VALUES
-                                (:aid, :ym, :meter_type, 1, :value, 'ocr', :ocr_value)
-                            ON CONFLICT (apartment_id, ym, meter_type, meter_index)
-                            DO UPDATE SET
-                                value = EXCLUDED.value,
-                                source = 'ocr',
-                                ocr_value = EXCLUDED.ocr_value,
-                                updated_at = now()
+                            SELECT meter_type, meter_index, value
+                            FROM meter_readings
+                            WHERE apartment_id=:aid
+                              AND ym=:ym
+                              AND source IN ('ocr','manual')
+                              AND abs(value - :val) <= :tol
+                              AND NOT (meter_type=:mt AND meter_index=:mi)
+                            ORDER BY meter_type ASC, meter_index ASC
+                            LIMIT 1
                         """),
                         {
                             "aid": int(apartment_id),
-                            "ym": ym,
-                            "meter_type": kind,
-                            "value": float(value_float),
-                            "ocr_value": float(value_float),
+                            "ym": str(ym),
+                            "val": float(value_float),
+                            "tol": float(tol),
+                            "mt": str(kind),
+                            "mi": int(assigned_meter_index),
                         },
-                    )
+                    ).fetchone()
 
+                if row:
+                    existing_mt = str(row[0])
+                    existing_mi = int(row[1])
+                    diag["warnings"].append(
+                        {
+                            "possible_duplicate": {
+                                "meter_type": existing_mt,
+                                "meter_index": existing_mi,
+                                "ym": str(ym),
+                                "value": float(value_float),
+                                "incoming_meter_type": str(kind),
+                                "incoming_meter_index": int(assigned_meter_index),
+                            }
+                        }
+                    )
+            except Exception as e:
+                diag["warnings"].append({"duplicate_check_failed": str(e)})
+
+            # 6.3) Обновляем статусы
             try:
                 _upsert_month_statuses(int(apartment_id), ym, UIStatusesPatch(meters_photo=True))
             except Exception as e:
@@ -1891,8 +1941,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
             wrote_meter = True
 
+            # 6.4) Обновляем photo_events и сохраняем актуальный diag_json (уже с possible_duplicate)
             if db_ready() and photo_event_id:
                 try:
+                    diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
                     with engine.begin() as conn:
                         conn.execute(
                             text("""
@@ -1903,7 +1955,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     meter_kind = COALESCE(meter_kind, :meter_kind),
                                     meter_value = COALESCE(meter_value, :meter_value),
                                     stage = 'meter_written',
-                                    stage_updated_at = now()
+                                    stage_updated_at = now(),
+                                    diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
                                 WHERE id = :id
                             """),
                             {
@@ -1911,6 +1964,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 "meter_index": int(assigned_meter_index),
                                 "meter_kind": str(kind),
                                 "meter_value": float(value_float),
+                                "diag_json": diag_json_str,
                             },
                         )
                 except Exception as e:
@@ -1918,6 +1972,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
         except Exception as e:
             diag["errors"].append({"meter_write_failed": str(e)})
+
 
     # 7) bill (для бота и web)
     bill = None
