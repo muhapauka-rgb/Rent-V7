@@ -1,9 +1,7 @@
 import React, { useEffect, useMemo, useState } from "react";
 import MetersTable from "./components/MetersTable";
 
-
 type ApartmentItem = { id: number; title: string; address?: string | null; electric_expected?: number | null };
-
 
 type ApartmentsResp = { ok: boolean; ym: string; items: ApartmentItem[] };
 
@@ -58,7 +56,14 @@ type UnassignedResp = { ok: boolean; items: UnassignedPhoto[] };
 
 type ApartmentCardResp = {
   ok: boolean;
-  apartment: { id: number; title: string; address?: string | null; tenant_name?: string | null; note?: string | null };
+  apartment: {
+    id: number;
+    title: string;
+    address?: string | null;
+    tenant_name?: string | null;
+    note?: string | null;
+    electric_expected?: number | null; // <-- добавили (может приходить, а может нет)
+  };
   contacts: { phone: string | null; telegram: string | null };
   chats: Array<{ chat_id: string; is_active: boolean; updated_at: string; created_at: string }>;
 };
@@ -146,10 +151,7 @@ export default function App() {
   // серверный "текущий месяц"
   const [serverYm, setServerYm] = useState<string>("");
 
-  const selected = useMemo(
-    () => apartments.find((a) => a.id === selectedId) ?? null,
-    [apartments, selectedId]
-  );
+  const selected = useMemo(() => apartments.find((a) => a.id === selectedId) ?? null, [apartments, selectedId]);
 
   // Apartment info modal
   const [infoOpen, setInfoOpen] = useState(false);
@@ -163,11 +165,17 @@ export default function App() {
   const [infoChats, setInfoChats] = useState<Array<{ chat_id: string; is_active: boolean; updated_at: string; created_at: string }>>([]);
   const [bindChatInput, setBindChatInput] = useState("");
 
+  // <-- добавили: сколько фото электро ждём (1..3)
+  const [infoElectricExpected, setInfoElectricExpected] = useState<string>("1");
+
   async function openInfo(apartmentId: number) {
     setInfoOpen(true);
     setInfoLoading(true);
     try {
       setErr(null);
+
+      const aLocal = apartments.find((a) => a.id === apartmentId) ?? null;
+
       const data = await apiGet<ApartmentCardResp>(`/admin/ui/apartments/${apartmentId}/card`);
       setInfoTitle(data.apartment?.title ?? "");
       setInfoAddress((data.apartment?.address ?? "") as any);
@@ -177,6 +185,12 @@ export default function App() {
       setInfoTelegram(data.contacts?.telegram ?? "");
       setInfoChats(data.chats ?? []);
       setBindChatInput("");
+
+      const ee =
+        (data.apartment as any)?.electric_expected ??
+        (aLocal as any)?.electric_expected ??
+        1;
+      setInfoElectricExpected(String(ee ?? 1));
     } catch (e: any) {
       setErr(String(e?.message ?? e));
       setInfoOpen(false);
@@ -191,6 +205,11 @@ export default function App() {
       setErr("Название квартиры обязательно.");
       return;
     }
+
+    // <-- нормализуем 1..3
+    const eeRaw = Number((infoElectricExpected ?? "").trim());
+    const ee = Math.max(1, Math.min(3, Number.isFinite(eeRaw) ? eeRaw : 1));
+
     try {
       setErr(null);
       await fetch(`/api/admin/ui/apartments/${apartmentId}`, {
@@ -203,6 +222,7 @@ export default function App() {
           note: infoNote.trim() || null,
           phone: infoPhone.trim() || null,
           telegram: infoTelegram.trim() || null,
+          electric_expected: ee, // <-- добавили
         }),
       }).then(async (r) => {
         if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -611,7 +631,6 @@ export default function App() {
   // сколько столбцов электро показывать (T1/T2/T3)
   const eN = Math.max(1, Math.min(3, Number((selected as any)?.electric_expected ?? 1) || 1));
 
-
   function calcSewerDelta(h: HistoryResp["history"][number]) {
     const d = h?.meters?.sewer?.delta;
     if (d != null && Number.isFinite(d)) return d;
@@ -865,10 +884,7 @@ export default function App() {
           <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ fontWeight: 900 }}>Тарифы</div>
-              <button
-                onClick={() => loadTariffs()}
-                style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}
-              >
+              <button onClick={() => loadTariffs()} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}>
                 Обновить
               </button>
             </div>
@@ -889,10 +905,7 @@ export default function App() {
 
               <input placeholder="Водоотв" value={tariffSewer} onChange={(e) => setTariffSewer(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
 
-              <button
-                onClick={saveTariff}
-                style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}
-              >
+              <button onClick={saveTariff} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                 Сохранить
               </button>
             </div>
@@ -944,10 +957,7 @@ export default function App() {
           <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <div style={{ fontWeight: 900 }}>Неразобранные фото</div>
-              <button
-                onClick={() => loadUnassigned()}
-                style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}
-              >
+              <button onClick={() => loadUnassigned()} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}>
                 Обновить
               </button>
             </div>
@@ -1050,10 +1060,7 @@ export default function App() {
           <div onClick={(e) => e.stopPropagation()} style={{ width: 640, maxWidth: "100%", background: "white", borderRadius: 14, padding: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 900, fontSize: 18 }}>Редактировать показания: {editMonth}</div>
-              <button
-                onClick={() => setEditOpen(false)}
-                style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
-              >
+              <button onClick={() => setEditOpen(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                 Закрыть
               </button>
             </div>
@@ -1085,21 +1092,13 @@ export default function App() {
                 </label>
               </div>
 
-              <div style={{ color: "#666", fontSize: 12 }}>
-                Если поле оставить пустым — оно не изменится. Можно вводить с точкой или запятой.
-              </div>
+              <div style={{ color: "#666", fontSize: 12 }}>Если поле оставить пустым — оно не изменится. Можно вводить с точкой или запятой.</div>
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
-                <button
-                  onClick={() => setEditOpen(false)}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
-                >
+                <button onClick={() => setEditOpen(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                   Отмена
                 </button>
-                <button
-                  onClick={saveEdit}
-                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}
-                >
+                <button onClick={saveEdit} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                   Сохранить
                 </button>
               </div>
@@ -1124,10 +1123,7 @@ export default function App() {
           <div onClick={(e) => e.stopPropagation()} style={{ width: 640, maxWidth: "100%", background: "white", borderRadius: 14, padding: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 900, fontSize: 18 }}>Карточка квартиры</div>
-              <button
-                onClick={() => setInfoOpen(false)}
-                style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
-              >
+              <button onClick={() => setInfoOpen(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                 Закрыть
               </button>
             </div>
@@ -1147,6 +1143,23 @@ export default function App() {
                     <input value={infoAddress} onChange={(e) => setInfoAddress(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
                 </div>
+
+                {/* <-- добавили: выбор количества фото электро */}
+                <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ fontWeight: 800 }}>Электро: сколько фото ждём (сколько столбцов показывать)</div>
+                  <select
+                    value={infoElectricExpected}
+                    onChange={(e) => setInfoElectricExpected(e.target.value)}
+                    style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
+                  >
+                    <option value="1">1 (T1)</option>
+                    <option value="2">2 (T1, T2)</option>
+                    <option value="3">3 (T1, T2, T3)</option>
+                  </select>
+                  <div style={{ color: "#666", fontSize: 12 }}>
+                    Это влияет на интерфейс (сколько колонок электро показываем) и на то, сколько фото электро ожидаем от жильца.
+                  </div>
+                </label>
 
                 <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
                   <label style={{ display: "grid", gap: 6 }}>
@@ -1187,9 +1200,7 @@ export default function App() {
                   <div style={{ fontWeight: 900, marginBottom: 8 }}>Привязанные Telegram ID (chat_id)</div>
 
                   {!infoChats.length ? (
-                    <div style={{ color: "#666" }}>
-                      Пока нет привязок. Они появятся автоматически после первого совпадения по телефону/нику или после ручной привязки ниже.
-                    </div>
+                    <div style={{ color: "#666" }}>Пока нет привязок. Они появятся автоматически после первого совпадения по телефону/нику или после ручной привязки ниже.</div>
                   ) : (
                     <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
                       {infoChats.map((c) => (
@@ -1229,10 +1240,7 @@ export default function App() {
                       placeholder="Ввести chat_id для ручной привязки"
                       style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd", minWidth: 260, flex: "1 1 260px" }}
                     />
-                    <button
-                      onClick={() => bindChatToApartment(selected.id)}
-                      style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}
-                    >
+                    <button onClick={() => bindChatToApartment(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                       Привязать
                     </button>
                   </div>
@@ -1242,16 +1250,10 @@ export default function App() {
                 </div>
 
                 <div style={{ display: "flex", gap: 10, justifyContent: "flex-end", position: "sticky", bottom: 0, background: "white", paddingTop: 12, marginTop: 12, borderTop: "1px solid #eee" }}>
-                  <button
-                    onClick={() => setInfoOpen(false)}
-                    style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
-                  >
+                  <button onClick={() => setInfoOpen(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                     Отмена
                   </button>
-                  <button
-                    onClick={() => saveInfo(selected.id)}
-                    style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}
-                  >
+                  <button onClick={() => saveInfo(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                     Сохранить
                   </button>
                 </div>
