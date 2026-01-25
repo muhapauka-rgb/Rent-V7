@@ -175,7 +175,8 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
 
     async def _job():
         try:
-            await asyncio.sleep(30)
+            # ВАЖНО: таймер напоминания = 40 секунд (по твоему пункту 3)
+            await asyncio.sleep(40)
 
             if key in SENT_BILL:
                 return
