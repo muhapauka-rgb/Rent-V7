@@ -235,7 +235,6 @@ def ensure_tables() -> None:
                 ydisk_path TEXT NULL,
                 status TEXT NOT NULL DEFAULT 'unassigned',
                 apartment_id BIGINT NULL,
-                ym TEXT NULL,
                 ocr_json JSONB NULL,
 
                 meter_index INTEGER NOT NULL DEFAULT 1,
@@ -265,8 +264,6 @@ def ensure_tables() -> None:
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_value NUMERIC(12,3) NULL;"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_written BOOLEAN NOT NULL DEFAULT FALSE;"))
         conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS diag_json JSONB NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ym TEXT NULL;"))
-
 
         # FK безопасно
         conn.execute(text("""
@@ -1307,21 +1304,14 @@ def effective_tariff_for_month(conn, ym: str) -> dict:
     t = _get_tariff_for_month(conn, ym)
     if not isinstance(t, dict):
         t = {}
-
-    # ВАЖНО: ключи должны совпадать с тем, как ниже используются тарифы в _calc_month_bill()
     return {
-        "cold": float(t.get("cold", 0) or 0),
-        "hot": float(t.get("hot", 0) or 0),
+        "water_cold": float(t.get("water_cold", 0) or 0),
+        "water_hot": float(t.get("water_hot", 0) or 0),
         "sewer": float(t.get("sewer", 0) or 0),
-
-        # базовый тариф электро (на случай, если tier-тарифы отсутствуют)
-        "electric": float(t.get("electric", 0) or 0),
-
         "electric_t1": float(t.get("electric_t1", 0) or 0),
         "electric_t2": float(t.get("electric_t2", 0) or 0),
         "electric_t3": float(t.get("electric_t3", 0) or 0),
     }
-
 
 
 def find_apartment_for_chat(conn, chat_id: str) -> Optional[dict]:
@@ -1348,7 +1338,6 @@ def _get_tariff_for_month(conn, ym: str) -> Optional[Dict[str, float]]:
             SELECT
                 month_from,
                 cold, hot, sewer,
-                electric,
                 COALESCE(electric_t1, electric) AS electric_t1,
                 COALESCE(electric_t2, electric) AS electric_t2,
                 COALESCE(electric_t3, electric) AS electric_t3
@@ -1366,7 +1355,6 @@ def _get_tariff_for_month(conn, ym: str) -> Optional[Dict[str, float]]:
         "cold": float(row["cold"]),
         "hot": float(row["hot"]),
         "sewer": float(row["sewer"]),
-        "electric": float(row["electric"]),
         "electric_t1": float(row["electric_t1"]) if row["electric_t1"] is not None else None,
         "electric_t2": float(row["electric_t2"]) if row["electric_t2"] is not None else None,
         "electric_t3": float(row["electric_t3"]) if row["electric_t3"] is not None else None,
@@ -1910,7 +1898,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         INSERT INTO photo_events
                         (
                             chat_id, telegram_username, phone, original_filename, ydisk_path,
-                            status, apartment_id, ym, ocr_json,
+                            status, apartment_id, ocr_json,
                             meter_index,
                             stage, stage_updated_at,
                             file_sha256, ocr_type, ocr_reading,
@@ -1920,7 +1908,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         VALUES
                         (
                             :chat_id, :username, :phone, :orig, :path,
-                            :status, :apartment_id, :ym,
+                            :status, :apartment_id,
                             CASE WHEN :ocr_json IS NULL THEN NULL ELSE CAST(:ocr_json AS JSONB) END,
                             :meter_index,
                             :stage, now(),
@@ -1938,7 +1926,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         "path": ydisk_path,
                         "status": status,
                         "apartment_id": apartment_id,
-                        "ym": str(ym),
                         "ocr_json": ocr_json_str,
                         "meter_index": int(meter_index),
                         "stage": stage,
@@ -2174,6 +2161,7 @@ class BotDuplicateResolveIn(BaseModel):
 
 
 @app.post("/bot/manual-reading")
+@app.post("/bot/manual-reading")
 def bot_manual_reading(payload: BotManualReadingIn):
     """Write a meter reading manually for the chat's bound apartment."""
     if not db_ready():
@@ -2242,7 +2230,6 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
     """Resolve a possible duplicate warning coming from /events/photo."""
     if not db_ready():
         raise HTTPException(status_code=503, detail="DB not ready")
-    ensure_tables()
 
     action = str(payload.action or "").strip().lower()
     if action not in ("ok", "repeat"):
@@ -2253,7 +2240,7 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
     with engine.begin() as conn:
         row = conn.execute(
             text("""
-                SELECT id, chat_id, apartment_id, ym, meter_kind, meter_index
+                SELECT id, chat_id, apartment_id, ym, meter_type, meter_index
                 FROM photo_events
                 WHERE id=:id
                 LIMIT 1
@@ -2264,51 +2251,48 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
         if not row:
             return {"ok": False, "reason": "photo_event_not_found", "bill": None}
 
-        apartment_id = row[2]
-        ym = (row[3] or month_now())
-        meter_kind = (row[4] or "")
+        chat_id = int(row[1])
+        apartment_id = int(row[2])
+        ym = str(row[3])
+        meter_type = str(row[4] or "")
         meter_index = int(row[5] or 1)
 
-        if apartment_id is None:
-            return {"ok": False, "reason": "photo_event_not_assigned", "bill": None}
-
-        apartment_id = int(apartment_id)
-        ym = str(ym).strip()
-        meter_kind = str(meter_kind).strip()
-
-        if not meter_kind:
-            return {"ok": False, "reason": "no_meter_kind", "bill": None}
-
         if action == "repeat":
-            # meter_readings.value NOT NULL -> NULL ставить нельзя, поэтому удаляем запись
+            # mark the reading as missing again (do not delete the row to keep uniqueness)
             conn.execute(
                 text("""
-                    DELETE FROM meter_readings
+                    UPDATE meter_readings
+                    SET value=NULL, source='duplicate_repeat', updated_at=NOW()
                     WHERE apartment_id=:aid AND ym=:ym AND meter_type=:t AND meter_index=:i
                 """),
-                {"aid": apartment_id, "ym": ym, "t": meter_kind, "i": int(meter_index)},
+                {"aid": apartment_id, "ym": ym, "t": meter_type, "i": meter_index},
             )
-            conn.execute(
-                text("""
-                    UPDATE photo_events
-                    SET status='dup_repeat', stage='dup_repeat', stage_updated_at=NOW()
-                    WHERE id=:id
-                """),
-                {"id": peid},
-            )
+            try:
+                conn.execute(
+                    text("""
+                        UPDATE photo_events
+                        SET status='dup_repeat', updated_at=NOW()
+                        WHERE id=:id
+                    """),
+                    {"id": peid},
+                )
+            except Exception:
+                pass
         else:
-            conn.execute(
-                text("""
-                    UPDATE photo_events
-                    SET status='dup_ok', stage='dup_ok', stage_updated_at=NOW()
-                    WHERE id=:id
-                """),
-                {"id": peid},
-            )
+            try:
+                conn.execute(
+                    text("""
+                        UPDATE photo_events
+                        SET status='dup_ok', updated_at=NOW()
+                        WHERE id=:id
+                    """),
+                    {"id": peid},
+                )
+            except Exception:
+                pass
 
-        bill = _calc_month_bill(conn, apartment_id, ym)
+        bill = _calc_month_bill(conn, chat_id, ym)
         return {"ok": True, "bill": bill}
-
 
 
 @app.get("/dashboard/apartments")
