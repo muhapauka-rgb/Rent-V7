@@ -1898,6 +1898,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         stage = "received"
 
     # 5) insert photo_event
+    ym = month_now()
+
     photo_event_id = None
     if db_ready():
         try:
@@ -1956,7 +1958,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 6) write meter_readings + statuses
     wrote_meter = False
-    ym = month_now()
     assigned_meter_index = int(meter_index)
 
     if db_ready() and apartment_id and kind and (value_float is not None):
@@ -2005,6 +2006,46 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             "ocr_value": float(value_float),
                         },
                     )
+            # 6.2A) Проверяем: если этот же файл уже был (file_sha256) -> возможный дубль фото
+            try:
+                if db_ready() and photo_event_id and file_sha256:
+                    with engine.begin() as conn:
+                        prev = conn.execute(
+                            text("""
+                                SELECT id, created_at, ym, meter_kind, meter_index, meter_value
+                                FROM photo_events
+                                WHERE chat_id=:chat_id
+                                  AND file_sha256=:sha
+                                  AND id <> :id
+                                ORDER BY created_at DESC
+                                LIMIT 1
+                            """),
+                            {
+                                "chat_id": str(chat_id),
+                                "sha": str(file_sha256),
+                                "id": int(photo_event_id),
+                            },
+                        ).mappings().first()
+
+                    if prev:
+                        diag["warnings"].append(
+                            {
+                                "possible_duplicate": {
+                                    "meter_type": str(prev.get("meter_kind") or kind),
+                                    "meter_index": int(prev.get("meter_index") or assigned_meter_index or 1),
+                                    "ym": str(prev.get("ym") or ym),
+                                    "value": float(value_float),
+                                    "incoming_meter_type": str(kind),
+                                    "incoming_meter_index": int(assigned_meter_index),
+                                    "reason": "same_file_sha256",
+                                    "prev_photo_event_id": int(prev.get("id")),
+                                    "prev_created_at": str(prev.get("created_at")),
+                                }
+                            }
+                        )
+            except Exception as e:
+                diag["warnings"].append({"duplicate_sha_check_failed": str(e)})
+
 
             # 6.2) ПОСЛЕ записи проверяем: возможно это одно и то же фото (значение совпало с другим счётчиком)
             try:
@@ -2280,14 +2321,10 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
             return {"ok": False, "reason": "no_meter_kind", "bill": None}
 
         if action == "repeat":
-            # meter_readings.value NOT NULL -> NULL ставить нельзя, поэтому удаляем запись
-            conn.execute(
-                text("""
-                    DELETE FROM meter_readings
-                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:t AND meter_index=:i
-                """),
-                {"aid": apartment_id, "ym": ym, "t": meter_kind, "i": int(meter_index)},
-            )
+            # ВАЖНО: НЕ удаляем meter_readings.
+            # Причина: при дубликате фактически пришло то же фото/то же значение,
+            # а удаление приводит к тому, что в квартире “пропадает” показание.
+            # Мы лишь помечаем photo_event как dup_repeat и ждём новое фото.
             conn.execute(
                 text("""
                     UPDATE photo_events
@@ -2776,6 +2813,7 @@ def upsert_tariff(payload: TariffIn):
 
 
 @app.get("/admin/ui/apartments/{apartment_id}/history")
+@app.get("/admin/ui/apartments/{apartment_id}/history")
 def ui_apartment_history(apartment_id: int):
     if not db_ready():
         raise HTTPException(status_code=503, detail="DB not ready")
@@ -2816,9 +2854,26 @@ def ui_apartment_history(apartment_id: int):
             y -= 1
         return f"{y:04d}-{m:02d}"
 
+    def add_months(ym: str, delta: int) -> str:
+        y, m = ym.split("-")
+        y = int(y)
+        m = int(m)
+        m = m + delta
+        while m > 12:
+            m -= 12
+            y += 1
+        while m < 1:
+            m += 12
+            y -= 1
+        return f"{y:04d}-{m:02d}"
+
+    # последние 4 месяца (текущий + 3 предыдущих) — всегда
+    end_ym = current_ym()  # есть в файле :contentReference[oaicite:2]{index=2}
+    months_to_show = [add_months(end_ym, -3), add_months(end_ym, -2), add_months(end_ym, -1), end_ym]
+
     history: List[Dict[str, Any]] = []
 
-    for ym in sorted(by_month.keys()):
+    for ym in months_to_show:
         cur = by_month.get(ym, {})
         pm = prev_month(ym)
         prev = by_month.get(pm, {})
