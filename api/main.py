@@ -42,40 +42,6 @@ def _tg_send_message(chat_id: str, text_msg: str) -> bool:
 
 
 
-# ---- Bill message formatting (tenant)
-RU_MONTHS_CAP = {
-    "01": "Январь",
-    "02": "Февраль",
-    "03": "Март",
-    "04": "Апрель",
-    "05": "Май",
-    "06": "Июнь",
-    "07": "Июль",
-    "08": "Август",
-    "09": "Сентябрь",
-    "10": "Октябрь",
-    "11": "Ноябрь",
-    "12": "Декабрь",
-}
-
-def _format_bill_message(ym: str, total_rub: float) -> str:
-    """
-    Требование: "Оплата за МЕСЯЦ (Словами).ГОД xxxxр"
-    Пример: "Оплата за Апрель.2026 — 12345 ₽"
-    """
-    ym = (ym or "").strip()
-    try:
-        y, m = ym.split("-")
-    except Exception:
-        y, m = ym[:4], ym[5:7] if len(ym) >= 7 else ""
-    month_name = RU_MONTHS_CAP.get(str(m).zfill(2), ym)
-    # Округляем до рублей (без копеек), так как в ТЗ "xxxxр"
-    rub_int = int(round(float(total_rub)))
-    # пробелы тысяч для читаемости
-    rub_txt = f"{rub_int:,}".replace(",", " ")
-    return f"Оплата за {month_name}.{y} — {rub_txt} ₽"
-
-
 # Yandex Disk WebDAV
 YANDEX_WEBDAV_BASE_URL = os.getenv("YANDEX_WEBDAV_BASE_URL", "https://webdav.yandex.ru")
 YANDEX_WEBDAV_USERNAME = os.getenv("YANDEX_WEBDAV_USERNAME", "")
@@ -2199,6 +2165,19 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     telegram_username = form.get("telegram_username") or None
     phone = form.get("phone") or None
 
+    # month (ym) for this photo event. Bot may send it; otherwise default to current month.
+    ym_raw = form.get("ym")
+    if ym_raw is None or str(ym_raw).strip() == "":
+        ym = month_now()
+    else:
+        ym_raw = str(ym_raw).strip()
+        if not re.match(r"^\d{4}-\d{2}$", ym_raw):
+            ym = month_now()
+            diag["warnings"].append({"invalid_ym": ym_raw})
+        else:
+            ym = ym_raw
+
+
     raw_meter_index = form.get("meter_index")
     try:
         meter_index = int(raw_meter_index) if raw_meter_index is not None else 1
@@ -2508,7 +2487,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
                 st = _get_month_bill_state(conn, int(apartment_id), str(ym))
                 if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
-                    msg = _format_bill_message(str(ym), float(bill.get("total_rub")))
+                    msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
                     if _tg_send_message(str(chat_id), msg):
                         _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True)
         except Exception:
@@ -2564,55 +2543,6 @@ def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
 
         bill = _calc_month_bill(conn, int(apt["id"]), ym)
         return {"ok": True, "apartment_id": int(apt["id"]), "ym": ym, "bill": bill}
-
-
-
-class BotChatContactIn(BaseModel):
-    phone: str = ""
-    telegram_username: Optional[str] = None
-
-
-@app.post("/bot/chats/{chat_id}/contact")
-def bot_chat_contact(chat_id: str, payload: BotChatContactIn):
-    """
-    Бот присылает сюда контакт (phone + telegram_username).
-    Сервер пытается найти квартиру по контактам, и если находит — привязывает chat_id.
-
-    Это нужно, чтобы после "Отправить контакт" в боте в WEB сразу появился chat_id
-    (в "Привязанные Telegram ID") и username (если указан).
-    """
-    if not db_ready():
-        raise HTTPException(status_code=503, detail="db_disabled")
-    ensure_tables()
-
-    chat_id = str(chat_id).strip()
-    if not chat_id:
-        raise HTTPException(status_code=400, detail="chat_id required")
-
-    phone_norm = norm_phone(payload.phone or "")
-    username = (payload.telegram_username or "").strip().lstrip("@").lower() or None
-
-    apt_id = find_apartment_by_contact(username, phone_norm)
-    if not apt_id:
-        return {"ok": False, "reason": "no_match"}
-
-    # Привязываем чат
-    bind_chat(chat_id, int(apt_id))
-
-    # Если есть username — добавляем/активируем контакт "telegram"
-    if username:
-        with engine.begin() as conn:
-            conn.execute(
-                text("""
-                    INSERT INTO apartment_contacts (apartment_id, kind, value, is_active)
-                    VALUES (:apartment_id, 'telegram', :value, true)
-                    ON CONFLICT (kind, value)
-                    DO UPDATE SET apartment_id=EXCLUDED.apartment_id, is_active=true
-                """),
-                {"apartment_id": int(apt_id), "value": username},
-            )
-
-    return {"ok": True, "apartment_id": int(apt_id)}
 
 
 # -------------------------
@@ -3181,47 +3111,6 @@ def get_tariffs():
     }
 
 
-@app.get("/admin/ui/apartments/{apartment_id}/tariffs")
-def ui_apartment_tariffs(apartment_id: int):
-    """
-    UI вызывает этот endpoint, чтобы показать “тариф: …” под каждой колонкой.
-
-    В базе tariffs хранится:
-      month_from (YYYY-MM) + cold/hot/electric/sewer.
-
-    Для обратной совместимости UI также отдаём поля e1/e2 (как electric).
-    """
-    if not db_ready():
-        raise HTTPException(status_code=503, detail="db_disabled")
-    ensure_tables()
-
-    with engine.begin() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT month_from, cold, hot, electric, sewer
-                FROM tariffs
-                ORDER BY month_from ASC
-            """)
-        ).fetchall()
-
-    items = []
-    for month_from, cold, hot, electric, sewer in rows:
-        ym = str(month_from)
-        e = float(electric) if electric is not None else None
-        items.append({
-            "ym": ym,
-            "cold": float(cold) if cold is not None else None,
-            "hot": float(hot) if hot is not None else None,
-            "electric": e,
-            "e1": e,   # legacy UI key
-            "e2": e,   # legacy UI key
-            "sewer": float(sewer) if sewer is not None else None,
-        })
-
-    return {"apartment_id": int(apartment_id), "tariffs": items}
-
-
-
 @app.post("/tariffs")
 def upsert_tariff(payload: TariffIn):
     # Accept both month_from and ym_from
@@ -3318,25 +3207,7 @@ def ui_apartment_history(apartment_id: int):
 
     history: List[Dict[str, Any]] = []
 
-    # UI показывает "последние 4 месяца". Даже если данных нет — показываем каркас.
-    def ym_shift(ym: str, delta: int) -> str:
-        y, m = ym.split("-")
-        y = int(y)
-        m = int(m)
-        m = m + int(delta)
-        while m <= 0:
-            m += 12
-            y -= 1
-        while m >= 13:
-            m -= 12
-            y += 1
-        return f"{y:04d}-{m:02d}"
-
-    latest = max(by_month.keys()) if by_month else current_ym()
-    # Берём 4 месяца: latest-3 ... latest
-    months = [ym_shift(latest, i) for i in (-3, -2, -1, 0)]
-
-    for ym in months:
+    for ym in sorted(by_month.keys()):
         cur = by_month.get(ym, {})
         pm = prev_month(ym)
         prev = by_month.get(pm, {})
@@ -3417,7 +3288,7 @@ def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
         if payload.send and (bill.get("reason") == "ok") and bill.get("total_rub") is not None:
             chat_id = _get_active_chat_id(conn, int(apartment_id))
             if chat_id:
-                msg = _format_bill_message(str(ym_), float(bill.get("total_rub")))
+                msg = f"Сумма оплаты по счётчикам за {ym_}: {float(bill.get('total_rub')):.2f} ₽"
                 sent = _tg_send_message(chat_id, msg)
                 if sent:
                     _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True)
@@ -3551,7 +3422,7 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
                 if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
                     chat_id = _get_active_chat_id(conn, int(apartment_id))
                     if chat_id:
-                        msg = _format_bill_message(str(ym), float(bill.get("total_rub")))
+                        msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
                         if _tg_send_message(str(chat_id), msg):
                             _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True)
         except Exception:
@@ -3604,7 +3475,7 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
             if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
                 chat_id = _get_active_chat_id(conn, int(apartment_id))
                 if chat_id:
-                    msg = _format_bill_message(str(month), float(bill.get("total_rub")))
+                    msg = f"Сумма оплаты по счётчикам за {month}: {float(bill.get('total_rub')):.2f} ₽"
                     if _tg_send_message(str(chat_id), msg):
                         _set_month_bill_state(conn, int(apartment_id), str(month), sent_at=True)
     except Exception:
