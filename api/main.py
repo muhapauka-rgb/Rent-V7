@@ -7,8 +7,13 @@ import json
 import re
 import requests
 import hashlib
+import threading
+import time
+
 from datetime import datetime
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import OperationalError
+
 
 app = FastAPI(title="Rent Backend API")
 
@@ -24,6 +29,11 @@ YANDEX_STORAGE_ROOT = os.getenv("YANDEX_STORAGE_ROOT", "tenants")
 # DB
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL) if DATABASE_URL else None
+
+# --- schema init guard (prevents deadlocks on concurrent requests) ---
+_SCHEMA_INIT_LOCK = threading.Lock()
+_SCHEMA_INIT_DONE = False
+_SCHEMA_ADVISORY_LOCK_KEY = 987654321  # any stable 64-bit int
 
 
 def db_ready() -> bool:
@@ -104,213 +114,253 @@ def upload_to_ydisk(
 
 
 def ensure_tables() -> None:
-    """Idempotent создание таблиц + мягкие миграции.
-    ВАЖНО: не ломаем существующую схему — только добавляем недостающие поля/индексы.
+    """Create/migrate DB schema once per process.
+
+    IMPORTANT: this function can be called from many endpoints. We guard it to avoid
+    concurrent DDL (ALTER TABLE / CREATE INDEX) which can deadlock in Postgres.
     """
     if not db_ready():
         return
+    global _SCHEMA_INIT_DONE
+    if _SCHEMA_INIT_DONE:
+        return
+    with _SCHEMA_INIT_LOCK:
+        if _SCHEMA_INIT_DONE:
+            return
+        # DDL can deadlock if multiple requests hit it concurrently. Retry a few times.
+        for attempt in range(1, 6):
+            try:
+                with engine.begin() as conn:
+                    # Keep waits bounded (Postgres only).
+                    try:
+                        conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                        conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+                    except Exception:
+                        pass
 
-    with engine.begin() as conn:
-        # --- apartments ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS apartments (
-                id BIGSERIAL PRIMARY KEY,
-                title TEXT NOT NULL,
-                tenant_name TEXT NULL,
-                address TEXT NULL,
-                note TEXT NULL,
-                ls_account TEXT NULL,
-                electric_expected INTEGER NOT NULL DEFAULT 3,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS tenant_name TEXT NULL;"))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS address TEXT NULL;"))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS note TEXT NULL;"))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS ls_account TEXT NULL;"))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS electric_expected INTEGER NOT NULL DEFAULT 3;"))
-        conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
+                    # Cross-process lock (Postgres) to prevent concurrent schema changes
+                    # from multiple workers/containers.
+                    _use_unlock = False
+                    try:
+                        conn.execute(text("SELECT pg_advisory_lock(:k)"), {"k": _SCHEMA_ADVISORY_LOCK_KEY})
+                        _use_unlock = True
+                    except Exception:
+                        _use_unlock = False
 
-        # --- tariffs ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS tariffs (
-                month_from TEXT PRIMARY KEY,  -- YYYY-MM
-                cold NUMERIC(14,3) NOT NULL,
-                hot NUMERIC(14,3) NOT NULL,
-                electric NUMERIC(14,3) NOT NULL,
-                sewer NUMERIC(14,3) NOT NULL DEFAULT 0,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
-        conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sewer NUMERIC(14,3) NOT NULL DEFAULT 0;"))
-        conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
-        conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
+                    # ---- original schema DDL (kept as-is) ----
+                    # --- apartments ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS apartments (
+                            id BIGSERIAL PRIMARY KEY,
+                            title TEXT NOT NULL,
+                            tenant_name TEXT NULL,
+                            address TEXT NULL,
+                            note TEXT NULL,
+                            ls_account TEXT NULL,
+                            electric_expected INTEGER NOT NULL DEFAULT 3,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS tenant_name TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS address TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS note TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS ls_account TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS electric_expected INTEGER NOT NULL DEFAULT 3;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
 
-        # NEW: тарифы электро T1/T2/T3 (совместимость: если NULL — используем electric)
-        conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t1 NUMERIC(14,3) NULL;"))
-        conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t2 NUMERIC(14,3) NULL;"))
-        conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t3 NUMERIC(14,3) NULL;"))
+                    # --- tariffs ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS tariffs (
+                            month_from TEXT PRIMARY KEY,  -- YYYY-MM
+                            cold NUMERIC(14,3) NOT NULL,
+                            hot NUMERIC(14,3) NOT NULL,
+                            electric NUMERIC(14,3) NOT NULL,
+                            sewer NUMERIC(14,3) NOT NULL DEFAULT 0,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
+                    conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS sewer NUMERIC(14,3) NOT NULL DEFAULT 0;"))
+                    conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
+                    conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
 
-        # --- apartment_contacts ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS apartment_contacts (
-                id BIGSERIAL PRIMARY KEY,
-                apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
-                kind TEXT NOT NULL,       -- telegram | phone
-                value TEXT NOT NULL,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
+                    # NEW: тарифы электро T1/T2/T3 (совместимость: если NULL — используем electric)
+                    conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t1 NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t2 NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t3 NUMERIC(14,3) NULL;"))
 
-        # --- apartment_statuses ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS apartment_statuses (
-                apartment_id BIGINT PRIMARY KEY REFERENCES apartments(id) ON DELETE CASCADE,
-                rent_paid BOOLEAN NOT NULL DEFAULT FALSE,
-                meters_paid BOOLEAN NOT NULL DEFAULT FALSE,
-                meters_photo_cold BOOLEAN NOT NULL DEFAULT FALSE,
-                meters_photo_hot BOOLEAN NOT NULL DEFAULT FALSE,
-                meters_photo_electric BOOLEAN NOT NULL DEFAULT FALSE,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
+                    # --- apartment_contacts ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS apartment_contacts (
+                            id BIGSERIAL PRIMARY KEY,
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            kind TEXT NOT NULL,       -- telegram | phone
+                            value TEXT NOT NULL,
+                            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
 
-        # --- apartment_month_statuses ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS apartment_month_statuses (
-                apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
-                ym TEXT NOT NULL, -- YYYY-MM
-                rent_paid BOOLEAN NOT NULL DEFAULT FALSE,
-                meters_photo BOOLEAN NOT NULL DEFAULT FALSE,
-                meters_paid BOOLEAN NOT NULL DEFAULT FALSE,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (apartment_id, ym)
-            );
-        """))
+                    # --- apartment_statuses ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS apartment_statuses (
+                            apartment_id BIGINT PRIMARY KEY REFERENCES apartments(id) ON DELETE CASCADE,
+                            rent_paid BOOLEAN NOT NULL DEFAULT FALSE,
+                            meters_paid BOOLEAN NOT NULL DEFAULT FALSE,
+                            meters_photo_cold BOOLEAN NOT NULL DEFAULT FALSE,
+                            meters_photo_hot BOOLEAN NOT NULL DEFAULT FALSE,
+                            meters_photo_electric BOOLEAN NOT NULL DEFAULT FALSE,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
 
-        # Миграции (добавление новых колонок без ломания старых БД)
-        conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_pending BOOLEAN NOT NULL DEFAULT FALSE"))
-        conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_expected_snapshot INTEGER"))
-        conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_resolved_at TIMESTAMPTZ"))
+                    # --- apartment_month_statuses ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS apartment_month_statuses (
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            ym TEXT NOT NULL, -- YYYY-MM
+                            rent_paid BOOLEAN NOT NULL DEFAULT FALSE,
+                            meters_photo BOOLEAN NOT NULL DEFAULT FALSE,
+                            meters_paid BOOLEAN NOT NULL DEFAULT FALSE,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            PRIMARY KEY (apartment_id, ym)
+                        );
+                    """))
 
-        # --- meter_readings (единая схема) ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS meter_readings (
-                id BIGSERIAL PRIMARY KEY,
-                apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
-                ym TEXT NOT NULL,
-                meter_type TEXT NOT NULL,
-                meter_index INTEGER NOT NULL DEFAULT 1,
-                value NUMERIC(12,3) NOT NULL,
-                source TEXT NOT NULL DEFAULT 'ocr',
-                ocr_value NUMERIC(12,3) NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                UNIQUE (apartment_id, ym, meter_type, meter_index)
-            );
-        """))
+                    # Миграции (добавление новых колонок без ломания старых БД)
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_pending BOOLEAN NOT NULL DEFAULT FALSE"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_expected_snapshot INTEGER"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_resolved_at TIMESTAMPTZ"))
 
-        # --- chat_bindings ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS chat_bindings (
-                chat_id TEXT PRIMARY KEY,
-                apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
-                is_active BOOLEAN NOT NULL DEFAULT TRUE,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
+                    # --- meter_readings (единая схема) ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS meter_readings (
+                            id BIGSERIAL PRIMARY KEY,
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            ym TEXT NOT NULL,
+                            meter_type TEXT NOT NULL,
+                            meter_index INTEGER NOT NULL DEFAULT 1,
+                            value NUMERIC(12,3) NOT NULL,
+                            source TEXT NOT NULL DEFAULT 'ocr',
+                            ocr_value NUMERIC(12,3) NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            UNIQUE (apartment_id, ym, meter_type, meter_index)
+                        );
+                    """))
 
-        # --- photo_events ---
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS photo_events (
-                id BIGSERIAL PRIMARY KEY,
-                chat_id TEXT NOT NULL,
-                telegram_username TEXT NULL,
-                phone TEXT NULL,
-                original_filename TEXT NULL,
-                ydisk_path TEXT NULL,
-                status TEXT NOT NULL DEFAULT 'unassigned',
-                apartment_id BIGINT NULL,
-                ym TEXT NULL,
-                ocr_json JSONB NULL,
+                    # --- chat_bindings ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS chat_bindings (
+                            chat_id TEXT PRIMARY KEY,
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            is_active BOOLEAN NOT NULL DEFAULT TRUE,
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
 
-                meter_index INTEGER NOT NULL DEFAULT 1,
+                    # --- photo_events ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS photo_events (
+                            id BIGSERIAL PRIMARY KEY,
+                            chat_id TEXT NOT NULL,
+                            telegram_username TEXT NULL,
+                            phone TEXT NULL,
+                            original_filename TEXT NULL,
+                            ydisk_path TEXT NULL,
+                            status TEXT NOT NULL DEFAULT 'unassigned',
+                            apartment_id BIGINT NULL,
+                            ym TEXT NULL,
+                            ocr_json JSONB NULL,
 
-                stage TEXT NOT NULL DEFAULT 'received',
-                stage_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-                file_sha256 TEXT NULL,
-                ocr_type TEXT NULL,
-                ocr_reading NUMERIC(12,3) NULL,
-                meter_kind TEXT NULL,
-                meter_value NUMERIC(12,3) NULL,
-                meter_written BOOLEAN NOT NULL DEFAULT FALSE,
-                diag_json JSONB NULL,
+                            meter_index INTEGER NOT NULL DEFAULT 1,
 
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
-        """))
+                            stage TEXT NOT NULL DEFAULT 'received',
+                            stage_updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            file_sha256 TEXT NULL,
+                            ocr_type TEXT NULL,
+                            ocr_reading NUMERIC(12,3) NULL,
+                            meter_kind TEXT NULL,
+                            meter_value NUMERIC(12,3) NULL,
+                            meter_written BOOLEAN NOT NULL DEFAULT FALSE,
+                            diag_json JSONB NULL,
 
-        # Soft migrations
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_index INTEGER NOT NULL DEFAULT 1;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'received';"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS file_sha256 TEXT NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ocr_type TEXT NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ocr_reading NUMERIC(12,3) NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_kind TEXT NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_value NUMERIC(12,3) NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_written BOOLEAN NOT NULL DEFAULT FALSE;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS diag_json JSONB NULL;"))
-        conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ym TEXT NULL;"))
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
 
-
-        # FK безопасно
-        conn.execute(text("""
-        DO $$
-        BEGIN
-            IF NOT EXISTS (
-                SELECT 1
-                FROM pg_constraint
-                WHERE conname = 'fk_photo_events_apartment'
-            ) THEN
-                ALTER TABLE photo_events
-                ADD CONSTRAINT fk_photo_events_apartment
-                FOREIGN KEY (apartment_id) REFERENCES apartments(id) ON DELETE SET NULL;
-            END IF;
-        END $$;
-        """))
-
-        # Indexes
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_apartments_ls_account ON apartments(ls_account) WHERE ls_account IS NOT NULL;"))
-        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_apartment_contacts_kind_value ON apartment_contacts(kind, value);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_contacts_apartment_id ON apartment_contacts(apartment_id);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chat_bindings_apartment_id ON chat_bindings(apartment_id);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_chat_id ON photo_events(chat_id);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_created_at ON photo_events(created_at);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_status ON photo_events(status);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_apartment_id ON photo_events(apartment_id);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_meter_index ON photo_events(meter_index);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_stage ON photo_events(stage);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_file_sha256 ON photo_events(file_sha256);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_stage_updated_at ON photo_events(stage_updated_at);"))
-
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_month_statuses_ym ON apartment_month_statuses(ym);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meter_readings_apartment_ym ON meter_readings(apartment_id, ym);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meter_readings_meter_type ON meter_readings(meter_type);"))
-        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_statuses_updated_at ON apartment_statuses(updated_at);"))
-
-        # seed statuses for existing apartments
-        conn.execute(text("""
-            INSERT INTO apartment_statuses(apartment_id)
-            SELECT id FROM apartments
-            ON CONFLICT (apartment_id) DO NOTHING;
-        """))
+                    # Soft migrations
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_index INTEGER NOT NULL DEFAULT 1;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage TEXT NOT NULL DEFAULT 'received';"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS stage_updated_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS file_sha256 TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ocr_type TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ocr_reading NUMERIC(12,3) NULL;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_kind TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_value NUMERIC(12,3) NULL;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS meter_written BOOLEAN NOT NULL DEFAULT FALSE;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS diag_json JSONB NULL;"))
+                    conn.execute(text("ALTER TABLE photo_events ADD COLUMN IF NOT EXISTS ym TEXT NULL;"))
 
 
+                    # FK безопасно
+                    conn.execute(text("""
+                    DO $$
+                    BEGIN
+                        IF NOT EXISTS (
+                            SELECT 1
+                            FROM pg_constraint
+                            WHERE conname = 'fk_photo_events_apartment'
+                        ) THEN
+                            ALTER TABLE photo_events
+                            ADD CONSTRAINT fk_photo_events_apartment
+                            FOREIGN KEY (apartment_id) REFERENCES apartments(id) ON DELETE SET NULL;
+                        END IF;
+                    END $$;
+                    """))
+
+                    # Indexes
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_apartments_ls_account ON apartments(ls_account) WHERE ls_account IS NOT NULL;"))
+                    conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS uq_apartment_contacts_kind_value ON apartment_contacts(kind, value);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_contacts_apartment_id ON apartment_contacts(apartment_id);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_chat_bindings_apartment_id ON chat_bindings(apartment_id);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_chat_id ON photo_events(chat_id);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_created_at ON photo_events(created_at);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_status ON photo_events(status);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_apartment_id ON photo_events(apartment_id);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_meter_index ON photo_events(meter_index);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_stage ON photo_events(stage);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_file_sha256 ON photo_events(file_sha256);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_stage_updated_at ON photo_events(stage_updated_at);"))
+
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_month_statuses_ym ON apartment_month_statuses(ym);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meter_readings_apartment_ym ON meter_readings(apartment_id, ym);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meter_readings_meter_type ON meter_readings(meter_type);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_statuses_updated_at ON apartment_statuses(updated_at);"))
+
+                    # seed statuses for existing apartments
+                    conn.execute(text("""
+                        INSERT INTO apartment_statuses(apartment_id)
+                        SELECT id FROM apartments
+                        ON CONFLICT (apartment_id) DO NOTHING;
+                    """))
+
+                    if _use_unlock:
+                        try:
+                            conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": _SCHEMA_ADVISORY_LOCK_KEY})
+                        except Exception:
+                            pass
+                _SCHEMA_INIT_DONE = True
+                return
+            except OperationalError as e:
+                pgcode = getattr(getattr(e, "orig", None), "pgcode", None)
+                # 40P01 = deadlock_detected, 55P03 = lock_not_available, 57014 = query_canceled
+                if pgcode in ("40P01", "55P03", "57014"):
+                    time.sleep(0.2 * attempt)
+                    continue
+                raise
 def norm_phone(p: str) -> str:
     """
     Нормализация телефона для поиска/хранения.
@@ -1590,7 +1640,7 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
 # -----------------------
 # INTERNAL DB helper (NEW): manual/ocr write into meter_readings
 # -----------------------
-def _add_meter_reading_db(
+def _add_meter_reading_db_impl(
     conn,
     apartment_id: int,
     ym: str,
@@ -1598,22 +1648,13 @@ def _add_meter_reading_db(
     meter_index: int,
     value: float,
     source: str = "manual",
-) -> None:
+):
     """
-    Единая внутренняя функция записи показаний в meter_readings.
-    Нужна, чтобы НЕ вызывать endpoint-функции из кода (это и ломало /bot/manual-reading).
+    Низкоуровневая запись одного показания в БД (внутри уже открытого conn/transaction).
     """
-    mt = str(meter_type).strip()
-    try:
-        mi = int(meter_index or 1)
-    except Exception:
-        mi = 1
-    mi = max(1, min(3, mi))
-    if mt in ("cold", "hot", "sewer"):
-        mi = 1
-
     conn.execute(
-        text("""
+        text(
+            """
             INSERT INTO meter_readings(
                 apartment_id, ym, meter_type, meter_index, value, source, ocr_value
             )
@@ -1625,16 +1666,75 @@ def _add_meter_reading_db(
                 value = EXCLUDED.value,
                 source = EXCLUDED.source,
                 updated_at = now()
-        """),
+            """
+        ),
         {
             "aid": int(apartment_id),
             "ym": str(ym),
-            "mt": mt,
-            "mi": int(mi),
+            "mt": str(meter_type),
+            "mi": int(meter_index),
             "val": float(value),
             "src": str(source),
         },
     )
+
+
+def _add_meter_reading_db(*args, **kwargs):
+    """
+    Совместимость вызовов по всему проекту.
+
+    Поддерживаем форматы:
+      1) _add_meter_reading_db(conn, apartment_id, ym, meter_type, meter_index, value, source="manual")
+      2) _add_meter_reading_db(apartment_id, ym, meter_type, meter_index, value, source="manual")  # conn отсутствует
+      3) _add_meter_reading_db(apartment_id=..., ym=..., meter_type=..., meter_index=..., value=..., source="manual", conn=conn)
+    """
+    conn = kwargs.pop("conn", None)
+
+    # Вариант (1): первый аргумент похож на SQLAlchemy connection (у него есть .execute)
+    if args and hasattr(args[0], "execute") and not isinstance(args[0], (int, float, str, bool, dict, list, tuple)):
+        conn = args[0]
+        args = args[1:]
+
+    # Разбор параметров
+    if len(args) >= 5:
+        apartment_id = args[0]
+        ym = args[1]
+        meter_type = args[2]
+        meter_index = args[3]
+        value = args[4]
+        source = args[5] if len(args) >= 6 else kwargs.pop("source", "manual")
+    else:
+        apartment_id = kwargs.pop("apartment_id")
+        ym = kwargs.pop("ym")
+        meter_type = kwargs.pop("meter_type")
+        meter_index = kwargs.pop("meter_index")
+        value = kwargs.pop("value")
+        source = kwargs.pop("source", "manual")
+
+    if conn is None:
+        # Если conn не передали — открываем транзакцию сами.
+        with engine.begin() as _conn:
+            return _add_meter_reading_db_impl(
+                _conn,
+                apartment_id=int(apartment_id),
+                ym=str(ym),
+                meter_type=str(meter_type),
+                meter_index=int(meter_index),
+                value=float(value),
+                source=str(source),
+            )
+
+    return _add_meter_reading_db_impl(
+        conn,
+        apartment_id=int(apartment_id),
+        ym=str(ym),
+        meter_type=str(meter_type),
+        meter_index=int(meter_index),
+        value=float(value),
+        source=str(source),
+    )
+
+
 
 
 def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int, new_value: float) -> int:
@@ -1898,8 +1998,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         stage = "received"
 
     # 5) insert photo_event
-    ym = month_now()
-
     photo_event_id = None
     if db_ready():
         try:
@@ -1958,6 +2056,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 6) write meter_readings + statuses
     wrote_meter = False
+    ym = month_now()
     assigned_meter_index = int(meter_index)
 
     if db_ready() and apartment_id and kind and (value_float is not None):
@@ -2006,46 +2105,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             "ocr_value": float(value_float),
                         },
                     )
-            # 6.2A) Проверяем: если этот же файл уже был (file_sha256) -> возможный дубль фото
-            try:
-                if db_ready() and photo_event_id and file_sha256:
-                    with engine.begin() as conn:
-                        prev = conn.execute(
-                            text("""
-                                SELECT id, created_at, ym, meter_kind, meter_index, meter_value
-                                FROM photo_events
-                                WHERE chat_id=:chat_id
-                                  AND file_sha256=:sha
-                                  AND id <> :id
-                                ORDER BY created_at DESC
-                                LIMIT 1
-                            """),
-                            {
-                                "chat_id": str(chat_id),
-                                "sha": str(file_sha256),
-                                "id": int(photo_event_id),
-                            },
-                        ).mappings().first()
-
-                    if prev:
-                        diag["warnings"].append(
-                            {
-                                "possible_duplicate": {
-                                    "meter_type": str(prev.get("meter_kind") or kind),
-                                    "meter_index": int(prev.get("meter_index") or assigned_meter_index or 1),
-                                    "ym": str(prev.get("ym") or ym),
-                                    "value": float(value_float),
-                                    "incoming_meter_type": str(kind),
-                                    "incoming_meter_index": int(assigned_meter_index),
-                                    "reason": "same_file_sha256",
-                                    "prev_photo_event_id": int(prev.get("id")),
-                                    "prev_created_at": str(prev.get("created_at")),
-                                }
-                            }
-                        )
-            except Exception as e:
-                diag["warnings"].append({"duplicate_sha_check_failed": str(e)})
-
 
             # 6.2) ПОСЛЕ записи проверяем: возможно это одно и то же фото (значение совпало с другим счётчиком)
             try:
@@ -2321,10 +2380,14 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
             return {"ok": False, "reason": "no_meter_kind", "bill": None}
 
         if action == "repeat":
-            # ВАЖНО: НЕ удаляем meter_readings.
-            # Причина: при дубликате фактически пришло то же фото/то же значение,
-            # а удаление приводит к тому, что в квартире “пропадает” показание.
-            # Мы лишь помечаем photo_event как dup_repeat и ждём новое фото.
+            # meter_readings.value NOT NULL -> NULL ставить нельзя, поэтому удаляем запись
+            conn.execute(
+                text("""
+                    DELETE FROM meter_readings
+                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:t AND meter_index=:i
+                """),
+                {"aid": apartment_id, "ym": ym, "t": meter_kind, "i": int(meter_index)},
+            )
             conn.execute(
                 text("""
                     UPDATE photo_events
@@ -2813,7 +2876,6 @@ def upsert_tariff(payload: TariffIn):
 
 
 @app.get("/admin/ui/apartments/{apartment_id}/history")
-@app.get("/admin/ui/apartments/{apartment_id}/history")
 def ui_apartment_history(apartment_id: int):
     if not db_ready():
         raise HTTPException(status_code=503, detail="DB not ready")
@@ -2854,26 +2916,9 @@ def ui_apartment_history(apartment_id: int):
             y -= 1
         return f"{y:04d}-{m:02d}"
 
-    def add_months(ym: str, delta: int) -> str:
-        y, m = ym.split("-")
-        y = int(y)
-        m = int(m)
-        m = m + delta
-        while m > 12:
-            m -= 12
-            y += 1
-        while m < 1:
-            m += 12
-            y -= 1
-        return f"{y:04d}-{m:02d}"
-
-    # последние 4 месяца (текущий + 3 предыдущих) — всегда
-    end_ym = current_ym()  # есть в файле :contentReference[oaicite:2]{index=2}
-    months_to_show = [add_months(end_ym, -3), add_months(end_ym, -2), add_months(end_ym, -1), end_ym]
-
     history: List[Dict[str, Any]] = []
 
-    for ym in months_to_show:
+    for ym in sorted(by_month.keys()):
         cur = by_month.get(ym, {})
         pm = prev_month(ym)
         prev = by_month.get(pm, {})
@@ -2983,53 +3028,108 @@ def admin_reject_electric_extra(apartment_id: int, ym: str):
 # Admin UI: add manual meter reading (endpoint)
 # -----------------------
 @app.post("/admin/ui/apartments/{apartment_id}/meters")
-def admin_add_meter_reading(apartment_id: int, payload: dict = Body(...)):
-    if not db_ready():
-        raise HTTPException(status_code=503, detail="db_disabled")
+async def admin_add_meter_reading(apartment_id: int, request: Request):
+    """Add/update meter reading.
+
+    Supports 2 payload formats:
+    1) Single value (used by UI now):
+       {"month":"YYYY-MM","kind":"cold|hot|sewer|electric","meter_index":1,"value":123}
+    2) Bulk values (handy for scripts/curl):
+       {"ym":"YYYY-MM","cold":1,"hot":2,"sewer":3,"electric_t1":10,"electric_t2":20,"electric_t3":30}
+    """
     ensure_tables()
+    data = await request.json()
 
-    ym = payload.get("month")
-    meter_type = payload.get("kind")
-    value = payload.get("value")
+    # ---- Bulk format ----
+    if ("ym" in data) and ("month" not in data) and ("kind" not in data):
+        ym = data.get("ym")
+        if not ym or not isinstance(ym, str):
+            raise HTTPException(status_code=400, detail="ym is required")
 
-    meter_index = payload.get("meter_index", 1)
-    try:
-        meter_index = int(meter_index)
-    except Exception:
-        meter_index = 1
+        def _norm_val(v):
+            if v is None:
+                return None
+            if isinstance(v, str) and v.strip() == "":
+                return None
+            try:
+                return float(v)
+            except Exception:
+                raise HTTPException(status_code=400, detail=f"invalid value: {v!r}")
 
-    meter_index = max(1, min(3, meter_index))
+        updates = []  # (kind, meter_index, value)
+        for key, kind, mi in (
+            ("cold", "cold", 1),
+            ("hot", "hot", 1),
+            ("sewer", "sewer", 1),
+            ("electric_t1", "electric", 1),
+            ("electric_t2", "electric", 2),
+            ("electric_t3", "electric", 3),
+            ("electric_1", "electric", 1),
+            ("electric_2", "electric", 2),
+            ("electric_3", "electric", 3),
+        ):
+            if key in data:
+                v = _norm_val(data.get(key))
+                if v is not None:
+                    updates.append((kind, mi, v))
 
-    if meter_type in {"cold", "hot"}:
-        meter_index = 1
+        if not updates:
+            raise HTTPException(status_code=400, detail="no values to update")
 
-    if not ym or not meter_type or value is None:
+        for kind, mi, v in updates:
+            _add_meter_reading_db(
+                apartment_id=apartment_id,
+                ym=ym,
+                meter_type=kind,
+                meter_index=int(mi),
+                value=v,
+                source="manual",
+            )
+
+        return {"status": "ok", "apartment_id": apartment_id, "month": ym, "updated": len(updates)}
+
+    # ---- Single-value format (UI) ----
+    month = data.get("month")
+    kind = data.get("kind")
+    value = data.get("value")
+    meter_index = data.get("meter_index", 1)
+
+    if month is None or kind is None or value is None:
         raise HTTPException(status_code=400, detail="month, kind and value are required")
 
-    if meter_type not in {"cold", "hot", "electric"}:
-        raise HTTPException(status_code=400, detail="kind must be one of: cold, hot, electric")
+    if kind not in {"cold", "hot", "electric", "sewer"}:
+        raise HTTPException(status_code=400, detail="unknown kind")
 
     try:
-        value = float(value)
+        meter_index = int(meter_index) if meter_index is not None else 1
     except Exception:
-        raise HTTPException(status_code=400, detail="value must be a number")
+        raise HTTPException(status_code=400, detail="meter_index must be int")
 
-    with engine.begin() as conn:
-        _add_meter_reading_db(
-            conn,
-            int(apartment_id),
-            str(ym),
-            str(meter_type),
-            int(meter_index),
-            float(value),
-            source="manual",
-        )
+    if kind != "electric":
+        meter_index = 1
+    else:
+        if meter_index not in (1, 2, 3):
+            raise HTTPException(status_code=400, detail="electric meter_index must be 1/2/3")
+
+    try:
+        value_f = float(value)
+    except Exception:
+        raise HTTPException(status_code=400, detail="value must be number")
+
+    _add_meter_reading_db(
+        apartment_id=apartment_id,
+        ym=month,
+        meter_type=kind,
+        meter_index=int(meter_index),
+        value=value_f,
+        source="manual",
+    )
 
     return {
         "status": "ok",
         "apartment_id": apartment_id,
-        "month": ym,
-        "kind": meter_type,
+        "month": month,
+        "kind": kind,
         "meter_index": int(meter_index),
-        "value": value,
+        "value": value_f,
     }

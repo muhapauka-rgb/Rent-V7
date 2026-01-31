@@ -40,6 +40,22 @@ type TariffItem = {
 
 type TariffsResp = { ok: boolean; items: TariffItem[] };
 
+type ApartmentTariffItem = {
+  ym_from: string; // YYYY-MM
+  cold: number | null;
+  hot: number | null;
+  sewer: number | null;
+  electric: number | null; // совместимость
+  electric_t1: number | null;
+  electric_t2: number | null;
+  electric_t3: number | null;
+  created_at?: string;
+  updated_at?: string;
+};
+
+type ApartmentTariffsResp = { ok: boolean; apartment_id: number; items: ApartmentTariffItem[] };
+
+
 type UnassignedPhoto = {
   id: number;
   chat_id: string | null;
@@ -294,6 +310,21 @@ export default function App() {
   const [tariffSewer, setTariffSewer] = useState("0");
   const [loadingTariffs, setLoadingTariffs] = useState(false);
 
+  const [globalTariffsOpen, setGlobalTariffsOpen] = useState(false);
+
+  // Apartment-specific tariffs (overrides)
+  const [apTariffsOpen, setApTariffsOpen] = useState(false);
+  const [apTariffs, setApTariffs] = useState<ApartmentTariffItem[]>([]);
+  const [loadingApTariffs, setLoadingApTariffs] = useState(false);
+
+  const [apTariffYmFrom, setApTariffYmFrom] = useState("");
+  const [apTariffCold, setApTariffCold] = useState("");
+  const [apTariffHot, setApTariffHot] = useState("");
+  const [apTariffSewer, setApTariffSewer] = useState("");
+  const [apTariffElectricT1, setApTariffElectricT1] = useState("");
+  const [apTariffElectricT2, setApTariffElectricT2] = useState("");
+  const [apTariffElectricT3, setApTariffElectricT3] = useState("");
+
   function effectiveTariffForMonth(month: string): {
     cold: number;
     hot: number;
@@ -331,6 +362,79 @@ export default function App() {
       sewer: best?.sewer ?? 0,
       ym_from: best?.ym_from ?? null,
     };
+  }
+
+
+  function ymFromAny(t: { ym_from?: string | null; month_from?: string | null }): string {
+    return String((t as any).ym_from ?? (t as any).month_from ?? "").trim();
+  }
+
+  function effectiveApartmentOverrideForMonth(month: string): {
+    cold: number | null;
+    hot: number | null;
+    e1: number | null;
+    e2: number | null;
+    e3: number | null;
+    sewer: number | null;
+    ym_from: string | null;
+  } {
+    const m = (month || "").trim();
+    if (!isYm(m) || !apTariffs.length) {
+      return { cold: null, hot: null, e1: null, e2: null, e3: null, sewer: null, ym_from: null };
+    }
+
+    let best: ApartmentTariffItem | null = null;
+    for (const t of apTariffs) {
+      const ym = ymFromAny(t as any);
+      if (!isYm(ym)) continue;
+      if (ym <= m) {
+        if (!best || ymFromAny(best as any) < ym) best = t;
+      }
+    }
+
+    if (!best) {
+      best = apTariffs.slice().sort((a, b) => (ymFromAny(a as any) < ymFromAny(b as any) ? -1 : ymFromAny(a as any) > ymFromAny(b as any) ? 1 : 0))[0] ?? null;
+    }
+
+    const baseE = best?.electric ?? null;
+    const e1 = (best?.electric_t1 ?? baseE) as any;
+    const e2 = (best?.electric_t2 ?? baseE) as any;
+    const e3 = (best?.electric_t3 ?? null) as any;
+
+    return {
+      cold: best?.cold ?? null,
+      hot: best?.hot ?? null,
+      e1: e1 ?? null,
+      e2: e2 ?? null,
+      e3,
+      sewer: best?.sewer ?? null,
+      ym_from: ymFromAny(best as any) || null,
+    };
+  }
+
+  function effectiveTariffForMonthForSelected(month: string): {
+    cold: number;
+    hot: number;
+    e1: number;
+    e2: number;
+    sewer: number;
+    ym_from: string | null;
+    source: "apartment" | "global" | "none";
+  } {
+    const base = effectiveTariffForMonth(month);
+    const ov = effectiveApartmentOverrideForMonth(month);
+
+    const merged = {
+      cold: ov.cold != null ? ov.cold : base.cold,
+      hot: ov.hot != null ? ov.hot : base.hot,
+      e1: ov.e1 != null ? ov.e1 : base.e1,
+      e2: ov.e2 != null ? ov.e2 : base.e2,
+      sewer: ov.sewer != null ? ov.sewer : base.sewer,
+      ym_from: (ov.ym_from ?? base.ym_from) as any,
+      source: (ov.ym_from ? "apartment" : base.ym_from ? "global" : "none") as any,
+    };
+
+    return merged;
   }
 
   // Unassigned photos
@@ -469,6 +573,62 @@ export default function App() {
     }
   }
 
+
+  async function loadApartmentTariffs(apartmentId: number) {
+    try {
+      setLoadingApTariffs(true);
+      const data = await apiGet<ApartmentTariffsResp>(`/admin/ui/apartments/${apartmentId}/tariffs`);
+      setApTariffs((data.items ?? []) as any);
+    } catch (e) {
+      // если бэкенд ещё без этой фичи — просто не ломаем UI
+      setApTariffs([]);
+    } finally {
+      setLoadingApTariffs(false);
+    }
+  }
+
+  async function saveApartmentTariff(apartmentId: number) {
+    const ym = apTariffYmFrom.trim();
+    if (!isYm(ym)) {
+      setErr("Формат месяца: YYYY-MM");
+      return;
+    }
+
+    const payload: any = { month_from: ym };
+
+    const cold = numOrNull(apTariffCold);
+    const hot = numOrNull(apTariffHot);
+    const sewer = numOrNull(apTariffSewer);
+    const e1 = numOrNull(apTariffElectricT1);
+    const e2 = numOrNull(apTariffElectricT2);
+    const e3 = numOrNull(apTariffElectricT3);
+
+    if (cold !== null) payload.cold = cold;
+    if (hot !== null) payload.hot = hot;
+    if (sewer !== null) payload.sewer = sewer;
+
+    // электро: допускаем пустые (не задавать) — тогда наследуем базовые
+    if (e1 !== null) payload.electric_t1 = e1;
+    if (e2 !== null) payload.electric_t2 = e2;
+    if (e3 !== null) payload.electric_t3 = e3;
+
+    try {
+      setErr(null);
+      await apiPost(`/admin/ui/apartments/${apartmentId}/tariffs`, payload);
+      await loadApartmentTariffs(apartmentId);
+
+      // очистим форму (не трогаем month_from — удобно для серии правок)
+      setApTariffCold("");
+      setApTariffHot("");
+      setApTariffSewer("");
+      setApTariffElectricT1("");
+      setApTariffElectricT2("");
+      setApTariffElectricT3("");
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    }
+  }
+
   async function loadUnassigned() {
     setLoadingUnassigned(true);
     try {
@@ -572,7 +732,10 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (selectedId != null) loadHistory(selectedId);
+    if (selectedId != null) {
+      loadHistory(selectedId);
+      loadApartmentTariffs(selectedId).catch(() => {});
+    }
   }, [selectedId]);
 
   // Добавляем "следующий месяц" в историю
@@ -697,6 +860,7 @@ export default function App() {
   }, [latest, latestTariff]);
 
   return (
+    <>
     <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", padding: 24 }}>
       <div style={{ display: "flex", gap: 10, alignItems: "center", justifyContent: "space-between" }}>
         <h1 style={{ margin: 0 }}>Rent Web</h1>
@@ -809,21 +973,44 @@ export default function App() {
               <div style={{ color: "#666", fontSize: 13 }}>
                 В каждой ячейке: текущее / Δ / ₽ / тариф. Следующий месяц добавлен автоматически — можно сразу редактировать.
               </div>
-              <button
-                disabled={!selected}
-                onClick={() => selected && openInfo(selected.id)}
-                style={{
-                  padding: "8px 10px",
-                  borderRadius: 10,
-                  border: "1px solid #ddd",
-                  background: "white",
-                  cursor: selected ? "pointer" : "not-allowed",
-                  fontWeight: 800,
-                  opacity: selected ? 1 : 0.5,
-                }}
-              >
-                Инфо
-              </button>
+              
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  disabled={!selected}
+                  onClick={() => {
+                    if (!selected) return;
+                    setApTariffsOpen(true);
+                    loadApartmentTariffs(selected.id).catch(() => {});
+                  }}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "white",
+                    cursor: selected ? "pointer" : "not-allowed",
+                    fontWeight: 800,
+                    opacity: selected ? 1 : 0.5,
+                  }}
+                >
+                  Тарифы
+                </button>
+
+                <button
+                  disabled={!selected}
+                  onClick={() => selected && openInfo(selected.id)}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "white",
+                    cursor: selected ? "pointer" : "not-allowed",
+                    fontWeight: 800,
+                    opacity: selected ? 1 : 0.5,
+                  }}
+                >
+                  Инфо
+                </button>
+              </div>
             </div>
 
             {!selected ? (
@@ -861,7 +1048,7 @@ export default function App() {
                   <MetersTable
                     rows={last4}
                     eN={eN}
-                    effectiveTariffForMonth={effectiveTariffForMonth}
+                    effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
                     calcSewerDelta={calcSewerDelta}
                     calcElectricT3Fallback={calcElectricT3Fallback}
                     cellTriplet={cellTriplet}
@@ -880,76 +1067,25 @@ export default function App() {
         </div>
       ) : (
         <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "1fr", gap: 16 }}>
-          {/* Tariffs */}
+
+          {/* Tariffs (global) */}
           <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-              <div style={{ fontWeight: 900 }}>Тарифы</div>
-              <button onClick={() => loadTariffs()} style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}>
-                Обновить
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12 }}>
+              <div>
+                <div style={{ fontWeight: 900 }}>Тарифы (по умолчанию)</div>
+                <div style={{ marginTop: 6, color: "#666", fontSize: 13 }}>
+                  Базовые тарифы применяются ко всем квартирам, если у квартиры нет переопределения.
+                </div>
+              </div>
+              <button
+                onClick={async () => {
+                  setGlobalTariffsOpen(true);
+                  await loadTariffs();
+                }}
+                style={{ padding: "8px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}
+              >
+                Открыть
               </button>
-            </div>
-
-            <div style={{ marginTop: 10, display: "grid", gridTemplateColumns: "200px 1fr 1fr 1fr 1fr 1fr 140px", gap: 8, alignItems: "center" }}>
-              <input
-                placeholder="С месяца (YYYY-MM)"
-                value={tariffYmFrom}
-                onChange={(e) => setTariffYmFrom(e.target.value)}
-                style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
-              />
-
-              <input placeholder="ХВС" value={tariffCold} onChange={(e) => setTariffCold(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
-              <input placeholder="ГВС" value={tariffHot} onChange={(e) => setTariffHot(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
-
-              <input placeholder="Эл. T1" value={tariffElectricT1} onChange={(e) => setTariffElectricT1(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
-              <input placeholder="Эл. T2" value={tariffElectricT2} onChange={(e) => setTariffElectricT2(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
-
-              <input placeholder="Водоотв" value={tariffSewer} onChange={(e) => setTariffSewer(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
-
-              <button onClick={saveTariff} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
-                Сохранить
-              </button>
-            </div>
-
-            <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
-              Подсказка: значения — “цена за единицу”. Электро: тарифицируем только T1 и T2. T3 — без тарифа (итого/инфо).
-            </div>
-
-            <div style={{ marginTop: 10 }}>
-              {loadingTariffs ? (
-                <div style={{ color: "#666" }}>Загрузка...</div>
-              ) : !tariffs.length ? (
-                <div style={{ color: "#666" }}>Тарифов пока нет</div>
-              ) : (
-                <table style={{ width: "100%", borderCollapse: "collapse" }}>
-                  <thead>
-                    <tr>
-                      <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>С месяца</th>
-                      <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ХВС</th>
-                      <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ГВС</th>
-                      <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T1</th>
-                      <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T2</th>
-                      <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Водоотв</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {tariffs.map((t, i) => {
-                      const baseE = t.electric ?? 0;
-                      const e1 = (t.electric_t1 ?? baseE) as number;
-                      const e2 = (t.electric_t2 ?? baseE) as number;
-                      return (
-                        <tr key={i}>
-                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.ym_from}</td>
-                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.cold}</td>
-                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.hot}</td>
-                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{e1}</td>
-                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{e2}</td>
-                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.sewer}</td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              )}
             </div>
           </div>
 
@@ -1334,5 +1470,230 @@ export default function App() {
         </div>
       )}
     </div>
+
+      {/* Global tariffs modal */}
+      {globalTariffsOpen && (
+        <div
+          onClick={() => setGlobalTariffsOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.35)",
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+          }}
+        >
+          <div onClick={(e) => e.stopPropagation()} style={{ width: 920, maxWidth: "100%", background: "white", borderRadius: 14, padding: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div style={{ fontWeight: 900, fontSize: 18 }}>Тарифы (по умолчанию)</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => loadTariffs()}
+                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
+                >
+                  Обновить
+                </button>
+                <button
+                  onClick={() => setGlobalTariffsOpen(false)}
+                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
+                >
+                  Закрыть
+                </button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "200px 1fr 1fr 1fr 1fr 1fr 140px", gap: 8, alignItems: "center" }}>
+                <input
+                  placeholder="С месяца (YYYY-MM)"
+                  value={tariffYmFrom}
+                  onChange={(e) => setTariffYmFrom(e.target.value)}
+                  style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                />
+
+                <input placeholder="ХВС" value={tariffCold} onChange={(e) => setTariffCold(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                <input placeholder="ГВС" value={tariffHot} onChange={(e) => setTariffHot(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+
+                <input placeholder="Эл. T1" value={tariffElectricT1} onChange={(e) => setTariffElectricT1(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                <input placeholder="Эл. T2" value={tariffElectricT2} onChange={(e) => setTariffElectricT2(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+
+                <input placeholder="Водоотв" value={tariffSewer} onChange={(e) => setTariffSewer(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+
+                <button onClick={saveTariff} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
+                  Сохранить
+                </button>
+              </div>
+
+              <div style={{ color: "#666", fontSize: 13 }}>
+                Подсказка: значения — “цена за единицу”. Электро: тарифицируем только T1 и T2. T3 — без тарифа (итого/инфо).
+              </div>
+
+              <div>
+                {loadingTariffs ? (
+                  <div style={{ color: "#666" }}>Загрузка...</div>
+                ) : !tariffs.length ? (
+                  <div style={{ color: "#666" }}>Тарифов пока нет</div>
+                ) : (
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>С месяца</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ХВС</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ГВС</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T1</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T2</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Водоотв</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {tariffs.map((t, i) => {
+                        const baseE = t.electric ?? 0;
+                        const e1 = (t.electric_t1 ?? baseE) as number;
+                        const e2 = (t.electric_t2 ?? baseE) as number;
+                        return (
+                          <tr key={i}>
+                            <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.ym_from}</td>
+                            <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.cold}</td>
+                            <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.hot}</td>
+                            <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{e1}</td>
+                            <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{e2}</td>
+                            <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.sewer}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Apartment tariffs modal */}
+      {apTariffsOpen && selected && (
+        <div
+          onClick={() => setApTariffsOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.35)",
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+          }}
+        >
+          <div onClick={(e) => e.stopPropagation()} style={{ width: 920, maxWidth: "100%", background: "white", borderRadius: 14, padding: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div style={{ fontWeight: 900, fontSize: 18 }}>Тарифы квартиры: {selected.title}</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => loadApartmentTariffs(selected.id)}
+                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
+                >
+                  Обновить
+                </button>
+                <button
+                  onClick={() => setApTariffsOpen(false)}
+                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}
+                >
+                  Закрыть
+                </button>
+              </div>
+            </div>
+
+            <div style={{ marginTop: 10, color: "#666", fontSize: 13 }}>
+              Здесь задаём тарифы только для этой квартиры. Пустое поле = не задавать (квартира наследует базовый тариф).
+            </div>
+
+            <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+              <div style={{ display: "grid", gridTemplateColumns: "200px 1fr 1fr 1fr 1fr 1fr 1fr 140px", gap: 8, alignItems: "center" }}>
+                <input
+                  placeholder="С месяца (YYYY-MM)"
+                  value={apTariffYmFrom}
+                  onChange={(e) => setApTariffYmFrom(e.target.value)}
+                  style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                />
+
+                <input placeholder="ХВС" value={apTariffCold} onChange={(e) => setApTariffCold(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                <input placeholder="ГВС" value={apTariffHot} onChange={(e) => setApTariffHot(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+
+                <input placeholder="Эл. T1" value={apTariffElectricT1} onChange={(e) => setApTariffElectricT1(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                <input placeholder="Эл. T2" value={apTariffElectricT2} onChange={(e) => setApTariffElectricT2(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                <input placeholder="Эл. T3 (инфо)" value={apTariffElectricT3} onChange={(e) => setApTariffElectricT3(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+
+                <input placeholder="Водоотв" value={apTariffSewer} onChange={(e) => setApTariffSewer(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+
+                <button
+                  onClick={() => saveApartmentTariff(selected.id)}
+                  style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}
+                >
+                  Сохранить
+                </button>
+              </div>
+
+              <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+                <div style={{ fontWeight: 900 }}>Эффективный тариф (для выбранного месяца)</div>
+                <div style={{ marginTop: 8, display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr 1fr", gap: 10 }}>
+                  {(() => {
+                    const ym = (historyWithFuture?.[historyWithFuture.length - 1]?.month ?? "").trim();
+                    const eff = effectiveTariffForMonthForSelected(ym);
+                    return (
+                      <>
+                        <div>ХВС: <b>{fmtNum(eff.cold, 3)}</b></div>
+                        <div>ГВС: <b>{fmtNum(eff.hot, 3)}</b></div>
+                        <div>Эл T1: <b>{fmtNum(eff.e1, 3)}</b></div>
+                        <div>Эл T2: <b>{fmtNum(eff.e2, 3)}</b></div>
+                        <div>Водоотв: <b>{fmtNum(eff.sewer, 3)}</b></div>
+                        <div style={{ gridColumn: "1 / -1", color: "#666", fontSize: 12 }}>
+                          Источник: {eff.source === "apartment" ? "квартира" : eff.source === "global" ? "база" : "нет"}; применяем с: {eff.ym_from ?? "—"}
+                        </div>
+                      </>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              <div>
+                {loadingApTariffs ? (
+                  <div style={{ color: "#666" }}>Загрузка...</div>
+                ) : !apTariffs.length ? (
+                  <div style={{ color: "#666" }}>Переопределений пока нет</div>
+                ) : (
+                  <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>С месяца</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ХВС</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ГВС</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T1</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T2</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Эл. T3</th>
+                        <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Водоотв</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {apTariffs.map((t, i) => (
+                        <tr key={i}>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{ymFromAny(t as any)}</td>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.cold ?? "—"}</td>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.hot ?? "—"}</td>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.electric_t1 ?? (t.electric ?? "—")}</td>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.electric_t2 ?? (t.electric ?? "—")}</td>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.electric_t3 ?? "—"}</td>
+                          <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>{t.sewer ?? "—"}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </>
   );
 }
