@@ -638,16 +638,34 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
 @dp.message_handler(content_types=ContentType.CONTACT)
 async def handle_contact(message: types.Message):
+    # 1) сохраняем телефон локально, чтобы привязка работала даже без API
     try:
         phone = _norm_phone(message.contact.phone_number)
     except Exception:
         phone = ""
+
     if phone:
         CHAT_PHONES[message.chat.id] = phone
-        await message.answer(f"✅ Номер получен: {phone}. Теперь пришлите фото счётчиков.")
+
+    # 2) просим API попытаться привязать chat_id -> apartment_id по phone/username
+    try:
+        tg_username = (message.from_user.username or "").strip()
+        url = f"{API_BASE}/bot/chats/{message.chat.id}/contact"
+        resp = await _http_post(url, json_body={"phone": phone, "telegram_username": tg_username}, read_timeout=HTTP_READ_TIMEOUT_FAST)
+        ok = (resp.status_code == 200)
+        js = resp.json() if ok else {}
+    except Exception:
+        ok = False
+        js = {}
+
+    if phone:
+        if ok and js.get("ok") and js.get("apartment_id"):
+            await message.answer(f"✅ Номер получен: {phone}. Привязка выполнена (квартира #{js.get('apartment_id')}). Теперь пришлите фото счётчиков.")
+        else:
+            # Если квартира пока не найдена — это не ошибка, пользователь может просто прислать фото, а админ позже привяжет
+            await message.answer(f"✅ Номер получен: {phone}. Теперь пришлите фото счётчиков.")
     else:
         await message.answer("Не получилось прочитать номер. Попробуйте ещё раз.")
-
 
 
 @dp.message_handler(content_types=ContentType.PHOTO)

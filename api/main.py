@@ -2566,6 +2566,55 @@ def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
         return {"ok": True, "apartment_id": int(apt["id"]), "ym": ym, "bill": bill}
 
 
+
+class BotChatContactIn(BaseModel):
+    phone: str = ""
+    telegram_username: Optional[str] = None
+
+
+@app.post("/bot/chats/{chat_id}/contact")
+def bot_chat_contact(chat_id: str, payload: BotChatContactIn):
+    """
+    Бот присылает сюда контакт (phone + telegram_username).
+    Сервер пытается найти квартиру по контактам, и если находит — привязывает chat_id.
+
+    Это нужно, чтобы после "Отправить контакт" в боте в WEB сразу появился chat_id
+    (в "Привязанные Telegram ID") и username (если указан).
+    """
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    chat_id = str(chat_id).strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id required")
+
+    phone_norm = norm_phone(payload.phone or "")
+    username = (payload.telegram_username or "").strip().lstrip("@").lower() or None
+
+    apt_id = find_apartment_by_contact(username, phone_norm)
+    if not apt_id:
+        return {"ok": False, "reason": "no_match"}
+
+    # Привязываем чат
+    bind_chat(chat_id, int(apt_id))
+
+    # Если есть username — добавляем/активируем контакт "telegram"
+    if username:
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO apartment_contacts (apartment_id, kind, value, is_active)
+                    VALUES (:apartment_id, 'telegram', :value, true)
+                    ON CONFLICT (kind, value)
+                    DO UPDATE SET apartment_id=EXCLUDED.apartment_id, is_active=true
+                """),
+                {"apartment_id": int(apt_id), "value": username},
+            )
+
+    return {"ok": True, "apartment_id": int(apt_id)}
+
+
 # -------------------------
 # BOT endpoints (manual + duplicate resolution)
 # -------------------------
@@ -3134,31 +3183,43 @@ def get_tariffs():
 
 @app.get("/admin/ui/apartments/{apartment_id}/tariffs")
 def ui_apartment_tariffs(apartment_id: int):
-    # Пока тарифы общие (не зависят от квартиры), но UI ожидает этот endpoint.
+    """
+    UI вызывает этот endpoint, чтобы показать “тариф: …” под каждой колонкой.
+
+    В базе tariffs хранится:
+      month_from (YYYY-MM) + cold/hot/electric/sewer.
+
+    Для обратной совместимости UI также отдаём поля e1/e2 (как electric).
+    """
     if not db_ready():
         raise HTTPException(status_code=503, detail="db_disabled")
     ensure_tables()
+
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
-                SELECT ym, cold, hot, e1, e2, sewer
+                SELECT month_from, cold, hot, electric, sewer
                 FROM tariffs
-                ORDER BY ym ASC
+                ORDER BY month_from ASC
             """)
         ).fetchall()
 
     items = []
-    for ym, cold, hot, e1, e2, sewer in rows:
+    for month_from, cold, hot, electric, sewer in rows:
+        ym = str(month_from)
+        e = float(electric) if electric is not None else None
         items.append({
-            "ym": str(ym),
+            "ym": ym,
             "cold": float(cold) if cold is not None else None,
             "hot": float(hot) if hot is not None else None,
-            "e1": float(e1) if e1 is not None else None,
-            "e2": float(e2) if e2 is not None else None,
+            "electric": e,
+            "e1": e,   # legacy UI key
+            "e2": e,   # legacy UI key
             "sewer": float(sewer) if sewer is not None else None,
         })
 
     return {"apartment_id": int(apartment_id), "tariffs": items}
+
 
 
 @app.post("/tariffs")
