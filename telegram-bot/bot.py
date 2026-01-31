@@ -60,6 +60,22 @@ dp.middleware.setup(DebugUpdatesMiddleware())
 
 # chat_id -> phone
 CHAT_PHONES: Dict[int, str] = {}
+
+def _norm_phone(s: str) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) == 11 and digits.startswith("8"):
+        digits = "7" + digits[1:]
+    if len(digits) == 11 and digits.startswith("7"):
+        return "+7" + digits[1:]
+    if len(digits) == 10:
+        return "+7" + digits
+    if s.startswith("+") and digits:
+        return "+" + digits
+    return digits
+
 # chat_id -> 1..3 (electric index expected for next file)
 CHAT_METER_INDEX: Dict[int, int] = {}
 
@@ -446,16 +462,17 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
 # -------------------------
 
 @dp.message_handler(commands=["start"])
-async def start_cmd(message: types.Message):
-    MANUAL_CTX.pop(message.chat.id, None)
-    await message.reply(
-        "Привет!\n"
-        "1) Нажми «Старт месяца» в начале месяца.\n"
-        "2) Пришли фото счётчиков (ХВС/ГВС/Электро).\n"
-        "3) Когда оплатишь — нажми «Аренда оплачена» / «Счётчики оплачены».",
-        reply_markup=_kb_main(),
-    )
+async def handle_start(message: types.Message):
+    kb = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    kb.add(KeyboardButton("📱 Отправить номер телефона", request_contact=True))
+    kb.add(KeyboardButton("Старт месяца"))
+    kb.add(KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены"))
 
+    await message.answer(
+        "Привет! Чтобы я мог автоматически найти вашу квартиру, отправьте номер телефона кнопкой ниже.\n\n"
+        "Дальше пришлите фото счётчиков через кнопки.",
+        reply_markup=kb,
+    )
 
 @dp.message_handler(content_types=ContentType.TEXT)
 async def on_text(message: types.Message):
@@ -617,6 +634,20 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         else:
             if bill.get("reason") == "missing_photos":
                 _schedule_missing_reminder(message.chat.id, ym)
+
+
+@dp.message_handler(content_types=ContentType.CONTACT)
+async def handle_contact(message: types.Message):
+    try:
+        phone = _norm_phone(message.contact.phone_number)
+    except Exception:
+        phone = ""
+    if phone:
+        CHAT_PHONES[message.chat.id] = phone
+        await message.answer(f"✅ Номер получен: {phone}. Теперь пришлите фото счётчиков.")
+    else:
+        await message.answer("Не получилось прочитать номер. Попробуйте ещё раз.")
+
 
 
 @dp.message_handler(content_types=ContentType.PHOTO)

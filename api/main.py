@@ -20,6 +20,62 @@ app = FastAPI(title="Rent Backend API")
 # OCR
 OCR_URL = os.getenv("OCR_URL", "http://host.docker.internal:8000/recognize")
 
+# --- Billing / approvals ---
+BILL_DIFF_THRESHOLD_RUB = float((os.getenv("BILL_DIFF_THRESHOLD_RUB") or "500").strip() or 500)
+
+# --- Telegram push (optional): API can send messages directly to tenant ---
+TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip()
+
+def _tg_send_message(chat_id: str, text_msg: str) -> bool:
+    """Return True if message was accepted by Telegram API."""
+    if not TG_BOT_TOKEN:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage",
+            json={"chat_id": str(chat_id), "text": str(text_msg)},
+            timeout=10,
+        )
+        return bool(r.ok)
+    except Exception:
+        return False
+
+
+
+# ---- Bill message formatting (tenant)
+RU_MONTHS_CAP = {
+    "01": "Январь",
+    "02": "Февраль",
+    "03": "Март",
+    "04": "Апрель",
+    "05": "Май",
+    "06": "Июнь",
+    "07": "Июль",
+    "08": "Август",
+    "09": "Сентябрь",
+    "10": "Октябрь",
+    "11": "Ноябрь",
+    "12": "Декабрь",
+}
+
+def _format_bill_message(ym: str, total_rub: float) -> str:
+    """
+    Требование: "Оплата за МЕСЯЦ (Словами).ГОД xxxxр"
+    Пример: "Оплата за Апрель.2026 — 12345 ₽"
+    """
+    ym = (ym or "").strip()
+    try:
+        y, m = ym.split("-")
+    except Exception:
+        y, m = ym[:4], ym[5:7] if len(ym) >= 7 else ""
+    month_name = RU_MONTHS_CAP.get(str(m).zfill(2), ym)
+    # Округляем до рублей (без копеек), так как в ТЗ "xxxxр"
+    rub_int = int(round(float(total_rub)))
+    # пробелы тысяч для читаемости
+    rub_txt = f"{rub_int:,}".replace(",", " ")
+    return f"Оплата за {month_name}.{y} — {rub_txt} ₽"
+
+
 # Yandex Disk WebDAV
 YANDEX_WEBDAV_BASE_URL = os.getenv("YANDEX_WEBDAV_BASE_URL", "https://webdav.yandex.ru")
 YANDEX_WEBDAV_USERNAME = os.getenv("YANDEX_WEBDAV_USERNAME", "")
@@ -232,6 +288,10 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_pending BOOLEAN NOT NULL DEFAULT FALSE"))
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_expected_snapshot INTEGER"))
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS electric_extra_resolved_at TIMESTAMPTZ"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_pending JSONB NULL"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_last_json JSONB NULL"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_approved_at TIMESTAMPTZ NULL"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_sent_at TIMESTAMPTZ NULL"))
 
                     # --- meter_readings (единая схема) ---
                     conn.execute(text("""
@@ -1490,6 +1550,95 @@ def _set_month_extra_state(conn, apartment_id: int, ym: str, pending: bool, snap
     )
 
 
+
+
+def _get_active_chat_id(conn, apartment_id: int) -> Optional[str]:
+    row = conn.execute(
+        text(
+            "SELECT chat_id FROM chat_bindings "
+            "WHERE apartment_id=:aid AND is_active=true "
+            "ORDER BY updated_at DESC, created_at DESC "
+            "LIMIT 1"
+        ),
+        {"aid": int(apartment_id)},
+    ).fetchone()
+    return str(row[0]) if row and row[0] is not None else None
+
+
+def _ensure_month_row(conn, apartment_id: int, ym: str) -> None:
+    conn.execute(
+        text(
+            "INSERT INTO apartment_month_statuses(apartment_id, ym) "
+            "VALUES (:aid, :ym) "
+            "ON CONFLICT (apartment_id, ym) DO NOTHING"
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    )
+
+
+def _get_month_bill_state(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
+    row = conn.execute(
+        text(
+            "SELECT bill_pending, bill_last_json, bill_approved_at, bill_sent_at "
+            "FROM apartment_month_statuses "
+            "WHERE apartment_id=:aid AND ym=:ym"
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchone()
+    if not row:
+        return {"pending": None, "last": None, "approved_at": None, "sent_at": None}
+    return {
+        "pending": row[0],
+        "last": row[1],
+        "approved_at": (row[2].isoformat() if row[2] is not None else None),
+        "sent_at": (row[3].isoformat() if row[3] is not None else None),
+    }
+
+
+def _set_month_bill_state(
+    conn,
+    apartment_id: int,
+    ym: str,
+    *,
+    pending: Optional[dict] = None,
+    last_json: Optional[dict] = None,
+    approved_at: Optional[bool] = None,
+    sent_at: Optional[bool] = None,
+    reset_approval: bool = False,
+) -> None:
+    """Update bill state columns. approved_at/sent_at: True->now(), False->NULL, None->keep."""
+    _ensure_month_row(conn, apartment_id, ym)
+
+    sets = []
+    params: Dict[str, Any] = {"aid": int(apartment_id), "ym": str(ym)}
+
+    if pending is not None:
+        sets.append("bill_pending = CASE WHEN :bill_pending IS NULL THEN NULL ELSE CAST(:bill_pending AS JSONB) END")
+        params["bill_pending"] = json.dumps(pending, ensure_ascii=False) if pending else None
+
+    if last_json is not None:
+        sets.append("bill_last_json = CASE WHEN :bill_last_json IS NULL THEN NULL ELSE CAST(:bill_last_json AS JSONB) END")
+        params["bill_last_json"] = json.dumps(last_json, ensure_ascii=False) if last_json else None
+
+    if reset_approval:
+        sets.append("bill_approved_at = NULL")
+
+    if approved_at is True:
+        sets.append("bill_approved_at = now()")
+    elif approved_at is False:
+        sets.append("bill_approved_at = NULL")
+
+    if sent_at is True:
+        sets.append("bill_sent_at = now()")
+    elif sent_at is False:
+        sets.append("bill_sent_at = NULL")
+
+    if not sets:
+        return
+
+    sql = "UPDATE apartment_month_statuses SET " + ", ".join(sets) + ", updated_at=now() WHERE apartment_id=:aid AND ym=:ym"
+    conn.execute(text(sql), params)
+
 def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     """
     Возвращает:
@@ -1627,13 +1776,151 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         }
 
     total = rc + rh + rs + re_sum
+
+    # --- per-article diff check vs previous month bill (рубли) ---
+    pending_items: Dict[str, Any] = {}
+    prev_components: Optional[Dict[str, Any]] = None
+
+    try:
+        prev_ym_bill = add_months(ym, -1)
+        prevprev_ym_bill = add_months(ym, -2)
+
+        def _v(ym_: str, mt: str, idx: int = 1) -> Optional[float]:
+            r = conn.execute(
+                text(
+                    "SELECT value FROM meter_readings "
+                    "WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi "
+                    "LIMIT 1"
+                ),
+                {"aid": apartment_id, "ym": str(ym_), "mt": str(mt), "mi": int(idx)},
+            ).fetchone()
+            return float(r[0]) if r and r[0] is not None else None
+
+        # prev and prevprev month readings (для расчёта предыдущей суммы)
+        pc, ph = _v(prev_ym_bill, "cold", 1), _v(prev_ym_bill, "hot", 1)
+        ppc, pph = _v(prevprev_ym_bill, "cold", 1), _v(prevprev_ym_bill, "hot", 1)
+
+        pe1, pe2 = _v(prev_ym_bill, "electric", 1), _v(prev_ym_bill, "electric", 2)
+        ppe1, ppe2 = _v(prevprev_ym_bill, "electric", 1), _v(prevprev_ym_bill, "electric", 2)
+
+        ps, pps = _v(prev_ym_bill, "sewer", 1), _v(prevprev_ym_bill, "sewer", 1)
+
+        prev_dc = safe_delta(pc, ppc)
+        prev_dh = safe_delta(ph, pph)
+
+        prev_ds = safe_delta(ps, pps)
+        if prev_ds is None:
+            if prev_dc is not None and prev_dh is not None:
+                prev_ds = (prev_dc or 0) + (prev_dh or 0)
+
+        prev_de1 = safe_delta(pe1, ppe1)
+        prev_de2 = safe_delta(pe2, ppe2)
+
+        rc_prev = None if prev_dc is None else float(prev_dc * float(tariff.get("cold") or 0))
+        rh_prev = None if prev_dh is None else float(prev_dh * float(tariff.get("hot") or 0))
+        rs_prev = None if prev_ds is None else float(prev_ds * float(tariff.get("sewer") or 0))
+
+        re_prev = None
+        if prev_de1 is not None or prev_de2 is not None:
+            re_prev = 0.0
+            if prev_de1 is not None:
+                re_prev += float(prev_de1 * float(tariff.get("electric_t1") or tariff.get("electric") or 0))
+            if prev_de2 is not None:
+                re_prev += float(prev_de2 * float(tariff.get("electric_t2") or tariff.get("electric") or 0))
+            re_prev = float(re_prev)
+
+        total_prev = None
+        if rc_prev is not None and rh_prev is not None and rs_prev is not None and re_prev is not None:
+            total_prev = float(rc_prev + rh_prev + rs_prev + re_prev)
+
+        prev_components = {
+            "prev_ym": str(prev_ym_bill),
+            "cold_rub": rc_prev,
+            "hot_rub": rh_prev,
+            "sewer_rub": rs_prev,
+            "electric_rub": re_prev,
+            "total_rub": total_prev,
+        }
+
+        def _flag(name: str, cur_val: float, prev_val: Optional[float]):
+            if prev_val is None:
+                return
+            diff = float(cur_val) - float(prev_val)
+            if abs(diff) > float(BILL_DIFF_THRESHOLD_RUB):
+                pending_items[name] = {"cur_rub": float(cur_val), "prev_rub": float(prev_val), "diff_rub": float(diff)}
+
+        _flag("cold", float(rc), rc_prev)
+        _flag("hot", float(rh), rh_prev)
+        _flag("sewer", float(rs), rs_prev)
+        _flag("electric", float(re_sum), re_prev)
+        _flag("total", float(total), total_prev)
+    except Exception:
+        pending_items = {}
+        prev_components = None
+
+    # --- admin approval gate (per-article diffs) ---
+    bill_state = _get_month_bill_state(conn, int(apartment_id), str(ym))
+    last = bill_state.get("last") if isinstance(bill_state, dict) else None
+    approved_at = bill_state.get("approved_at") if isinstance(bill_state, dict) else None
+    sent_at = bill_state.get("sent_at") if isinstance(bill_state, dict) else None
+
+    reset_approval = False
+    if pending_items and approved_at:
+        try:
+            last_components = (last or {}).get("components") if isinstance(last, dict) else None
+            cur_components = {
+                "cold_rub": float(rc),
+                "hot_rub": float(rh),
+                "sewer_rub": float(rs),
+                "electric_rub": float(re_sum),
+                "total_rub": float(total),
+            }
+            if last_components != cur_components:
+                reset_approval = True
+                approved_at = None
+        except Exception:
+            reset_approval = True
+            approved_at = None
+
+    reason_override = None
+    if pending_items and not approved_at:
+        reason_override = "pending_admin"
+
+    snap = {
+        "ym": str(ym),
+        "components": {
+            "cold_rub": float(rc),
+            "hot_rub": float(rh),
+            "sewer_rub": float(rs),
+            "electric_rub": float(re_sum),
+            "total_rub": float(total),
+        },
+        "prev_components": prev_components,
+        "pending_items": pending_items,
+        "threshold_rub": float(BILL_DIFF_THRESHOLD_RUB),
+    }
+    _set_month_bill_state(
+        conn,
+        int(apartment_id),
+        str(ym),
+        pending=(pending_items if reason_override == "pending_admin" else {}),
+        last_json=snap,
+        reset_approval=bool(reset_approval),
+    )
+
+
     return {
         "is_complete_photos": True,
         "total_rub": round(total, 2),
         "missing": [],
-        "reason": "ok",
+        "reason": (reason_override or "ok"),
         "electric_expected": electric_expected,
         "extra_pending": False,
+        "threshold_rub": float(BILL_DIFF_THRESHOLD_RUB),
+        "pending_items": pending_items,
+        "prev_components": prev_components,
+        "approved_at": approved_at,
+        "sent_at": sent_at,
     }
 
 
@@ -1744,6 +2031,8 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
     except Exception:
         return 0
     meter_index = max(1, min(3, meter_index))
+
+    ym = month_now()
 
     expected = _get_apartment_electric_expected(conn, apartment_id)
 
@@ -1967,6 +2256,14 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             apartment_id = find_apartment_by_contact(telegram_username, phone)
             if apartment_id is not None:
                 bind_chat(str(chat_id), int(apartment_id))
+                # Автозаполнение контактов квартиры (если пришли от пользователя)
+                try:
+                    if telegram_username:
+                        _set_contact(int(apartment_id), "telegram", telegram_username)
+                    if phone:
+                        _set_contact(int(apartment_id), "phone", phone)
+                except Exception as e:
+                    diag["warnings"].append({"autofill_contact_error": str(e)})
         except Exception as e:
             diag["errors"].append({"apartment_match_error": str(e)})
 
@@ -2056,7 +2353,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 6) write meter_readings + statuses
     wrote_meter = False
-    ym = month_now()
+    # ym уже определён выше (месяц события)
     assigned_meter_index = int(meter_index)
 
     if db_ready() and apartment_id and kind and (value_float is not None):
@@ -2203,7 +2500,20 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         except Exception as e:
             diag["errors"].append({"meter_write_failed": str(e)})
 
-    # 7) bill (для бота и web)
+    
+    # 6.5) Авто-отправка суммы (если всё заполнено и не требуется проверка)
+    if db_ready() and apartment_id:
+        try:
+            with engine.begin() as conn:
+                bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
+                st = _get_month_bill_state(conn, int(apartment_id), str(ym))
+                if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
+                    msg = _format_bill_message(str(ym), float(bill.get("total_rub")))
+                    if _tg_send_message(str(chat_id), msg):
+                        _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True)
+        except Exception:
+            pass
+# 7) bill (для бота и web)
     bill = None
     if db_ready() and apartment_id:
         try:
@@ -2822,6 +3132,35 @@ def get_tariffs():
     }
 
 
+@app.get("/admin/ui/apartments/{apartment_id}/tariffs")
+def ui_apartment_tariffs(apartment_id: int):
+    # Пока тарифы общие (не зависят от квартиры), но UI ожидает этот endpoint.
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("""
+                SELECT ym, cold, hot, e1, e2, sewer
+                FROM tariffs
+                ORDER BY ym ASC
+            """)
+        ).fetchall()
+
+    items = []
+    for ym, cold, hot, e1, e2, sewer in rows:
+        items.append({
+            "ym": str(ym),
+            "cold": float(cold) if cold is not None else None,
+            "hot": float(hot) if hot is not None else None,
+            "e1": float(e1) if e1 is not None else None,
+            "e2": float(e2) if e2 is not None else None,
+            "sewer": float(sewer) if sewer is not None else None,
+        })
+
+    return {"apartment_id": int(apartment_id), "tariffs": items}
+
+
 @app.post("/tariffs")
 def upsert_tariff(payload: TariffIn):
     # Accept both month_from and ym_from
@@ -2918,7 +3257,25 @@ def ui_apartment_history(apartment_id: int):
 
     history: List[Dict[str, Any]] = []
 
-    for ym in sorted(by_month.keys()):
+    # UI показывает "последние 4 месяца". Даже если данных нет — показываем каркас.
+    def ym_shift(ym: str, delta: int) -> str:
+        y, m = ym.split("-")
+        y = int(y)
+        m = int(m)
+        m = m + int(delta)
+        while m <= 0:
+            m += 12
+            y -= 1
+        while m >= 13:
+            m -= 12
+            y += 1
+        return f"{y:04d}-{m:02d}"
+
+    latest = max(by_month.keys()) if by_month else current_ym()
+    # Берём 4 месяца: latest-3 ... latest
+    months = [ym_shift(latest, i) for i in (-3, -2, -1, 0)]
+
+    for ym in months:
         cur = by_month.get(ym, {})
         pm = prev_month(ym)
         prev = by_month.get(pm, {})
@@ -2965,6 +3322,45 @@ def ui_apartment_history(apartment_id: int):
 
     return {"apartment_id": apartment_id, "history": history}
 
+
+
+
+class BillApproveIn(BaseModel):
+    ym: str
+    send: bool = True
+
+
+@app.get("/admin/ui/apartments/{apartment_id}/bill")
+def ui_get_bill(apartment_id: int, ym: Optional[str] = None):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    ym_ = (ym or current_ym()).strip()
+    with engine.begin() as conn:
+        bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym_))
+        state = _get_month_bill_state(conn, int(apartment_id), str(ym_))
+        return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "bill": bill, "state": state}
+
+
+@app.post("/admin/ui/apartments/{apartment_id}/bill/approve")
+def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    ym_ = (payload.ym or "").strip() or current_ym()
+    with engine.begin() as conn:
+        _set_month_bill_state(conn, int(apartment_id), str(ym_), pending={}, approved_at=True)
+        bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym_))
+
+        sent = False
+        if payload.send and (bill.get("reason") == "ok") and bill.get("total_rub") is not None:
+            chat_id = _get_active_chat_id(conn, int(apartment_id))
+            if chat_id:
+                msg = _format_bill_message(str(ym_), float(bill.get("total_rub")))
+                sent = _tg_send_message(chat_id, msg)
+                if sent:
+                    _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True)
+        return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
 
 @app.post("/admin/ui/apartments/{apartment_id}/months/{ym}/electric-extra/accept")
 def admin_accept_electric_extra(apartment_id: int, ym: str):
@@ -3086,6 +3482,20 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
                 source="manual",
             )
 
+        # --- after manual edit: recompute bill and auto-send if allowed ---
+        try:
+            with engine.begin() as conn:
+                bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
+                st = _get_month_bill_state(conn, int(apartment_id), str(ym))
+                if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
+                    chat_id = _get_active_chat_id(conn, int(apartment_id))
+                    if chat_id:
+                        msg = _format_bill_message(str(ym), float(bill.get("total_rub")))
+                        if _tg_send_message(str(chat_id), msg):
+                            _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True)
+        except Exception:
+            pass
+
         return {"status": "ok", "apartment_id": apartment_id, "month": ym, "updated": len(updates)}
 
     # ---- Single-value format (UI) ----
@@ -3124,6 +3534,20 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
         value=value_f,
         source="manual",
     )
+
+    # --- after manual edit: recompute bill and auto-send if allowed ---
+    try:
+        with engine.begin() as conn:
+            bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(month))
+            st = _get_month_bill_state(conn, int(apartment_id), str(month))
+            if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
+                chat_id = _get_active_chat_id(conn, int(apartment_id))
+                if chat_id:
+                    msg = _format_bill_message(str(month), float(bill.get("total_rub")))
+                    if _tg_send_message(str(chat_id), msg):
+                        _set_month_bill_state(conn, int(apartment_id), str(month), sent_at=True)
+    except Exception:
+        pass
 
     return {
         "status": "ok",

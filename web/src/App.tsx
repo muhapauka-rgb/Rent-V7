@@ -290,6 +290,9 @@ export default function App() {
   // History
   const [history, setHistory] = useState<HistoryResp["history"]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [billInfo, setBillInfo] = useState<any | null>(null);
+  const [billByMonth, setBillByMonth] = useState<Record<string, any>>({});
+  const [loadingBill, setLoadingBill] = useState(false);
 
   // Edit readings modal
   const [editOpen, setEditOpen] = useState(false);
@@ -472,6 +475,8 @@ export default function App() {
       setErr(null);
       const data = await apiGet<HistoryResp>(`/admin/ui/apartments/${apartmentId}/history`);
       setHistory(data.history ?? []);
+      const months = (data.history ?? []).map((h: any) => h.month).filter(Boolean);
+      await loadBillsForMonths(apartmentId, months);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
       setHistory([]);
@@ -479,6 +484,59 @@ export default function App() {
       setLoadingHistory(false);
     }
   }
+
+  async function loadBill(apartmentId: number, ym: string) {
+    setLoadingBill(true);
+    try {
+      const r = await apiGet(`/admin/ui/apartments/${apartmentId}/bill?ym=${encodeURIComponent(ym)}`);
+      setBillInfo(r);
+      setBillByMonth((prev) => ({ ...(prev || {}), [ym]: r }));
+    } catch (e: any) {
+      setBillInfo(null);
+    } finally {
+      setLoadingBill(false);
+    }
+  }
+
+  async function loadBillsForMonths(apartmentId: number, months: string[]) {
+    if (!apartmentId || !months || months.length === 0) return;
+    try {
+      const pairs = await Promise.all(
+        months.map(async (ym) => {
+          try {
+            const r = await apiGet(`/admin/ui/apartments/${apartmentId}/bill?ym=${encodeURIComponent(ym)}`);
+            return [ym, r] as const;
+          } catch {
+            return [ym, null] as const;
+          }
+        })
+      );
+      const m: Record<string, any> = {};
+      for (const [ym, v] of pairs) {
+        if (v) m[ym] = v;
+      }
+      setBillByMonth(m);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+
+
+  async function approveAndSendMonth(ym: string) {
+    if (selectedId == null) return;
+    try {
+      await apiPost(`/admin/ui/apartments/${selectedId}/bill/approve`, { ym, send: true });
+      // обновим кэш по месяцу + по всем видимым месяцам
+      await loadBill(selectedId, ym);
+      const months = (historyWithFuture ?? []).map((h: any) => h.month).filter(Boolean);
+      await loadBillsForMonths(selectedId, months);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    }
+  }
+
+
 
   async function createApartment() {
     const title = newTitle.trim();
@@ -719,6 +777,7 @@ export default function App() {
 
       await Promise.all(tasks);
       await loadHistory(selectedId);
+      await loadBill(selectedId, editMonth);
       setEditOpen(false);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
@@ -734,6 +793,7 @@ export default function App() {
   useEffect(() => {
     if (selectedId != null) {
       loadHistory(selectedId);
+      loadBill(selectedId, serverYm);
       loadApartmentTariffs(selectedId).catch(() => {});
     }
   }, [selectedId]);
@@ -789,6 +849,12 @@ export default function App() {
   const latest = historyWithFuture.length ? historyWithFuture[historyWithFuture.length - 1] : null;
   const latestMonth = latest?.month ?? null;
   const latestMeters = latest?.meters ?? null;
+
+  useEffect(() => {
+    if (selectedId != null && latestMonth) {
+      loadBill(selectedId, latestMonth);
+    }
+  }, [selectedId, latestMonth]);
 
   const last4 = historyWithFuture.slice(-4).reverse();
   // сколько столбцов электро показывать (T1/T2/T3)
@@ -1044,6 +1110,88 @@ export default function App() {
                   </div>
                 </div>
 
+                <div style={{ border: "1px solid #e5e7eb", borderRadius: 12, padding: 12, marginTop: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+                    <div style={{ fontWeight: 700 }}>Контроль отклонений (±500 ₽) — {latestMonth}</div>
+                    <button
+                      style={{
+                        padding: "6px 10px",
+                        border: "1px solid #e5e7eb",
+                        borderRadius: 10,
+                        background: "white",
+                        cursor: "pointer",
+                        opacity: loadingBill ? 0.6 : 1,
+                      }}
+                      onClick={() => {
+                        if (selectedId != null) loadBill(selectedId, latestMonth);
+                      }}
+                      disabled={loadingBill || selectedId == null}
+                    >
+                      {loadingBill ? "..." : "Обновить"}
+                    </button>
+                  </div>
+
+                  {billInfo?.bill?.reason === "pending_admin" ? (
+                    <div style={{ marginTop: 10 }}>
+                      <div style={{ color: "#b91c1c", fontSize: 13, marginBottom: 8 }}>
+                        Есть отклонения больше 500 ₽. Нужна проверка администратора.
+                      </div>
+
+                      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                        {Object.entries(billInfo?.bill?.pending_items ?? {}).map(([k, v]: any) => (
+                          <div
+                            key={k}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              justifyContent: "space-between",
+                              border: "1px solid #e5e7eb",
+                              borderRadius: 10,
+                              padding: "8px 10px",
+                            }}
+                          >
+                            <div style={{ fontWeight: 700 }}>{k}</div>
+                            <div style={{ textAlign: "right", fontSize: 12, color: "#444" }}>
+                              <div>тек.: {Number(v?.cur_rub ?? 0).toFixed(2)} ₽</div>
+                              <div>прошл.: {Number(v?.prev_rub ?? 0).toFixed(2)} ₽</div>
+                              <div style={{ fontWeight: 700 }}>Δ {Number(v?.diff_rub ?? 0).toFixed(2)} ₽</div>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+
+                      <button
+                        style={{
+                          marginTop: 10,
+                          width: "100%",
+                          padding: "10px 12px",
+                          borderRadius: 12,
+                          border: "1px solid #059669",
+                          background: "#10b981",
+                          color: "white",
+                          fontWeight: 700,
+                          cursor: "pointer",
+                        }}
+                        onClick={async () => {
+                          if (selectedId == null) return;
+                          try {
+                            await approveAndSendMonth(latestMonth);
+                          } catch (e: any) {
+                            setErr(String(e?.message ?? e));
+                          }
+                        }}
+                      >
+                        Подтвердить и отправить сумму арендатору
+                      </button>
+                    </div>
+                  ) : (
+                    <div style={{ marginTop: 10, fontSize: 13, color: "#444" }}>
+                      {billInfo?.bill?.sent_at ? "✅ Уже отправлено арендатору" : "Отклонений нет (или данных ещё недостаточно)."}
+                    </div>
+                  )}
+                </div>
+
+
                 <div style={{ marginTop: 12 }}>
                   <MetersTable
                     rows={last4}
@@ -1055,6 +1203,8 @@ export default function App() {
                     calcSumRub={calcSumRub}
                     fmtRub={fmtRub}
                     openEdit={openEdit}
+                    billByMonth={billByMonth}
+                    onApproveAndSend={approveAndSendMonth}
                   />
 
                   <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
