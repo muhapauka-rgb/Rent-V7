@@ -119,6 +119,17 @@ def _kb_manual_start() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📸 Пришлю новое фото", callback_data="manual_photo")],
         ]
     )
+def _kb_fix_fields() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="ХВС", callback_data="fix_pick|cold|1")],
+            [InlineKeyboardButton(text="ГВС", callback_data="fix_pick|hot|1")],
+            [InlineKeyboardButton(text="Электро T1 (среднее)", callback_data="fix_pick|electric|1")],
+            [InlineKeyboardButton(text="Электро T2 (минимум)", callback_data="fix_pick|electric|2")],
+            [InlineKeyboardButton(text="Электро T3 (максимум)", callback_data="fix_pick|electric|3")],
+            [InlineKeyboardButton(text="Отмена", callback_data="fix_cancel")],
+        ]
+    )
 
 
 def _kb_manual_missing(missing: List[str]) -> InlineKeyboardMarkup:
@@ -467,6 +478,57 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
 # Handlers
 # -------------------------
 
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("fix_pick|"))
+async def on_fix_pick(call: types.CallbackQuery):
+    await call.answer("Ок", show_alert=False)
+
+    chat_id = call.message.chat.id
+    parts = (call.data or "").split("|")
+    if len(parts) < 3:
+        await bot.send_message(chat_id, "Ошибка выбора поля.", reply_markup=_kb_main())
+        return
+
+    meter_type = parts[1]
+    try:
+        meter_index = int(parts[2])
+    except Exception:
+        meter_index = 1
+
+    ym = _current_ym()
+
+    MANUAL_CTX[chat_id] = {
+        "ym": ym,
+        "step": "await_value",
+        "meter_type": meter_type,
+        "meter_index": meter_index,
+    }
+
+    title = meter_type
+    if meter_type == "cold":
+        title = "ХВС"
+    elif meter_type == "hot":
+        title = "ГВС"
+    elif meter_type == "electric":
+        if meter_index == 1:
+            title = "Электро T1 (среднее)"
+        elif meter_index == 2:
+            title = "Электро T2 (минимум)"
+        else:
+            title = "Электро T3 (максимум)"
+
+    await bot.send_message(
+        chat_id,
+        f"Введите корректное показание для {title} (число). Пример: 123.45",
+        reply_markup=_kb_main(),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "fix_cancel")
+async def on_fix_cancel(call: types.CallbackQuery):
+    await call.answer("Ок", show_alert=False)
+    await bot.send_message(call.message.chat.id, "Ок. Исправление отменено.", reply_markup=_kb_main())
+
+
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     MANUAL_CTX.pop(message.chat.id, None)
@@ -652,6 +714,11 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     if ocr_type or ocr_reading:
         msg += f"\nРаспознано: {ocr_type or '—'} / {ocr_reading or '—'}"
     await message.reply(msg, reply_markup=_kb_main())
+    await message.reply(
+        "Если распознано неверно — выберите, что исправить:",
+        reply_markup=_kb_fix_fields(),
+    )
+
 
     dup = _extract_duplicate_info(js)
     photo_event_id = js.get("photo_event_id")

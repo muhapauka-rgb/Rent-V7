@@ -2824,15 +2824,19 @@ def bot_manual_reading(payload: BotManualReadingIn):
 
         # FIX: раньше здесь ошибочно вызывался add_meter_reading(...) как будто это внутренняя функция,
         # но на самом деле это endpoint-функция (ниже), из-за этого и был TypeError.
-        _add_meter_reading_db(
-            conn,
-            apt_id,
-            ym,
-            meter_type,
-            meter_index,
-            value,
-            source="manual",
-        )
+        if meter_type == "electric":
+            _write_electric_explicit(conn, apt_id, ym, meter_index, value)
+        else:
+            _add_meter_reading_db(
+                conn,
+                apt_id,
+                ym,
+                meter_type,
+                meter_index,
+                value,
+                source="manual",
+            )
+
 
         # FIX: раньше считали bill по int(chat_id), это неверно. Нужно apartment_id.
         bill = _calc_month_bill(conn, apt_id, ym)
