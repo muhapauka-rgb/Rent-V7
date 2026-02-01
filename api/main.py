@@ -2036,17 +2036,27 @@ def _add_meter_reading_db(*args, **kwargs):
 
 
 def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int, new_value: float) -> int:
-    """Пишем электро строго в заданный meter_index (1..3), без пересортировки по величине."""
+    """
+    Электро:
+    - если ожидаем 3 тарифа: храним по величине
+        T2 (idx=2) = MIN
+        T1 (idx=1) = MID
+        T3 (idx=3) = MAX
+      (при 2 значениях: idx2=min, idx3=max, idx1 удаляем;
+       при 1 значении: idx1=value, idx2/idx3 удаляем)
+    - иначе: пишем строго в заданный meter_index (как раньше)
+    """
     try:
         meter_index = int(meter_index)
     except Exception:
         return 0
     meter_index = max(1, min(3, meter_index))
 
-    ym = month_now()
+    ym = (str(ym).strip() or month_now())  # FIX: не затираем ym
 
     expected = _get_apartment_electric_expected(conn, apartment_id)
 
+    # Сначала пишем как пришло (чтобы значение точно оказалось в БД)
     conn.execute(
         text(
             "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
@@ -2057,11 +2067,131 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
         {"aid": int(apartment_id), "ym": ym, "idx": int(meter_index), "val": float(new_value), "ocr": float(new_value)},
     )
 
-    # если прислали индекс “выше ожидания” (например ожидаем 1 фото, а пришел idx=2) — блокируем расчет до решения админа
+    # Если ожидаем 3 тарифа — пересортировка по величине (как ты хочешь)
+    if int(expected) == 3:
+        rows = conn.execute(
+            text(
+                "SELECT meter_index, value "
+                "FROM meter_readings "
+                "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)"
+            ),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        ).fetchall()
+
+        vals = [float(r[1]) for r in rows if r and r[1] is not None]
+
+        # Нормализация:
+        if len(vals) == 1:
+            v = vals[0]
+            # idx1 = единственное значение, idx2/idx3 удаляем
+            conn.execute(
+                text(
+                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                    "VALUES(:aid,:ym,'electric',1,:val,'ocr',:ocr) "
+                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                    " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "val": float(v), "ocr": float(v)},
+            )
+            conn.execute(
+                text(
+                    "DELETE FROM meter_readings "
+                    "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (2,3)"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym)},
+            )
+
+        elif len(vals) == 2:
+            vmin, vmax = sorted(vals)
+            # idx2=min, idx3=max, idx1 удаляем
+            conn.execute(
+                text(
+                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                    "VALUES(:aid,:ym,'electric',2,:val,'ocr',:ocr) "
+                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                    " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "val": float(vmin), "ocr": float(vmin)},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                    "VALUES(:aid,:ym,'electric',3,:val,'ocr',:ocr) "
+                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                    " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "val": float(vmax), "ocr": float(vmax)},
+            )
+            conn.execute(
+                text(
+                    "DELETE FROM meter_readings "
+                    "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=1"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym)},
+            )
+
+        else:
+            vmin, vmid, vmax = sorted(vals)[:3]
+            # idx2=min, idx1=mid, idx3=max
+            conn.execute(
+                text(
+                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                    "VALUES(:aid,:ym,'electric',2,:val,'ocr',:ocr) "
+                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                    " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "val": float(vmin), "ocr": float(vmin)},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                    "VALUES(:aid,:ym,'electric',1,:val,'ocr',:ocr) "
+                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                    " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "val": float(vmid), "ocr": float(vmid)},
+            )
+            conn.execute(
+                text(
+                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                    "VALUES(:aid,:ym,'electric',3,:val,'ocr',:ocr) "
+                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                    " value=EXCLUDED.value, source='ocr', ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "val": float(vmax), "ocr": float(vmax)},
+            )
+
+        # вернём индекс, в котором лежит new_value (если одинаковые — оставляем присланный)
+        rows2 = conn.execute(
+            text(
+                "SELECT meter_index, value "
+                "FROM meter_readings "
+                "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)"
+            ),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        ).fetchall()
+
+        candidates = []
+        for mi, v in rows2:
+            try:
+                if abs(float(v) - float(new_value)) < 1e-9:
+                    candidates.append(int(mi))
+            except Exception:
+                continue
+
+        if candidates:
+            if meter_index in candidates:
+                return int(meter_index)
+            return int(candidates[0])
+
+        return int(meter_index)
+
+    # Старое правило “выше ожидания” оставляем как было (работает только для expected<3)
     if int(meter_index) > int(expected) and int(expected) < 3:
         _set_month_extra_state(conn, int(apartment_id), str(ym), True, int(expected))
 
     return int(meter_index)
+
 
 
 def _assign_and_write_electric_sorted(apartment_id: int, ym: str, new_value: float) -> int:
