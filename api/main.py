@@ -2571,6 +2571,44 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 # Dashboard: apartments list
 # -----------------------
 
+class BotContactIn(BaseModel):
+    chat_id: str
+    telegram_username: Optional[str] = None
+    phone: Optional[str] = None
+
+
+@app.post("/bot/contact")
+def bot_contact(payload: BotContactIn):
+    chat_id = str(payload.chat_id or "").strip()
+    telegram_username = (payload.telegram_username or "").strip()
+    phone = (payload.phone or "").strip()
+
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id_required")
+    if not telegram_username and not phone:
+        raise HTTPException(status_code=400, detail="contact_required")
+
+    # 1) если уже привязано — просто допишем/обновим контакты
+    apartment_id = find_apartment_by_chat(chat_id)
+
+    # 2) иначе пробуем найти по контактам и привязать
+    if not apartment_id:
+        apartment_id = find_apartment_by_contact(telegram_username, phone)
+        if apartment_id:
+            bind_chat(chat_id, int(apartment_id))
+
+    if not apartment_id:
+        return {"ok": False, "apartment_id": None}
+
+    # 3) сохраняем контакты в квартиру
+    if telegram_username:
+        _set_contact(int(apartment_id), "telegram", telegram_username)
+    if phone:
+        _set_contact(int(apartment_id), "phone", phone)
+
+    return {"ok": True, "apartment_id": int(apartment_id)}
+
+
 @app.get("/bot/chats/{chat_id}/bill")
 def bot_chat_bill(chat_id: str, ym: Optional[str] = None):
     """Используется ботом для проверки “что ещё нужно” и/или выдачи суммы после всех фото.

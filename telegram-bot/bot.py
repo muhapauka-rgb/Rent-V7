@@ -359,6 +359,24 @@ async def _manual_write(chat_id: int, ym: str, meter_type: str, meter_index: int
         logging.exception("_manual_write failed")
         return None
 
+async def _post_contact_now(chat_id: int, telegram_username: Optional[str], phone: Optional[str]) -> Optional[dict]:
+    url = f"{API_BASE}/bot/contact"
+    payload = {
+        "chat_id": str(chat_id),
+        "telegram_username": telegram_username or "",
+        "phone": phone or "",
+    }
+    try:
+        resp = await _http_post(url, json_body=payload, read_timeout=HTTP_READ_TIMEOUT_FAST)
+        if resp.status_code != 200:
+            logging.warning(f"_post_contact_now: non-200 status={resp.status_code} text={resp.text[:300]!r}")
+            return None
+        return resp.json()
+    except Exception:
+        logging.exception("_post_contact_now failed")
+        return None
+
+
 
 async def _resolve_duplicate(photo_event_id: int, action: str) -> Optional[dict]:
     url = f"{API_BASE}/bot/duplicate/resolve"
@@ -473,6 +491,18 @@ async def on_contact(message: types.Message):
         return
 
     CHAT_PHONES[message.chat.id] = c.phone_number
+    username = message.from_user.username if message.from_user else None
+    res = await _post_contact_now(message.chat.id, username, c.phone_number)
+
+    if not res or not res.get("ok"):
+        await message.reply(
+            "✅ Контакт получен.\n"
+            "Но квартиру по номеру пока не нашёл.\n"
+            "Попросите администратора добавить ваш номер в карточку квартиры.",
+            reply_markup=_kb_main(),
+        )
+        return
+
 
     await message.reply(
         "✅ Контакт получен.\n"
