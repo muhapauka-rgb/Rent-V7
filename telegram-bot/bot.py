@@ -80,15 +80,17 @@ MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step
 # -------------------------
 
 def _kb_main() -> ReplyKeyboardMarkup:
-    # Главная клавиатура: старт месяца + отметки оплат
+    # Главная клавиатура: контакт + старт месяца + отметки оплат
     return ReplyKeyboardMarkup(
         resize_keyboard=True,
         row_width=2,
         keyboard=[
+            [KeyboardButton("Передать контакт", request_contact=True)],
             [KeyboardButton("Старт месяца")],
             [KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены")],
         ],
     )
+
 
 
 def _kb_duplicate(photo_event_id: int) -> InlineKeyboardMarkup:
@@ -458,6 +460,26 @@ async def start_cmd(message: types.Message):
         reply_markup=_kb_main(),
     )
 
+@dp.message_handler(content_types=ContentType.CONTACT)
+async def on_contact(message: types.Message):
+    c = message.contact
+    if not c or not c.phone_number:
+        await message.reply("Контакт пустой. Нажмите «Передать контакт» ещё раз.", reply_markup=_kb_main())
+        return
+
+    # защита: контакт должен быть от самого пользователя
+    if message.from_user and c.user_id and int(c.user_id) != int(message.from_user.id):
+        await message.reply("Пожалуйста, отправьте СВОЙ контакт кнопкой «Передать контакт».", reply_markup=_kb_main())
+        return
+
+    CHAT_PHONES[message.chat.id] = c.phone_number
+
+    await message.reply(
+        "✅ Контакт получен.\n"
+        "Теперь пришлите фото счётчика.\n"
+        "Если ваш номер уже внесён администратором в квартиру — привязка произойдёт автоматически.",
+        reply_markup=_kb_main(),
+    )
 
 @dp.message_handler(content_types=ContentType.TEXT)
 async def on_text(message: types.Message):
@@ -532,7 +554,8 @@ async def on_text(message: types.Message):
 
 async def _handle_file_message(message: types.Message, *, file_bytes: bytes, filename: str, mime_type: str):
     username = message.from_user.username if message.from_user else None
-    phone = None  # контакт не запрашиваем
+    phone = CHAT_PHONES.get(message.chat.id)  # берём телефон, который пользователь отправил кнопкой
+
     ym = _current_ym()
 
     # Пытаемся выбрать, какой индекс (особенно для электро T1/T2/T3) сейчас не заполнен

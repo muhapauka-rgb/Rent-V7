@@ -2740,7 +2740,7 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
                 {"id": peid},
             )
 
-        bill = _calc_month_bill(conn, apartment_id, ym)
+        bill = _calc_month_bill(conn, apartment_id, ym_)
         return {"ok": True, "bill": bill}
 
 
