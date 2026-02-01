@@ -37,9 +37,6 @@ type Props = {
 
   fmtRub: (n: number | null | undefined) => string;
   openEdit: (month: string) => void;
-
-  billByMonth: Record<string, any>;
-  onApproveAndSend: (ym: string) => void;
 };
 
 export default function MetersTable(props: Props) {
@@ -53,8 +50,6 @@ export default function MetersTable(props: Props) {
     cellTriplet,
     fmtRub,
     openEdit,
-    billByMonth,
-    onApproveAndSend,
   } = props;
 
   const n = Math.max(1, Math.min(3, Number.isFinite(eN) ? eN : 3));
@@ -141,77 +136,6 @@ export default function MetersTable(props: Props) {
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 900 }}>
                   {sum == null ? "—" : `₽ ${fmtRub(sum)}`}
-
-                  {/* Контроль отклонений и отправка суммы — по каждому месяцу */}
-                  {(() => {
-                    const b = (billByMonth || {})[h.month];
-                    const state = b?.state || {};
-                    const pending = state?.pending || {};
-                    const hasPending = pending && Object.keys(pending).length > 0;
-                    const sent = Boolean(state?.sent_at);
-                    const approved = Boolean(state?.approved_at);
-
-                    if (!b) return null;
-
-                    if (sent) {
-                      return <div style={{ marginTop: 6, fontSize: 12, fontWeight: 700, color: "#0a7a2f" }}>✅ отправлено арендатору</div>;
-                    }
-
-                    if (b?.reason === "pending_admin" && !approved) {
-                      return (
-                        <div style={{ marginTop: 6 }}>
-                          <div style={{ fontSize: 12, fontWeight: 800, color: "#b00020" }}>⚠ отклонение &gt; 500 ₽ — нужно подтвердить</div>
-                          <button
-                            onClick={() => onApproveAndSend(h.month)}
-                            style={{
-                              marginTop: 6,
-                              padding: "6px 10px",
-                              borderRadius: 10,
-                              border: "1px solid #b00020",
-                              background: "#b00020",
-                              color: "white",
-                              cursor: "pointer",
-                              fontWeight: 900,
-                              fontSize: 12,
-                            }}
-                          >
-                            Принять и отправить
-                          </button>
-                        </div>
-                      );
-                    }
-
-                    // Нет отклонений: можно отправить вручную (если автосенд по какой-то причине не сработал)
-                    if (b?.reason === "ok" && b?.total_rub != null) {
-                      return (
-                        <div style={{ marginTop: 6 }}>
-                          <div style={{ fontSize: 12, fontWeight: 700, color: "#333" }}>готово к отправке</div>
-                          <button
-                            onClick={() => onApproveAndSend(h.month)}
-                            style={{
-                              marginTop: 6,
-                              padding: "6px 10px",
-                              borderRadius: 10,
-                              border: "1px solid #111",
-                              background: "#111",
-                              color: "white",
-                              cursor: "pointer",
-                              fontWeight: 900,
-                              fontSize: 12,
-                            }}
-                          >
-                            Отправить сумму
-                          </button>
-                        </div>
-                      );
-                    }
-
-                    if (hasPending) {
-                      return <div style={{ marginTop: 6, fontSize: 12, fontWeight: 800, color: "#b00020" }}>⚠ нужно подтвердить</div>;
-                    }
-
-                    return null;
-                  })()}
                 </td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>

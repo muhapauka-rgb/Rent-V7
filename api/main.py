@@ -1646,12 +1646,19 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         mi = int(r["meter_index"] or 0)
         cur_map.setdefault(mt, {})[mi] = r["value"]
 
+    # --- completeness rules ---
+    # For electricity:
+    #   - if electric_expected == 1 -> require only T1
+    #   - if electric_expected >= 2 -> require T1 and T2
+    #   - T3 is ALWAYS derived as (T1 + T2) when possible and is NOT required for completeness.
     missing: List[str] = []
     if cur_map.get("cold", {}).get(1) is None:
         missing.append("cold")
     if cur_map.get("hot", {}).get(1) is None:
         missing.append("hot")
-    for i in range(1, electric_expected + 1):
+
+    req_electric = [1] if int(electric_expected) <= 1 else [1, 2]
+    for i in req_electric:
         if cur_map.get("electric", {}).get(i) is None:
             missing.append(f"electric_{i}")
 
@@ -1666,6 +1673,23 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
             "extra_pending": extra_pending,
         }
 
+    # --- T3 derive + mismatch check (does not affect rub) ---
+    e1_cur_for_t3 = cur_map.get("electric", {}).get(1)
+    e2_cur_for_t3 = cur_map.get("electric", {}).get(2)
+    e3_raw_for_t3 = cur_map.get("electric", {}).get(3)
+    t3_expected = None  # T1+T2
+    t3_mismatch = False
+    if e1_cur_for_t3 is not None and e2_cur_for_t3 is not None:
+        t3_expected = float(e1_cur_for_t3) + float(e2_cur_for_t3)
+        if e3_raw_for_t3 is not None:
+            try:
+                t3_raw = float(e3_raw_for_t3)
+                if abs(t3_raw - t3_expected) > 0.01:
+                    t3_mismatch = True
+            except Exception:
+                # If cannot parse, treat as mismatch to force admin review.
+                t3_mismatch = True
+
     if extra_pending:
         return {
             "is_complete_photos": True,
@@ -1674,6 +1698,14 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
             "reason": "pending_admin",
             "electric_expected": electric_expected,
             "extra_pending": True,
+            "threshold_rub": BILL_DIFF_THRESHOLD_RUB,
+            "t3": {"expected": t3_expected, "raw": e3_raw_for_t3, "mismatch": bool(t3_mismatch)},
+            "pending_flags": [
+                {
+                    "code": "duplicate_photos",
+                    "message": "Обнаружены одинаковые показания (возможно отправили одно и то же фото). Нужна проверка.",
+                }
+            ],
         }
 
     prev_ym = add_months(ym, -1)
@@ -1745,6 +1777,17 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
 
     # --- per-article diff check vs previous month bill (рубли) ---
     pending_items: Dict[str, Any] = {}
+    pending_flags: List[Dict[str, Any]] = []
+    if bool(t3_mismatch):
+        pending_flags.append(
+            {
+                "code": "t3_mismatch",
+                "message": "Т3 не совпадает с суммой Т1+Т2. Т3 не участвует в расчёте, но нужна проверка.",
+                "expected": t3_expected,
+                "raw": e3_raw_for_t3,
+            }
+        )
+
     prev_components: Optional[Dict[str, Any]] = None
 
     try:
@@ -1849,7 +1892,7 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
             approved_at = None
 
     reason_override = None
-    if pending_items and not approved_at:
+    if (pending_items or pending_flags) and not approved_at:
         reason_override = "pending_admin"
 
     snap = {
@@ -1863,6 +1906,8 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         },
         "prev_components": prev_components,
         "pending_items": pending_items,
+            "pending_flags": pending_flags,
+            "t3": {"expected": t3_expected, "raw": e3_raw_for_t3, "mismatch": bool(t3_mismatch)},
         "threshold_rub": float(BILL_DIFF_THRESHOLD_RUB),
     }
     _set_month_bill_state(
@@ -3226,6 +3271,15 @@ def ui_apartment_history(apartment_id: int):
         e2_prev = prev.get("electric_2")
         e3_prev = prev.get("electric_3")
 
+        # Derive T3 as T1+T2 when possible (T3 is optional / not required).
+        e3_is_derived = False
+        if e3_cur is None and e1_cur is not None and e2_cur is not None:
+            e3_cur = e1_cur + e2_cur
+            e3_is_derived = True
+        if e3_prev is None and e1_prev is not None and e2_prev is not None:
+            e3_prev = e1_prev + e2_prev
+
+
         cold_delta = (cold_cur - cold_prev) if (cold_cur is not None and cold_prev is not None) else None
         hot_delta = (hot_cur - hot_prev) if (hot_cur is not None and hot_prev is not None) else None
 
@@ -3246,7 +3300,7 @@ def ui_apartment_history(apartment_id: int):
                     "title": "Электро",
                     "t1": {"title": "T1", "current": e1_cur, "previous": e1_prev, "delta": e1_delta},
                     "t2": {"title": "T2", "current": e2_cur, "previous": e2_prev, "delta": e2_delta},
-                    "t3": {"title": "T3", "current": e3_cur, "previous": e3_prev, "delta": e3_delta},
+                    "t3": {"title": "T3", "current": e3_cur, "previous": e3_prev, "delta": e3_delta, "derived": e3_is_derived},
                 },
                 "sewer": {"title": "Водоотведение", "current": None, "previous": None, "delta": sewer_delta},
             }
@@ -3292,6 +3346,7 @@ def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
                 sent = _tg_send_message(chat_id, msg)
                 if sent:
                     _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True)
+        bill = _calc_month_bill(conn, apartment_id, ym)
         return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
 
 @app.post("/admin/ui/apartments/{apartment_id}/months/{ym}/electric-extra/accept")
@@ -3420,6 +3475,7 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
                 bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
                 st = _get_month_bill_state(conn, int(apartment_id), str(ym))
                 if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
+                    _set_month_bill_state(conn, int(apartment_id), str(ym), pending={}, approved_at=True)
                     chat_id = _get_active_chat_id(conn, int(apartment_id))
                     if chat_id:
                         msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
