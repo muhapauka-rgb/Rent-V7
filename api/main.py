@@ -3346,7 +3346,7 @@ def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
                 sent = _tg_send_message(chat_id, msg)
                 if sent:
                     _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True)
-        bill = _calc_month_bill(conn, apartment_id, ym)
+        bill = _calc_month_bill(conn, apartment_id, ym_)
         return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
 
 @app.post("/admin/ui/apartments/{apartment_id}/months/{ym}/electric-extra/accept")
