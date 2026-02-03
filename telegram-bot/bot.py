@@ -199,6 +199,21 @@ def _missing_to_text(missing: List[str]) -> str:
             out.append(x)
     return ", ".join(out)
 
+def _expected_missing_from_bill(bill: dict) -> List[str]:
+    # For expected >=2 we require T1+T2; T3 is derived and not required
+    missing = ["cold", "hot"]
+    try:
+        expected = int(bill.get("electric_expected") or 1)
+    except Exception:
+        expected = 1
+    if expected <= 1:
+        missing.append("electric_1")
+    elif expected == 2:
+        missing.extend(["electric_1", "electric_2"])
+    else:
+        missing.extend(["electric_1", "electric_2", "electric_3"])
+    return missing
+
 
 def _extract_duplicate_info(js: dict) -> Optional[dict]:
     diag = js.get("diag") or {}
@@ -621,11 +636,20 @@ async def on_text(message: types.Message):
         bill = wrap.get("bill") or {}
         if bill.get("reason") == "missing_photos":
             missing = bill.get("missing") or []
+            # If this apartment expects 3 electric photos, explicitly mention T3 as well
+            try:
+                expected = int(bill.get("electric_expected") or 1)
+            except Exception:
+                expected = 1
+            if expected >= 3 and "electric_3" not in missing:
+                missing = list(missing) + ["electric_3"]
             tail = (("\nНе хватает: " + _missing_to_text(missing)) if missing else "")
             await message.reply("Месяц начат. Пришлите фото счётчиков." + tail, reply_markup=_kb_main())
             return
 
-        await message.reply("Месяц начат. Пришлите фото счётчиков.", reply_markup=_kb_main())
+        expected = _expected_missing_from_bill(bill)
+        tail = (("\nЖду: " + _missing_to_text(expected)) if expected else "")
+        await message.reply("Месяц начат. Пришлите фото счётчиков." + tail, reply_markup=_kb_main())
         return
 
     if text_in == "Аренда оплачена":
