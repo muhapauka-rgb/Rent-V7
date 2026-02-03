@@ -65,7 +65,7 @@ export default function MetersTable(props: Props) {
 
             {n >= 1 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T1</th>}
             {n >= 2 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T2</th>}
-            {n >= 3 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T3 (итого)</th>}
+            {n >= 3 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T3</th>}
 
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Водоотв</th>
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Сумма</th>
@@ -97,8 +97,23 @@ export default function MetersTable(props: Props) {
             // ВАЖНО: T3 в рублях НЕ считаем
             const rs = ds == null ? null : ds * (t.sewer || 0);
 
+            const ccur = h.meters?.cold?.current ?? null;
+            const hcur = h.meters?.hot?.current ?? null;
+            const e1cur = h.meters?.electric?.t1?.current ?? null;
+            const e2cur = h.meters?.electric?.t2?.current ?? null;
+            const e3cur = h.meters?.electric?.t3?.current ?? null;
+
+            // Если в квартире ожидается 3 электро-индекса — сумму НЕ показываем, пока не пришёл T3
+            const isComplete =
+              ccur != null &&
+              hcur != null &&
+              e1cur != null &&
+              (n < 2 || e2cur != null) &&
+              (n < 3 || e3cur != null);
+
             // Сумма = ХВС + ГВС + (T1 если показываем) + (T2 если показываем) + водоотведение
-            const sum = calcSumRub(rc, rh, n >= 1 ? re1 : null, n >= 2 ? re2 : null, rs);
+            const sum = isComplete ? calcSumRub(rc, rh, n >= 1 ? re1 : null, n >= 2 ? re2 : null, rs) : null;
+
 
             return (
               <tr key={h.month}>
@@ -161,7 +176,8 @@ export default function MetersTable(props: Props) {
       </table>
 
       <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
-        Пояснение: ₽ = Δ × тариф месяца. Водоотведение: если sewer.delta пустой — считаем как Δ(ХВС)+Δ(ГВС). Электро: тарифицируем только T1 и T2. T3 (итого) — без тарифа (инфо).
+        Пояснение: ₽ = Δ × тариф месяца. Водоотведение: если sewer.delta пустой — считаем как Δ(ХВС)+Δ(ГВС). Электро: тарифицируем только T1 и T2. T3 — без тарифа (инфо).
+
       </div>
     </div>
   );

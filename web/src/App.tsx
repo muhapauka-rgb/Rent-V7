@@ -677,6 +677,7 @@ export default function App() {
     setEditE2(m?.electric?.t2?.current == null ? "" : String(m.electric.t2.current));
     setEditE3(t3Fallback == null ? "" : String(t3Fallback));
 
+
     setEditOpen(true);
   }
 
@@ -807,18 +808,9 @@ export default function App() {
   function calcElectricT3Fallback(h: HistoryResp["history"][number]): { current: number | null; delta: number | null } {
     const e3c = h?.meters?.electric?.t3?.current ?? null;
     const e3d = h?.meters?.electric?.t3?.delta ?? null;
-
-    if (e3c != null || e3d != null) return { current: e3c, delta: e3d };
-
-    const c1 = h?.meters?.electric?.t1?.current;
-    const c2 = h?.meters?.electric?.t2?.current;
-    const d1 = h?.meters?.electric?.t1?.delta;
-    const d2 = h?.meters?.electric?.t2?.delta;
-
-    const current = c1 != null && c2 != null ? (c1 as number) + (c2 as number) : null;
-    const delta = d1 != null && d2 != null ? (d1 as number) + (d2 as number) : null;
-    return { current, delta };
+    return { current: e3c, delta: e3d };
   }
+
 
   function cellTriplet(current: number | null, delta: number | null, rub: number | null, tariff: number | null, rubEnabled: boolean) {
     return (
@@ -855,8 +847,16 @@ export default function App() {
     const re2 = de2 == null ? null : de2 * (latestTariff.e2 || 0);
     const rs = ds == null ? null : ds * (latestTariff.sewer || 0);
 
-    const sum = calcSumRub(rc, rh, re1, re2, rs);
+    const isComplete =
+      h?.meters?.cold?.current != null &&
+      h?.meters?.hot?.current != null &&
+      h?.meters?.electric?.t1?.current != null &&
+      (eN < 2 || h?.meters?.electric?.t2?.current != null) &&
+      (eN < 3 || h?.meters?.electric?.t3?.current != null);
+
+    const sum = isComplete ? calcSumRub(rc, rh, re1, re2, rs) : null;
     return { sum };
+
   }, [latest, latestTariff]);
 
   return (

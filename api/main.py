@@ -2143,10 +2143,12 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
             it_min = items_sorted[0]
             it_max = items_sorted[1]
 
+            # FIX expected=3: при 2 значениях держим их в idx=1 и idx=2,
+            # иначе ломается completeness (electric_1 + electric_2).
             conn.execute(
                 text(
                     "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
-                    "VALUES(:aid,:ym,'electric',2,:val,:src,:ocr) "
+                    "VALUES(:aid,:ym,'electric',1,:val,:src,:ocr) "
                     "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
                     " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
                 ),
@@ -2155,16 +2157,18 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
             conn.execute(
                 text(
                     "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
-                    "VALUES(:aid,:ym,'electric',3,:val,:src,:ocr) "
+                    "VALUES(:aid,:ym,'electric',2,:val,:src,:ocr) "
                     "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
                     " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
                 ),
                 {"aid": int(apartment_id), "ym": str(ym), "val": float(it_max["value"]), "src": str(it_max["source"]), "ocr": it_max["ocr_value"]},
             )
+            # idx=3 очищаем (если был)
             conn.execute(
-                text("DELETE FROM meter_readings WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=1"),
+                text("DELETE FROM meter_readings WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=3"),
                 {"aid": int(apartment_id), "ym": str(ym)},
             )
+
 
         else:
             items_sorted = sorted(items, key=lambda x: x["value"])
@@ -2297,10 +2301,12 @@ def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
         it_min = items_sorted[0]
         it_max = items_sorted[1]
 
+        # FIX expected=3: при 2 значениях держим их в idx=1 и idx=2,
+        # иначе ломается completeness (electric_1 + electric_2).
         conn.execute(
             text(
                 "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
-                "VALUES(:aid,:ym,'electric',2,:val,:src,:ocr) "
+                "VALUES(:aid,:ym,'electric',1,:val,:src,:ocr) "
                 "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
                 " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
             ),
@@ -2309,17 +2315,19 @@ def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
         conn.execute(
             text(
                 "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
-                "VALUES(:aid,:ym,'electric',3,:val,:src,:ocr) "
+                "VALUES(:aid,:ym,'electric',2,:val,:src,:ocr) "
                 "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
                 " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
             ),
             {"aid": int(apartment_id), "ym": str(ym), "val": float(it_max["value"]), "src": str(it_max["source"]), "ocr": it_max["ocr_value"]},
         )
+        # idx=3 очищаем (если был)
         conn.execute(
-            text("DELETE FROM meter_readings WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=1"),
+            text("DELETE FROM meter_readings WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=3"),
             {"aid": int(apartment_id), "ym": str(ym)},
         )
         return
+
 
     items_sorted = sorted(items, key=lambda x: x["value"])
     it_min, it_mid, it_max = items_sorted[0], items_sorted[1], items_sorted[2]
@@ -2570,8 +2578,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
 
     raw_meter_index = form.get("meter_index")
+    meter_index_mode = (form.get("meter_index_mode") or "").strip().lower()  # "explicit" | "" (auto)
     try:
         meter_index = int(raw_meter_index) if raw_meter_index is not None else 1
+
     except Exception:
         meter_index = 1
         diag["warnings"].append({"invalid_meter_index": str(raw_meter_index)})
@@ -2730,9 +2740,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         try:
             # 6.1) СНАЧАЛА пишем показания в meter_readings и получаем assigned_meter_index
             if kind == "electric":
-                # Если клиент явно передал meter_index (бот/админ) — пишем строго в этот индекс.
-                # Если meter_index не передан — авто-логика (sorted) для совместимости.
-                if raw_meter_index is not None:
+                # ВАЖНО: tenant-фото по электро НЕ маркируем как T1/T2/T3.
+                # По умолчанию всегда авто-сортировка.
+                # Явный индекс используем ТОЛЬКО если передали meter_index_mode="explicit".
+                if (meter_index_mode == "explicit") and (raw_meter_index is not None):
                     with engine.begin() as conn:
                         assigned_meter_index = _write_electric_explicit(
                             conn,
@@ -2747,6 +2758,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         ym,
                         float(value_float),
                     )
+
             else:
                 # water (cold/hot): всегда meter_index=1
                 assigned_meter_index = 1
@@ -3128,10 +3140,8 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
                 {"id": peid},
             )
 
-        bill = _calc_month_bill(conn, apartment_id, ym_)
+        bill = _calc_month_bill(conn, apartment_id, ym)
         return {"ok": True, "bill": bill}
-
-
 
 @app.get("/dashboard/apartments")
 def dashboard_apartments():
@@ -3734,7 +3744,7 @@ def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
                 sent = _tg_send_message(chat_id, msg)
                 if sent:
                     _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True)
-        bill = _calc_month_bill(conn, apartment_id, ym_)
+        bill = _calc_month_bill(conn, apartment_id, ym)
         return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
 
 @app.post("/admin/ui/apartments/{apartment_id}/months/{ym}/electric-extra/accept")
