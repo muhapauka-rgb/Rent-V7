@@ -55,6 +55,21 @@ type ApartmentTariffItem = {
 
 type ApartmentTariffsResp = { ok: boolean; apartment_id: number; items: ApartmentTariffItem[] };
 
+type BillState = {
+  pending?: any;
+  last?: any;
+  approved_at?: string | null;
+  sent_at?: string | null;
+};
+
+type BillResp = {
+  ok: boolean;
+  apartment_id: number;
+  ym: string;
+  bill: any;
+  state: BillState;
+};
+
 
 type UnassignedPhoto = {
   id: number;
@@ -299,6 +314,11 @@ export default function App() {
   const [editE1, setEditE1] = useState("");
   const [editE2, setEditE2] = useState("");
   const [editE3, setEditE3] = useState("");
+
+  // Bill state for edit month
+  const [billInfo, setBillInfo] = useState<BillResp | null>(null);
+  const [billLoading, setBillLoading] = useState(false);
+  const [billErr, setBillErr] = useState<string | null>(null);
 
   // Tariffs
   const [tariffs, setTariffs] = useState<TariffItem[]>([]);
@@ -679,6 +699,36 @@ export default function App() {
 
 
     setEditOpen(true);
+    setBillInfo(null);
+    setBillErr(null);
+    if (selectedId != null) {
+      loadBill(selectedId, month).catch(() => {});
+    }
+  }
+
+  async function loadBill(apartmentId: number, ym: string) {
+    setBillLoading(true);
+    try {
+      const data = await apiGet<BillResp>(`/admin/ui/apartments/${apartmentId}/bill?ym=${encodeURIComponent(ym)}`);
+      setBillInfo(data);
+      setBillErr(null);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+      setBillInfo(null);
+    } finally {
+      setBillLoading(false);
+    }
+  }
+
+  async function approveBill(apartmentId: number, ym: string, send: boolean) {
+    try {
+      setBillErr(null);
+      await apiPost(`/admin/ui/apartments/${apartmentId}/bill/approve`, { ym, send });
+      await loadBill(apartmentId, ym);
+      await loadHistory(apartmentId);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+    }
   }
 
   async function saveEdit() {
@@ -691,35 +741,25 @@ export default function App() {
     const e3 = numOrNull(editE3);
 
     // пустое поле = "не менять"
-    const tasks: Array<Promise<any>> = [];
 
     try {
       setErr(null);
 
-      if (cold !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "cold", value: cold }));
-      }
-      if (hot !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "hot", value: hot }));
-      }
-      if (e1 !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "electric", value: e1, meter_index: 1 }));
-      }
-      if (e2 !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "electric", value: e2, meter_index: 2 }));
-      }
-      if (e3 !== null) {
-        // t3 — информативно (в рублях не учитываем)
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "electric", value: e3, meter_index: 3 }));
-      }
+      const payload: any = { ym: editMonth };
+      if (cold !== null) payload.cold = cold;
+      if (hot !== null) payload.hot = hot;
+      if (e1 !== null) payload.electric_t1 = e1;
+      if (e2 !== null) payload.electric_t2 = e2;
+      if (e3 !== null) payload.electric_t3 = e3; // t3 — информативно (в рублях не учитываем)
 
-      if (!tasks.length) {
+      if (Object.keys(payload).length <= 1) {
         setErr("Нечего сохранять: все поля пустые.");
         return;
       }
 
-      await Promise.all(tasks);
+      await apiPost(`/admin/ui/apartments/${selectedId}/meters`, payload);
       await loadHistory(selectedId);
+      await loadBill(selectedId, editMonth);
       setEditOpen(false);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
@@ -1229,6 +1269,73 @@ export default function App() {
               </div>
 
               <div style={{ color: "#666", fontSize: 12 }}>Если поле оставить пустым — оно не изменится. Можно вводить с точкой или запятой.</div>
+
+              <div style={{ borderTop: "1px solid #eee", paddingTop: 12, marginTop: 4 }}>
+                <div style={{ fontWeight: 900, marginBottom: 6 }}>Согласование суммы</div>
+
+                {billLoading ? (
+                  <div style={{ color: "#666" }}>Загрузка расчёта...</div>
+                ) : billErr ? (
+                  <div style={{ color: "#8a0000" }}>{billErr}</div>
+                ) : billInfo?.bill ? (
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div>Причина: <b>{String(billInfo.bill?.reason ?? "—")}</b></div>
+                    <div>Сумма: <b>{billInfo.bill?.total_rub == null ? "—" : `₽ ${fmtRub(billInfo.bill?.total_rub)}`}</b></div>
+                    <div>Approved: {billInfo.state?.approved_at ? "да" : "нет"}; Sent: {billInfo.state?.sent_at ? "да" : "нет"}</div>
+
+                    {Array.isArray(billInfo.bill?.missing) && billInfo.bill.missing.length ? (
+                      <div>Не хватает: {billInfo.bill.missing.join(", ")}</div>
+                    ) : null}
+
+                    {billInfo.bill?.pending_items && Object.keys(billInfo.bill.pending_items).length ? (
+                      <div>
+                        Есть превышения по статьям:{" "}
+                        {Object.keys(billInfo.bill.pending_items).join(", ")}
+                      </div>
+                    ) : null}
+
+                    {Array.isArray(billInfo.bill?.pending_flags) && billInfo.bill.pending_flags.length ? (
+                      <div>
+                        Флаги: {billInfo.bill.pending_flags.map((f: any) => f.code || "flag").join(", ")}
+                      </div>
+                    ) : null}
+
+                    {billInfo.bill?.reason === "pending_admin" ? (
+                      <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                        <button
+                          onClick={() => approveBill(selected.id, editMonth, true)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #111",
+                            background: "#111",
+                            color: "white",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          Согласовать и отправить
+                        </button>
+                        <button
+                          onClick={() => approveBill(selected.id, editMonth, false)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #ddd",
+                            background: "white",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          Согласовать без отправки
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div style={{ color: "#666" }}>Нет данных по сумме.</div>
+                )}
+              </div>
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
                 <button onClick={() => setEditOpen(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>

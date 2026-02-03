@@ -9,6 +9,7 @@ import requests
 import hashlib
 import threading
 import time
+import logging
 
 from datetime import datetime, date
 from decimal import Decimal
@@ -17,6 +18,7 @@ from sqlalchemy.exc import OperationalError
 
 
 app = FastAPI(title="Rent Backend API")
+logger = logging.getLogger("rent_api")
 
 # OCR
 OCR_URL = os.getenv("OCR_URL", "http://host.docker.internal:8000/recognize")
@@ -30,6 +32,7 @@ TG_BOT_TOKEN = (os.getenv("TG_BOT_TOKEN") or os.getenv("BOT_TOKEN") or "").strip
 def _tg_send_message(chat_id: str, text_msg: str) -> bool:
     """Return True if message was accepted by Telegram API."""
     if not TG_BOT_TOKEN:
+        logger.warning("tg_send skipped: missing token")
         return False
     try:
         r = requests.post(
@@ -37,8 +40,13 @@ def _tg_send_message(chat_id: str, text_msg: str) -> bool:
             json={"chat_id": str(chat_id), "text": str(text_msg)},
             timeout=10,
         )
+        if r.ok:
+            logger.info("tg_send ok chat_id=%s", str(chat_id))
+        else:
+            logger.warning("tg_send failed chat_id=%s status=%s text=%s", str(chat_id), r.status_code, (r.text or "")[:200])
         return bool(r.ok)
     except Exception:
+        logger.exception("tg_send exception chat_id=%s", str(chat_id))
         return False
 
 
@@ -259,6 +267,7 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_last_json JSONB NULL"))
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_approved_at TIMESTAMPTZ NULL"))
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_sent_at TIMESTAMPTZ NULL"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_sent_total NUMERIC(14,2) NULL"))
 
                     # --- meter_readings (единая схема) ---
                     conn.execute(text("""
@@ -1546,19 +1555,20 @@ def _ensure_month_row(conn, apartment_id: int, ym: str) -> None:
 def _get_month_bill_state(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     row = conn.execute(
         text(
-            "SELECT bill_pending, bill_last_json, bill_approved_at, bill_sent_at "
+            "SELECT bill_pending, bill_last_json, bill_approved_at, bill_sent_at, bill_sent_total "
             "FROM apartment_month_statuses "
             "WHERE apartment_id=:aid AND ym=:ym"
         ),
         {"aid": int(apartment_id), "ym": str(ym)},
     ).fetchone()
     if not row:
-        return {"pending": None, "last": None, "approved_at": None, "sent_at": None}
+        return {"pending": None, "last": None, "approved_at": None, "sent_at": None, "sent_total": None}
     return {
         "pending": row[0],
         "last": row[1],
         "approved_at": (row[2].isoformat() if row[2] is not None else None),
         "sent_at": (row[3].isoformat() if row[3] is not None else None),
+        "sent_total": (float(row[4]) if row[4] is not None else None),
     }
 
 def _json_sanitize(v):
@@ -1572,6 +1582,14 @@ def _json_sanitize(v):
         return [_json_sanitize(x) for x in v]
     return v
 
+def _same_total(a: Optional[float], b: Optional[float]) -> bool:
+    try:
+        if a is None or b is None:
+            return False
+        return round(float(a), 2) == round(float(b), 2)
+    except Exception:
+        return False
+
 def _set_month_bill_state(
     conn,
     apartment_id: int,
@@ -1581,6 +1599,7 @@ def _set_month_bill_state(
     last_json: Optional[dict] = None,
     approved_at: Optional[bool] = None,
     sent_at: Optional[bool] = None,
+    sent_total: Optional[float] = None,
     reset_approval: bool = False,
 ) -> None:
     """Update bill state columns. approved_at/sent_at: True->now(), False->NULL, None->keep."""
@@ -1610,6 +1629,10 @@ def _set_month_bill_state(
         sets.append("bill_sent_at = now()")
     elif sent_at is False:
         sets.append("bill_sent_at = NULL")
+
+    if sent_total is not None:
+        sets.append("bill_sent_total = :sent_total")
+        params["sent_total"] = float(sent_total)
 
     if not sets:
         return
@@ -2255,8 +2278,8 @@ def _write_electric_explicit(conn, apartment_id: int, ym: str, meter_index: int,
 
 def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
     """Normalize electric readings for expected=3:
-    - if 3 values exist: idx2=min, idx1=mid, idx3=max
-    - if 2 values: idx2=min, idx3=max, idx1 removed
+    - if 3 values exist: idx2=min, idx1=mid, idx3=idx1+idx2 (derived)
+    - if 2 values: idx1=min, idx2=max, idx3=idx1+idx2 (derived)
     - if 1 value: idx1=value, idx2/idx3 removed
     This is used after ADMIN/BOT corrections where we WANT to overwrite a slot, then re-sort.
     """
@@ -2301,8 +2324,7 @@ def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
         it_min = items_sorted[0]
         it_max = items_sorted[1]
 
-        # FIX expected=3: при 2 значениях держим их в idx=1 и idx=2,
-        # иначе ломается completeness (electric_1 + electric_2).
+        # при 2 значениях держим их в idx=1 и idx=2
         conn.execute(
             text(
                 "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
@@ -2321,10 +2343,17 @@ def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
             ),
             {"aid": int(apartment_id), "ym": str(ym), "val": float(it_max["value"]), "src": str(it_max["source"]), "ocr": it_max["ocr_value"]},
         )
-        # idx=3 очищаем (если был)
+
+        # idx=3 = T1+T2 (derived)
+        t3_val = float(it_min["value"]) + float(it_max["value"])
         conn.execute(
-            text("DELETE FROM meter_readings WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=3"),
-            {"aid": int(apartment_id), "ym": str(ym)},
+            text(
+                "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                "VALUES(:aid,:ym,'electric',3,:val,:src,:ocr) "
+                "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+            ),
+            {"aid": int(apartment_id), "ym": str(ym), "val": t3_val, "src": "manual", "ocr": None},
         )
         return
 
@@ -2357,7 +2386,7 @@ def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
             "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
             " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
         ),
-        {"aid": int(apartment_id), "ym": str(ym), "val": float(it_max["value"]), "src": str(it_max["source"]), "ocr": it_max["ocr_value"]},
+        {"aid": int(apartment_id), "ym": str(ym), "val": float(it_mid["value"]) + float(it_min["value"]), "src": "manual", "ocr": None},
     )
 
 
@@ -2889,10 +2918,19 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             with engine.begin() as conn:
                 bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
                 st = _get_month_bill_state(conn, int(apartment_id), str(ym))
-                if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
+                if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not _same_total(st.get("sent_total"), bill.get("total_rub"))):
                     msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
                     if _tg_send_message(str(chat_id), msg):
-                        _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True)
+                        _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True, sent_total=bill.get("total_rub"))
+                else:
+                    logger.info(
+                        "tg_send skip ctx=photo_event apartment_id=%s ym=%s reason=%s total=%s sent_total=%s",
+                        int(apartment_id),
+                        str(ym),
+                        str(bill.get("reason")),
+                        bill.get("total_rub"),
+                        st.get("sent_total"),
+                    )
         except Exception:
             pass
 # 7) bill (для бота и web)
@@ -3416,6 +3454,51 @@ def patch_current_month_readings(apartment_id: int, payload: MeterCurrentPatch):
                 },
             )
 
+        # Normalize electricity slots after dashboard edit (if expected=3)
+        try:
+            if any(k.startswith("electric") for k in updates.keys()):
+                expected = _get_apartment_electric_expected(conn, int(apartment_id))
+                if int(expected) == 3:
+                    _normalize_electric_expected3(conn, int(apartment_id), str(m))
+        except Exception:
+            pass
+
+    # --- after web edit: recompute bill and auto-send if allowed ---
+    try:
+        with engine.begin() as conn:
+            bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(m))
+            if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None):
+                st = _get_month_bill_state(conn, int(apartment_id), str(m))
+                if _same_total(st.get("sent_total"), bill.get("total_rub")):
+                    logger.info(
+                        "tg_send skip ctx=dashboard_current_same_total apartment_id=%s ym=%s total=%s",
+                        int(apartment_id),
+                        str(m),
+                        bill.get("total_rub"),
+                    )
+                else:
+                    chat_id = _get_active_chat_id(conn, int(apartment_id))
+                    if chat_id:
+                        msg = f"Сумма оплаты по счётчикам за {m}: {float(bill.get('total_rub')):.2f} ₽"
+                        if _tg_send_message(str(chat_id), msg):
+                            _set_month_bill_state(conn, int(apartment_id), str(m), sent_at=True, sent_total=bill.get("total_rub"))
+                    else:
+                        logger.info(
+                            "tg_send skip ctx=dashboard_current_no_chat apartment_id=%s ym=%s",
+                            int(apartment_id),
+                            str(m),
+                        )
+            else:
+                logger.info(
+                    "tg_send skip ctx=dashboard_current apartment_id=%s ym=%s reason=%s total=%s",
+                    int(apartment_id),
+                    str(m),
+                    str(bill.get("reason")),
+                    bill.get("total_rub"),
+                )
+    except Exception:
+        pass
+
     return {"ok": True, "apartment_id": apartment_id, "month": m, "updated": list(updates.keys())}
 
 
@@ -3738,13 +3821,36 @@ def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
 
         sent = False
         if payload.send and (bill.get("reason") == "ok") and bill.get("total_rub") is not None:
-            chat_id = _get_active_chat_id(conn, int(apartment_id))
-            if chat_id:
-                msg = f"Сумма оплаты по счётчикам за {ym_}: {float(bill.get('total_rub')):.2f} ₽"
-                sent = _tg_send_message(chat_id, msg)
-                if sent:
-                    _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True)
-        bill = _calc_month_bill(conn, apartment_id, ym)
+            st = _get_month_bill_state(conn, int(apartment_id), str(ym_))
+            if _same_total(st.get("sent_total"), bill.get("total_rub")):
+                logger.info(
+                    "tg_send skip ctx=approve_same_total apartment_id=%s ym=%s total=%s",
+                    int(apartment_id),
+                    str(ym_),
+                    bill.get("total_rub"),
+                )
+            else:
+                chat_id = _get_active_chat_id(conn, int(apartment_id))
+                if chat_id:
+                    msg = f"Сумма оплаты по счётчикам за {ym_}: {float(bill.get('total_rub')):.2f} ₽"
+                    sent = _tg_send_message(chat_id, msg)
+                    if sent:
+                        _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True, sent_total=bill.get("total_rub"))
+                else:
+                    logger.info(
+                        "tg_send skip ctx=approve_no_chat apartment_id=%s ym=%s",
+                        int(apartment_id),
+                        str(ym_),
+                    )
+        elif payload.send:
+            logger.info(
+                "tg_send skip ctx=approve apartment_id=%s ym=%s reason=%s total=%s",
+                int(apartment_id),
+                str(ym_),
+                str(bill.get("reason")),
+                bill.get("total_rub"),
+            )
+        bill = _calc_month_bill(conn, apartment_id, ym_)
         return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
 
 @app.post("/admin/ui/apartments/{apartment_id}/months/{ym}/electric-extra/accept")
@@ -3882,14 +3988,36 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
         try:
             with engine.begin() as conn:
                 bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
-                st = _get_month_bill_state(conn, int(apartment_id), str(ym))
-                if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
+                if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None):
                     _set_month_bill_state(conn, int(apartment_id), str(ym), pending={}, approved_at=True)
-                    chat_id = _get_active_chat_id(conn, int(apartment_id))
-                    if chat_id:
-                        msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
-                        if _tg_send_message(str(chat_id), msg):
-                            _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True)
+                    st = _get_month_bill_state(conn, int(apartment_id), str(ym))
+                    if _same_total(st.get("sent_total"), bill.get("total_rub")):
+                        logger.info(
+                            "tg_send skip ctx=admin_bulk_same_total apartment_id=%s ym=%s total=%s",
+                            int(apartment_id),
+                            str(ym),
+                            bill.get("total_rub"),
+                        )
+                    else:
+                        chat_id = _get_active_chat_id(conn, int(apartment_id))
+                        if chat_id:
+                            msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
+                            if _tg_send_message(str(chat_id), msg):
+                                _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True, sent_total=bill.get("total_rub"))
+                        else:
+                            logger.info(
+                                "tg_send skip ctx=admin_bulk_no_chat apartment_id=%s ym=%s",
+                                int(apartment_id),
+                                str(ym),
+                            )
+                else:
+                    logger.info(
+                        "tg_send skip ctx=admin_bulk apartment_id=%s ym=%s reason=%s total=%s",
+                        int(apartment_id),
+                        str(ym),
+                        str(bill.get("reason")),
+                        bill.get("total_rub"),
+                    )
         except Exception:
             pass
 
@@ -3936,17 +4064,48 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
             source="manual",
         )
 
+    # Normalize electricity slots after single manual edit as well (if expected=3)
+    try:
+        with engine.begin() as conn:
+            expected = _get_apartment_electric_expected(conn, int(apartment_id))
+            if int(expected) == 3:
+                _normalize_electric_expected3(conn, int(apartment_id), str(month))
+    except Exception:
+        pass
+
     # --- after manual edit: recompute bill and auto-send if allowed ---
     try:
         with engine.begin() as conn:
             bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(month))
-            st = _get_month_bill_state(conn, int(apartment_id), str(month))
-            if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None) and (not st.get("sent_at")):
-                chat_id = _get_active_chat_id(conn, int(apartment_id))
-                if chat_id:
-                    msg = f"Сумма оплаты по счётчикам за {month}: {float(bill.get('total_rub')):.2f} ₽"
-                    if _tg_send_message(str(chat_id), msg):
-                        _set_month_bill_state(conn, int(apartment_id), str(month), sent_at=True)
+            if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None):
+                st = _get_month_bill_state(conn, int(apartment_id), str(month))
+                if _same_total(st.get("sent_total"), bill.get("total_rub")):
+                    logger.info(
+                        "tg_send skip ctx=admin_single_same_total apartment_id=%s ym=%s total=%s",
+                        int(apartment_id),
+                        str(month),
+                        bill.get("total_rub"),
+                    )
+                else:
+                    chat_id = _get_active_chat_id(conn, int(apartment_id))
+                    if chat_id:
+                        msg = f"Сумма оплаты по счётчикам за {month}: {float(bill.get('total_rub')):.2f} ₽"
+                        if _tg_send_message(str(chat_id), msg):
+                            _set_month_bill_state(conn, int(apartment_id), str(month), sent_at=True, sent_total=bill.get("total_rub"))
+                    else:
+                        logger.info(
+                            "tg_send skip ctx=admin_single_no_chat apartment_id=%s ym=%s",
+                            int(apartment_id),
+                            str(month),
+                        )
+            else:
+                logger.info(
+                    "tg_send skip ctx=admin_single apartment_id=%s ym=%s reason=%s total=%s",
+                    int(apartment_id),
+                    str(month),
+                    str(bill.get("reason")),
+                    bill.get("total_rub"),
+                )
     except Exception:
         pass
 
