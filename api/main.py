@@ -1759,12 +1759,19 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
             return float(tariff.get("electric_t3") or base)
         return base
 
+    # Электро тарифицируем только T1 и T2.
+    # T3 (итого) — информационное поле, его НЕ включаем в оплату.
+    tariffed_electric = electric_expected
+    if electric_expected >= 3:
+        tariffed_electric = 2
+
     re_sum = 0.0
-    for idx in range(1, electric_expected + 1):
+    for idx in range(1, tariffed_electric + 1):
         de = safe_delta(cur_map["electric"].get(idx), prev_map["electric"].get(idx))
         if de is None:
             continue
         re_sum += de * elec_tariff(idx)
+
 
     rc = (dc or 0) * float(tariff.get("cold") or 0)
     rh = (dh or 0) * float(tariff.get("hot") or 0)
