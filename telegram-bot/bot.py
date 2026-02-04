@@ -80,15 +80,17 @@ MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step
 # -------------------------
 
 def _kb_main() -> ReplyKeyboardMarkup:
-    # Главная клавиатура: старт месяца + отметки оплат
+    # Главная клавиатура: контакт + старт месяца + отметки оплат
     return ReplyKeyboardMarkup(
         resize_keyboard=True,
         row_width=2,
         keyboard=[
+            [KeyboardButton("Передать контакт", request_contact=True)],
             [KeyboardButton("Старт месяца")],
             [KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены")],
         ],
     )
+
 
 
 def _kb_duplicate(photo_event_id: int) -> InlineKeyboardMarkup:
@@ -115,6 +117,17 @@ def _kb_manual_start() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="manual_start")],
             [InlineKeyboardButton(text="📸 Пришлю новое фото", callback_data="manual_photo")],
+        ]
+    )
+def _kb_fix_fields() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="ХВС", callback_data="fix_pick|cold|1")],
+            [InlineKeyboardButton(text="ГВС", callback_data="fix_pick|hot|1")],
+            [InlineKeyboardButton(text="Электро T1 (среднее)", callback_data="fix_pick|electric|1")],
+            [InlineKeyboardButton(text="Электро T2 (минимум)", callback_data="fix_pick|electric|2")],
+            [InlineKeyboardButton(text="Электро T3 (максимум)", callback_data="fix_pick|electric|3")],
+            [InlineKeyboardButton(text="Отмена", callback_data="fix_cancel")],
         ]
     )
 
@@ -185,6 +198,21 @@ def _missing_to_text(missing: List[str]) -> str:
         if x not in out:
             out.append(x)
     return ", ".join(out)
+
+def _expected_missing_from_bill(bill: dict) -> List[str]:
+    # For expected >=2 we require T1+T2; T3 is derived and not required
+    missing = ["cold", "hot"]
+    try:
+        expected = int(bill.get("electric_expected") or 1)
+    except Exception:
+        expected = 1
+    if expected <= 1:
+        missing.append("electric_1")
+    elif expected == 2:
+        missing.extend(["electric_1", "electric_2"])
+    else:
+        missing.extend(["electric_1", "electric_2", "electric_3"])
+    return missing
 
 
 def _extract_duplicate_info(js: dict) -> Optional[dict]:
@@ -357,6 +385,24 @@ async def _manual_write(chat_id: int, ym: str, meter_type: str, meter_index: int
         logging.exception("_manual_write failed")
         return None
 
+async def _post_contact_now(chat_id: int, telegram_username: Optional[str], phone: Optional[str]) -> Optional[dict]:
+    url = f"{API_BASE}/bot/contact"
+    payload = {
+        "chat_id": str(chat_id),
+        "telegram_username": telegram_username or "",
+        "phone": phone or "",
+    }
+    try:
+        resp = await _http_post(url, json_body=payload, read_timeout=HTTP_READ_TIMEOUT_FAST)
+        if resp.status_code != 200:
+            logging.warning(f"_post_contact_now: non-200 status={resp.status_code} text={resp.text[:300]!r}")
+            return None
+        return resp.json()
+    except Exception:
+        logging.exception("_post_contact_now failed")
+        return None
+
+
 
 async def _resolve_duplicate(photo_event_id: int, action: str) -> Optional[dict]:
     url = f"{API_BASE}/bot/duplicate/resolve"
@@ -447,6 +493,57 @@ def _schedule_missing_reminder(chat_id: int, ym: str):
 # Handlers
 # -------------------------
 
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("fix_pick|"))
+async def on_fix_pick(call: types.CallbackQuery):
+    await call.answer("Ок", show_alert=False)
+
+    chat_id = call.message.chat.id
+    parts = (call.data or "").split("|")
+    if len(parts) < 3:
+        await bot.send_message(chat_id, "Ошибка выбора поля.", reply_markup=_kb_main())
+        return
+
+    meter_type = parts[1]
+    try:
+        meter_index = int(parts[2])
+    except Exception:
+        meter_index = 1
+
+    ym = _current_ym()
+
+    MANUAL_CTX[chat_id] = {
+        "ym": ym,
+        "step": "await_value",
+        "meter_type": meter_type,
+        "meter_index": meter_index,
+    }
+
+    title = meter_type
+    if meter_type == "cold":
+        title = "ХВС"
+    elif meter_type == "hot":
+        title = "ГВС"
+    elif meter_type == "electric":
+        if meter_index == 1:
+            title = "Электро T1 (среднее)"
+        elif meter_index == 2:
+            title = "Электро T2 (минимум)"
+        else:
+            title = "Электро T3 (максимум)"
+
+    await bot.send_message(
+        chat_id,
+        f"Введите корректное показание для {title} (число). Пример: 123.45",
+        reply_markup=_kb_main(),
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data == "fix_cancel")
+async def on_fix_cancel(call: types.CallbackQuery):
+    await call.answer("Ок", show_alert=False)
+    await bot.send_message(call.message.chat.id, "Ок. Исправление отменено.", reply_markup=_kb_main())
+
+
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     MANUAL_CTX.pop(message.chat.id, None)
@@ -458,6 +555,38 @@ async def start_cmd(message: types.Message):
         reply_markup=_kb_main(),
     )
 
+@dp.message_handler(content_types=ContentType.CONTACT)
+async def on_contact(message: types.Message):
+    c = message.contact
+    if not c or not c.phone_number:
+        await message.reply("Контакт пустой. Нажмите «Передать контакт» ещё раз.", reply_markup=_kb_main())
+        return
+
+    # защита: контакт должен быть от самого пользователя
+    if message.from_user and c.user_id and int(c.user_id) != int(message.from_user.id):
+        await message.reply("Пожалуйста, отправьте СВОЙ контакт кнопкой «Передать контакт».", reply_markup=_kb_main())
+        return
+
+    CHAT_PHONES[message.chat.id] = c.phone_number
+    username = message.from_user.username if message.from_user else None
+    res = await _post_contact_now(message.chat.id, username, c.phone_number)
+
+    if not res or not res.get("ok"):
+        await message.reply(
+            "✅ Контакт получен.\n"
+            "Но квартиру по номеру пока не нашёл.\n"
+            "Попросите администратора добавить ваш номер в карточку квартиры.",
+            reply_markup=_kb_main(),
+        )
+        return
+
+
+    await message.reply(
+        "✅ Контакт получен.\n"
+        "Теперь пришлите фото счётчика.\n"
+        "Если ваш номер уже внесён администратором в квартиру — привязка произойдёт автоматически.",
+        reply_markup=_kb_main(),
+    )
 
 @dp.message_handler(content_types=ContentType.TEXT)
 async def on_text(message: types.Message):
@@ -507,11 +636,20 @@ async def on_text(message: types.Message):
         bill = wrap.get("bill") or {}
         if bill.get("reason") == "missing_photos":
             missing = bill.get("missing") or []
+            # If this apartment expects 3 electric photos, explicitly mention T3 as well
+            try:
+                expected = int(bill.get("electric_expected") or 1)
+            except Exception:
+                expected = 1
+            if expected >= 3 and "electric_3" not in missing:
+                missing = list(missing) + ["electric_3"]
             tail = (("\nНе хватает: " + _missing_to_text(missing)) if missing else "")
             await message.reply("Месяц начат. Пришлите фото счётчиков." + tail, reply_markup=_kb_main())
             return
 
-        await message.reply("Месяц начат. Пришлите фото счётчиков.", reply_markup=_kb_main())
+        expected = _expected_missing_from_bill(bill)
+        tail = (("\nЖду: " + _missing_to_text(expected)) if expected else "")
+        await message.reply("Месяц начат. Пришлите фото счётчиков." + tail, reply_markup=_kb_main())
         return
 
     if text_in == "Аренда оплачена":
@@ -532,7 +670,8 @@ async def on_text(message: types.Message):
 
 async def _handle_file_message(message: types.Message, *, file_bytes: bytes, filename: str, mime_type: str):
     username = message.from_user.username if message.from_user else None
-    phone = None  # контакт не запрашиваем
+    phone = CHAT_PHONES.get(message.chat.id)  # берём телефон, который пользователь отправил кнопкой
+
     ym = _current_ym()
 
     # Пытаемся выбрать, какой индекс (особенно для электро T1/T2/T3) сейчас не заполнен
@@ -599,6 +738,11 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     if ocr_type or ocr_reading:
         msg += f"\nРаспознано: {ocr_type or '—'} / {ocr_reading or '—'}"
     await message.reply(msg, reply_markup=_kb_main())
+    await message.reply(
+        "Если распознано неверно — выберите, что исправить:",
+        reply_markup=_kb_fix_fields(),
+    )
+
 
     dup = _extract_duplicate_info(js)
     photo_event_id = js.get("photo_event_id")

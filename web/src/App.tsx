@@ -10,15 +10,15 @@ type HistoryResp = {
   history: Array<{
     month: string;
     meters: {
-      cold: { title: string; current: number | null; previous: number | null; delta: number | null };
-      hot: { title: string; current: number | null; previous: number | null; delta: number | null };
+      cold: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
+      hot: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
       electric: {
         title: string;
-        t1: { title: string; current: number | null; previous: number | null; delta: number | null };
-        t2: { title: string; current: number | null; previous: number | null; delta: number | null };
-        t3: { title: string; current: number | null; previous: number | null; delta: number | null };
+        t1: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
+        t2: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
+        t3: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
       };
-      sewer: { title: string; current: number | null; previous: number | null; delta: number | null };
+      sewer: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
     };
   }>;
 };
@@ -54,6 +54,21 @@ type ApartmentTariffItem = {
 };
 
 type ApartmentTariffsResp = { ok: boolean; apartment_id: number; items: ApartmentTariffItem[] };
+
+type BillState = {
+  pending?: any;
+  last?: any;
+  approved_at?: string | null;
+  sent_at?: string | null;
+};
+
+type BillResp = {
+  ok: boolean;
+  apartment_id: number;
+  ym: string;
+  bill: any;
+  state: BillState;
+};
 
 
 type UnassignedPhoto = {
@@ -299,6 +314,11 @@ export default function App() {
   const [editE1, setEditE1] = useState("");
   const [editE2, setEditE2] = useState("");
   const [editE3, setEditE3] = useState("");
+
+  // Bill state for edit month
+  const [billInfo, setBillInfo] = useState<BillResp | null>(null);
+  const [billLoading, setBillLoading] = useState(false);
+  const [billErr, setBillErr] = useState<string | null>(null);
 
   // Tariffs
   const [tariffs, setTariffs] = useState<TariffItem[]>([]);
@@ -677,7 +697,49 @@ export default function App() {
     setEditE2(m?.electric?.t2?.current == null ? "" : String(m.electric.t2.current));
     setEditE3(t3Fallback == null ? "" : String(t3Fallback));
 
+
     setEditOpen(true);
+    setBillInfo(null);
+    setBillErr(null);
+    if (selectedId != null) {
+      loadBill(selectedId, month).catch(() => {});
+    }
+  }
+
+  async function loadBill(apartmentId: number, ym: string) {
+    setBillLoading(true);
+    try {
+      const data = await apiGet<BillResp>(`/admin/ui/apartments/${apartmentId}/bill?ym=${encodeURIComponent(ym)}`);
+      setBillInfo(data);
+      setBillErr(null);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+      setBillInfo(null);
+    } finally {
+      setBillLoading(false);
+    }
+  }
+
+  async function approveBill(apartmentId: number, ym: string, send: boolean) {
+    try {
+      setBillErr(null);
+      await apiPost(`/admin/ui/apartments/${apartmentId}/bill/approve`, { ym, send });
+      await loadBill(apartmentId, ym);
+      await loadHistory(apartmentId);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+    }
+  }
+
+  async function sendBillWithoutT3Photo(apartmentId: number, ym: string) {
+    try {
+      setBillErr(null);
+      await apiPost(`/admin/ui/apartments/${apartmentId}/bill/send-without-t3-photo`, { ym, send: true });
+      await loadBill(apartmentId, ym);
+      await loadHistory(apartmentId);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+    }
   }
 
   async function saveEdit() {
@@ -690,35 +752,32 @@ export default function App() {
     const e3 = numOrNull(editE3);
 
     // пустое поле = "не менять"
-    const tasks: Array<Promise<any>> = [];
+    const row = historyWithFuture.find((h) => h.month === editMonth);
+    const cur = row?.meters;
+    const nearlyEq = (a: number | null | undefined, b: number | null | undefined) => {
+      if (a == null && b == null) return true;
+      if (a == null || b == null) return false;
+      return Math.abs(Number(a) - Number(b)) <= 1e-9;
+    };
 
     try {
       setErr(null);
 
-      if (cold !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "cold", value: cold }));
-      }
-      if (hot !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "hot", value: hot }));
-      }
-      if (e1 !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "electric", value: e1, meter_index: 1 }));
-      }
-      if (e2 !== null) {
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "electric", value: e2, meter_index: 2 }));
-      }
-      if (e3 !== null) {
-        // t3 — информативно (в рублях не учитываем)
-        tasks.push(apiPost(`/admin/ui/apartments/${selectedId}/meters`, { month: editMonth, kind: "electric", value: e3, meter_index: 3 }));
-      }
+      const payload: any = { ym: editMonth };
+      if (cold !== null && !nearlyEq(cold, cur?.cold?.current ?? null)) payload.cold = cold;
+      if (hot !== null && !nearlyEq(hot, cur?.hot?.current ?? null)) payload.hot = hot;
+      if (e1 !== null && !nearlyEq(e1, cur?.electric?.t1?.current ?? null)) payload.electric_t1 = e1;
+      if (e2 !== null && !nearlyEq(e2, cur?.electric?.t2?.current ?? null)) payload.electric_t2 = e2;
+      if (e3 !== null && !nearlyEq(e3, cur?.electric?.t3?.current ?? null)) payload.electric_t3 = e3; // t3 — только если реально изменен
 
-      if (!tasks.length) {
+      if (Object.keys(payload).length <= 1) {
         setErr("Нечего сохранять: все поля пустые.");
         return;
       }
 
-      await Promise.all(tasks);
+      await apiPost(`/admin/ui/apartments/${selectedId}/meters`, payload);
       await loadHistory(selectedId);
+      await loadBill(selectedId, editMonth);
       setEditOpen(false);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
@@ -807,23 +866,21 @@ export default function App() {
   function calcElectricT3Fallback(h: HistoryResp["history"][number]): { current: number | null; delta: number | null } {
     const e3c = h?.meters?.electric?.t3?.current ?? null;
     const e3d = h?.meters?.electric?.t3?.delta ?? null;
-
-    if (e3c != null || e3d != null) return { current: e3c, delta: e3d };
-
-    const c1 = h?.meters?.electric?.t1?.current;
-    const c2 = h?.meters?.electric?.t2?.current;
-    const d1 = h?.meters?.electric?.t1?.delta;
-    const d2 = h?.meters?.electric?.t2?.delta;
-
-    const current = c1 != null && c2 != null ? (c1 as number) + (c2 as number) : null;
-    const delta = d1 != null && d2 != null ? (d1 as number) + (d2 as number) : null;
-    return { current, delta };
+    return { current: e3c, delta: e3d };
   }
 
-  function cellTriplet(current: number | null, delta: number | null, rub: number | null, tariff: number | null, rubEnabled: boolean) {
+
+  function cellTriplet(
+    current: number | null,
+    delta: number | null,
+    rub: number | null,
+    tariff: number | null,
+    rubEnabled: boolean,
+    highlightMissing: boolean = false
+  ) {
     return (
       <div style={{ display: "grid", gap: 2, lineHeight: 1.25 }}>
-        <div style={{ fontWeight: 900 }}>{fmtNum(current, 3)}</div>
+        <div style={{ fontWeight: 900, color: highlightMissing ? "#d97706" : "#111" }}>{fmtNum(current, 3)}</div>
         <div style={{ color: "#666", fontSize: 12 }}>Δ {fmtNum(delta, 3)}</div>
         <div style={{ color: "#111", fontSize: 12, fontWeight: 800 }}>{rubEnabled ? (rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`) : "₽ —"}</div>
         <div style={{ color: "#777", fontSize: 11 }}>тариф: {tariff == null ? "—" : fmtNum(tariff, 3)}</div>
@@ -855,8 +912,16 @@ export default function App() {
     const re2 = de2 == null ? null : de2 * (latestTariff.e2 || 0);
     const rs = ds == null ? null : ds * (latestTariff.sewer || 0);
 
-    const sum = calcSumRub(rc, rh, re1, re2, rs);
+    const isComplete =
+      h?.meters?.cold?.current != null &&
+      h?.meters?.hot?.current != null &&
+      h?.meters?.electric?.t1?.current != null &&
+      (eN < 2 || h?.meters?.electric?.t2?.current != null) &&
+      (eN < 3 || h?.meters?.electric?.t3?.current != null);
+
+    const sum = isComplete ? calcSumRub(rc, rh, re1, re2, rs) : null;
     return { sum };
+
   }, [latest, latestTariff]);
 
   return (
@@ -1229,6 +1294,95 @@ export default function App() {
               </div>
 
               <div style={{ color: "#666", fontSize: 12 }}>Если поле оставить пустым — оно не изменится. Можно вводить с точкой или запятой.</div>
+
+              <div style={{ borderTop: "1px solid #eee", paddingTop: 12, marginTop: 4 }}>
+                <div style={{ fontWeight: 900, marginBottom: 6 }}>Согласование суммы</div>
+
+                {billLoading ? (
+                  <div style={{ color: "#666" }}>Загрузка расчёта...</div>
+                ) : billErr ? (
+                  <div style={{ color: "#8a0000" }}>{billErr}</div>
+                ) : billInfo?.bill ? (
+                  <div style={{ display: "grid", gap: 6 }}>
+                    <div>Причина: <b>{String(billInfo.bill?.reason ?? "—")}</b></div>
+                    <div>Сумма: <b>{billInfo.bill?.total_rub == null ? "—" : `₽ ${fmtRub(billInfo.bill?.total_rub)}`}</b></div>
+                    <div>Approved: {billInfo.state?.approved_at ? "да" : "нет"}; Sent: {billInfo.state?.sent_at ? "да" : "нет"}</div>
+
+                    {Array.isArray(billInfo.bill?.missing) && billInfo.bill.missing.length ? (
+                      <div>Не хватает: {billInfo.bill.missing.join(", ")}</div>
+                    ) : null}
+
+                    {billInfo.bill?.pending_items && Object.keys(billInfo.bill.pending_items).length ? (
+                      <div>
+                        Есть превышения по статьям:{" "}
+                        {Object.keys(billInfo.bill.pending_items).join(", ")}
+                      </div>
+                    ) : null}
+
+                    {Array.isArray(billInfo.bill?.pending_flags) && billInfo.bill.pending_flags.length ? (
+                      <div>
+                        Флаги: {billInfo.bill.pending_flags.map((f: any) => f.code || "flag").join(", ")}
+                      </div>
+                    ) : null}
+
+                    {billInfo.bill?.reason === "pending_admin" ? (
+                      <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                        <button
+                          onClick={() => approveBill(selected.id, editMonth, true)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #111",
+                            background: "#111",
+                            color: "white",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          Согласовать и отправить
+                        </button>
+                        <button
+                          onClick={() => approveBill(selected.id, editMonth, false)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #ddd",
+                            background: "white",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          Согласовать без отправки
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {billInfo.bill?.reason === "missing_photos" &&
+                    Array.isArray(billInfo.bill?.missing) &&
+                    billInfo.bill.missing.length === 1 &&
+                    billInfo.bill.missing[0] === "electric_3" ? (
+                      <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                        <button
+                          onClick={() => sendBillWithoutT3Photo(selected.id, editMonth)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #111",
+                            background: "#111",
+                            color: "white",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          Отправить сумму без фото T3
+                        </button>
+                      </div>
+                    ) : null}
+                  </div>
+                ) : (
+                  <div style={{ color: "#666" }}>Нет данных по сумме.</div>
+                )}
+              </div>
 
               <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
                 <button onClick={() => setEditOpen(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
