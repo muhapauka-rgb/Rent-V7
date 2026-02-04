@@ -408,6 +408,29 @@ def _assign_and_write_electric_sorted(apartment_id: int, ym: str, new_value: flo
                     free = i
                     break
             if free is None:
+                # All slots are already occupied.
+                # If T3 is still not OCR, allow new photo to replace T3 to break "missing T3" loops.
+                try:
+                    if int(expected) >= 3:
+                        r3 = None
+                        for r in rows:
+                            if int(r.get("meter_index") or 0) == 3:
+                                r3 = r
+                                break
+                        if r3 and str(r3.get("source") or "").lower() != "ocr":
+                            conn.execute(
+                                text(
+                                    "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                                    "VALUES(:aid,:ym,'electric',3,:val,'ocr',:ocr) "
+                                    "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                                    " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+                                ),
+                                {"aid": apartment_id, "ym": ym, "val": float(new_value), "ocr": float(new_value)},
+                            )
+                            _normalize_electric_expected3(conn, int(apartment_id), str(ym))
+                            return 3
+                except Exception:
+                    pass
                 return 0
 
             # записываем и помечаем pending, если индекс "лишний"

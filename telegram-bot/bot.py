@@ -5,6 +5,7 @@ import requests
 import io
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
+from contextvars import ContextVar
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -43,10 +44,14 @@ dp = Dispatcher(bot)
 # -------------------------
 class DebugUpdatesMiddleware(BaseMiddleware):
     async def on_pre_process_update(self, update: types.Update, data: Dict[str, Any]):
+        chat_id = None
         try:
             if update.callback_query:
+                if update.callback_query.message:
+                    chat_id = int(update.callback_query.message.chat.id)
                 logging.info(f"DEBUG_UPDATE callback_query: data={update.callback_query.data!r}")
             elif update.message:
+                chat_id = int(update.message.chat.id)
                 logging.info(
                     f"DEBUG_UPDATE message: content_type={update.message.content_type} text={update.message.text!r}"
                 )
@@ -54,6 +59,9 @@ class DebugUpdatesMiddleware(BaseMiddleware):
                 logging.info("DEBUG_UPDATE other type")
         except Exception:
             logging.exception("DEBUG_UPDATE failed")
+        finally:
+            if chat_id is not None:
+                CURRENT_CHAT_ID.set(chat_id)
 
 
 dp.middleware.setup(DebugUpdatesMiddleware())
@@ -61,8 +69,10 @@ dp.middleware.setup(DebugUpdatesMiddleware())
 
 # chat_id -> phone
 CHAT_PHONES: Dict[int, str] = {}
+CONTACT_CONFIRMED: set[int] = set()
 # chat_id -> 1..3 (electric index expected for next file)
 CHAT_METER_INDEX: Dict[int, int] = {}
+CURRENT_CHAT_ID: ContextVar[Optional[int]] = ContextVar("current_chat_id", default=None)
 
 # Avoid repeated month total spam
 SENT_BILL: set[Tuple[int, str]] = set()          # (chat_id, ym)
@@ -77,17 +87,27 @@ MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step
 # Keyboards
 # -------------------------
 
-def _kb_main() -> ReplyKeyboardMarkup:
+def _kb_main(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     # Главная клавиатура: контакт + старт месяца + отметки оплат
-    return ReplyKeyboardMarkup(
-        resize_keyboard=True,
-        row_width=2,
-        keyboard=[
-            [KeyboardButton("Передать контакт", request_contact=True)],
+    if chat_id is None:
+        chat_id = CURRENT_CHAT_ID.get()
+    show_contact = not (chat_id is not None and int(chat_id) in CONTACT_CONFIRMED)
+
+    rows = []
+    if show_contact:
+        rows.append([KeyboardButton("Передать контакт", request_contact=True)])
+    rows.extend(
+        [
             [KeyboardButton("Старт месяца")],
             [KeyboardButton("Сообщить об ошибке распознавания")],
             [KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены")],
-        ],
+        ]
+    )
+
+    return ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2,
+        keyboard=rows,
     )
 
 
@@ -272,6 +292,7 @@ async def _post_photo_event(
         "phone": phone or "",
         "ym": ym,
         "meter_index": str(meter_index),
+        "meter_index_mode": "explicit",
     }
     resp = await _http_post(url, data=data, files=files, read_timeout=HTTP_READ_TIMEOUT_PHOTO)
     return {"status_code": resp.status_code, "ok": resp.ok, "text": resp.text, "json": (resp.json() if resp.ok else None)}
@@ -581,12 +602,20 @@ async def on_report_pick(call: types.CallbackQuery):
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     MANUAL_CTX.pop(message.chat.id, None)
+    try:
+        wrap = await _fetch_bill_wrap(message.chat.id, _current_ym())
+        if wrap and wrap.get("ok"):
+            CONTACT_CONFIRMED.add(int(message.chat.id))
+        else:
+            CONTACT_CONFIRMED.discard(int(message.chat.id))
+    except Exception:
+        pass
     await message.reply(
         "Привет!\n"
         "1) Нажми «Старт месяца» в начале месяца.\n"
         "2) Пришли фото счётчиков (ХВС/ГВС/Электро).\n"
         "3) Когда оплатишь — нажми «Аренда оплачена» / «Счётчики оплачены».",
-        reply_markup=_kb_main(),
+        reply_markup=_kb_main(message.chat.id),
     )
 
 @dp.message_handler(content_types=ContentType.CONTACT)
@@ -606,20 +635,22 @@ async def on_contact(message: types.Message):
     res = await _post_contact_now(message.chat.id, username, c.phone_number)
 
     if not res or not res.get("ok"):
+        CONTACT_CONFIRMED.discard(int(message.chat.id))
         await message.reply(
             "✅ Контакт получен.\n"
             "Но квартиру по номеру пока не нашёл.\n"
             "Попросите администратора добавить ваш номер в карточку квартиры.",
-            reply_markup=_kb_main(),
+            reply_markup=_kb_main(message.chat.id),
         )
         return
 
+    CONTACT_CONFIRMED.add(int(message.chat.id))
 
     await message.reply(
         "✅ Контакт получен.\n"
         "Теперь пришлите фото счётчика.\n"
         "Если ваш номер уже внесён администратором в квартиру — привязка произойдёт автоматически.",
-        reply_markup=_kb_main(),
+        reply_markup=_kb_main(message.chat.id),
     )
 
 @dp.message_handler(content_types=ContentType.TEXT)
