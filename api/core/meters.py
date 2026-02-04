@@ -36,7 +36,14 @@ def _add_meter_reading_db_impl(
             ON CONFLICT (apartment_id, ym, meter_type, meter_index)
             DO UPDATE SET
                 value = EXCLUDED.value,
-                source = EXCLUDED.source,
+                source = CASE
+                    -- Don't downgrade OCR to manual when value is unchanged.
+                    WHEN meter_readings.source = 'ocr'
+                         AND EXCLUDED.source = 'manual'
+                         AND abs(meter_readings.value - EXCLUDED.value) <= 1e-9
+                    THEN meter_readings.source
+                    ELSE EXCLUDED.source
+                END,
                 updated_at = now()
             """
         ),

@@ -752,16 +752,23 @@ export default function App() {
     const e3 = numOrNull(editE3);
 
     // пустое поле = "не менять"
+    const row = historyWithFuture.find((h) => h.month === editMonth);
+    const cur = row?.meters;
+    const nearlyEq = (a: number | null | undefined, b: number | null | undefined) => {
+      if (a == null && b == null) return true;
+      if (a == null || b == null) return false;
+      return Math.abs(Number(a) - Number(b)) <= 1e-9;
+    };
 
     try {
       setErr(null);
 
       const payload: any = { ym: editMonth };
-      if (cold !== null) payload.cold = cold;
-      if (hot !== null) payload.hot = hot;
-      if (e1 !== null) payload.electric_t1 = e1;
-      if (e2 !== null) payload.electric_t2 = e2;
-      if (e3 !== null) payload.electric_t3 = e3; // t3 — информативно (в рублях не учитываем)
+      if (cold !== null && !nearlyEq(cold, cur?.cold?.current ?? null)) payload.cold = cold;
+      if (hot !== null && !nearlyEq(hot, cur?.hot?.current ?? null)) payload.hot = hot;
+      if (e1 !== null && !nearlyEq(e1, cur?.electric?.t1?.current ?? null)) payload.electric_t1 = e1;
+      if (e2 !== null && !nearlyEq(e2, cur?.electric?.t2?.current ?? null)) payload.electric_t2 = e2;
+      if (e3 !== null && !nearlyEq(e3, cur?.electric?.t3?.current ?? null)) payload.electric_t3 = e3; // t3 — только если реально изменен
 
       if (Object.keys(payload).length <= 1) {
         setErr("Нечего сохранять: все поля пустые.");
