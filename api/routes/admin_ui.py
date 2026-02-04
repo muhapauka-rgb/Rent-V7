@@ -241,7 +241,8 @@ def ui_apartment_history(apartment_id: int):
                     ym,
                     meter_type,
                     meter_index,
-                    value
+                    value,
+                    source
                 FROM meter_readings
                 WHERE apartment_id=:aid AND meter_type IN ('cold','hot','electric','sewer')
                 ORDER BY ym ASC, meter_type ASC, meter_index ASC
@@ -261,31 +262,37 @@ def ui_apartment_history(apartment_id: int):
             by_month[ym] = {
                 "month": ym,
                 "meters": {
-                    "cold": {"title": "ХВС", "current": None, "previous": None, "delta": None},
-                    "hot": {"title": "ГВС", "current": None, "previous": None, "delta": None},
+                    "cold": {"title": "ХВС", "current": None, "previous": None, "delta": None, "source": None},
+                    "hot": {"title": "ГВС", "current": None, "previous": None, "delta": None, "source": None},
                     "electric": {
                         "title": "Электро",
-                        "t1": {"title": "T1", "current": None, "previous": None, "delta": None, "derived": False},
-                        "t2": {"title": "T2", "current": None, "previous": None, "delta": None},
-                        "t3": {"title": "T3", "current": None, "previous": None, "delta": None, "derived": False},
+                        "t1": {"title": "T1", "current": None, "previous": None, "delta": None, "source": None, "derived": False},
+                        "t2": {"title": "T2", "current": None, "previous": None, "delta": None, "source": None},
+                        "t3": {"title": "T3", "current": None, "previous": None, "delta": None, "source": None, "derived": False},
                     },
-                    "sewer": {"title": "Водоотведение", "current": None, "previous": None, "delta": None},
+                    "sewer": {"title": "Водоотведение", "current": None, "previous": None, "delta": None, "source": None},
                 },
             }
 
         if mt == "cold":
             by_month[ym]["meters"]["cold"]["current"] = val
+            by_month[ym]["meters"]["cold"]["source"] = r.get("source")
         elif mt == "hot":
             by_month[ym]["meters"]["hot"]["current"] = val
+            by_month[ym]["meters"]["hot"]["source"] = r.get("source")
         elif mt == "sewer":
             by_month[ym]["meters"]["sewer"]["current"] = val
+            by_month[ym]["meters"]["sewer"]["source"] = r.get("source")
         elif mt == "electric":
             if mi == 1:
                 by_month[ym]["meters"]["electric"]["t1"]["current"] = val
+                by_month[ym]["meters"]["electric"]["t1"]["source"] = r.get("source")
             elif mi == 2:
                 by_month[ym]["meters"]["electric"]["t2"]["current"] = val
+                by_month[ym]["meters"]["electric"]["t2"]["source"] = r.get("source")
             elif mi == 3:
                 by_month[ym]["meters"]["electric"]["t3"]["current"] = val
+                by_month[ym]["meters"]["electric"]["t3"]["source"] = r.get("source")
 
     # вычисляем дельты по истории
     history = []

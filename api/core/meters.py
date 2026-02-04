@@ -351,7 +351,46 @@ def _assign_and_write_electric_sorted(apartment_id: int, ym: str, new_value: flo
 
         existing_vals = [float(r["value"]) for r in rows if r.get("value") is not None]
         if any(same(v, new_value) for v in existing_vals):
-            # дубликат — ничего не делаем
+            # Если такое значение уже есть, считаем что пришло "подтверждающее фото":
+            # помечаем соответствующий слот как OCR (особенно важно для T3).
+            matches = []
+            for r in rows:
+                try:
+                    rv = float(r.get("value")) if r.get("value") is not None else None
+                    if rv is not None and same(rv, new_value):
+                        matches.append(
+                            {
+                                "idx": int(r.get("meter_index") or 0),
+                                "src": str(r.get("source") or ""),
+                            }
+                        )
+                except Exception:
+                    continue
+
+            if matches:
+                # Для expected=3 в первую очередь подтверждаем T3, если он совпал.
+                chosen = None
+                if int(expected) >= 3:
+                    for m in matches:
+                        if int(m["idx"]) == 3:
+                            chosen = m
+                            break
+                if chosen is None:
+                    chosen = matches[0]
+
+                chosen_idx = int(chosen["idx"])
+                if chosen_idx in (1, 2, 3):
+                    conn.execute(
+                        text(
+                            "UPDATE meter_readings "
+                            "SET source='ocr', ocr_value=:ocr, updated_at=now() "
+                            "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=:idx"
+                        ),
+                        {"aid": apartment_id, "ym": ym, "idx": chosen_idx, "ocr": float(new_value)},
+                    )
+                    return chosen_idx
+
+            # fallback: дубликат без явного совпадения слота
             return 0
 
         if has_manual:

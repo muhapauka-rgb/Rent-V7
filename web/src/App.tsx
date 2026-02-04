@@ -10,15 +10,15 @@ type HistoryResp = {
   history: Array<{
     month: string;
     meters: {
-      cold: { title: string; current: number | null; previous: number | null; delta: number | null };
-      hot: { title: string; current: number | null; previous: number | null; delta: number | null };
+      cold: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
+      hot: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
       electric: {
         title: string;
-        t1: { title: string; current: number | null; previous: number | null; delta: number | null };
-        t2: { title: string; current: number | null; previous: number | null; delta: number | null };
-        t3: { title: string; current: number | null; previous: number | null; delta: number | null };
+        t1: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
+        t2: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
+        t3: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
       };
-      sewer: { title: string; current: number | null; previous: number | null; delta: number | null };
+      sewer: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
     };
   }>;
 };
@@ -863,10 +863,17 @@ export default function App() {
   }
 
 
-  function cellTriplet(current: number | null, delta: number | null, rub: number | null, tariff: number | null, rubEnabled: boolean) {
+  function cellTriplet(
+    current: number | null,
+    delta: number | null,
+    rub: number | null,
+    tariff: number | null,
+    rubEnabled: boolean,
+    highlightMissing: boolean = false
+  ) {
     return (
       <div style={{ display: "grid", gap: 2, lineHeight: 1.25 }}>
-        <div style={{ fontWeight: 900 }}>{fmtNum(current, 3)}</div>
+        <div style={{ fontWeight: 900, color: highlightMissing ? "#d97706" : "#111" }}>{fmtNum(current, 3)}</div>
         <div style={{ color: "#666", fontSize: 12 }}>Δ {fmtNum(delta, 3)}</div>
         <div style={{ color: "#111", fontSize: 12, fontWeight: 800 }}>{rubEnabled ? (rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`) : "₽ —"}</div>
         <div style={{ color: "#777", fontSize: 11 }}>тариф: {tariff == null ? "—" : fmtNum(tariff, 3)}</div>
