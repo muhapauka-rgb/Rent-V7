@@ -8,6 +8,7 @@ type ApartmentItem = {
   electric_expected?: number | null;
   statuses?: {
     all_photos_received: boolean;
+    meters_photo: boolean;
     rent_paid: boolean;
     meters_paid: boolean;
   };
@@ -498,6 +499,7 @@ export default function App() {
       electric_expected: x.electric_expected ?? null,
       statuses: {
         all_photos_received: Boolean((x as any)?.statuses?.all_photos_received),
+        meters_photo: Boolean((x as any)?.statuses?.meters_photo),
         rent_paid: Boolean((x as any)?.statuses?.rent_paid),
         meters_paid: Boolean((x as any)?.statuses?.meters_paid),
       },
@@ -533,7 +535,7 @@ export default function App() {
     }
   }
 
-  async function togglePaidStatus(apartmentId: number, key: "rent_paid" | "meters_paid", current: boolean) {
+  async function togglePaidStatus(apartmentId: number, key: "rent_paid" | "meters_paid" | "meters_photo", current: boolean) {
     try {
       setErr(null);
       const ym = (serverYm || "").trim();
@@ -1145,7 +1147,11 @@ export default function App() {
                       <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                           <div style={{ fontSize: 12, color: "#444" }}>Фото счетчиков</div>
-                          {renderStatusSwitch(Boolean(a.statuses?.all_photos_received), undefined, true)}
+                          {renderStatusSwitch(
+                            Boolean(a.statuses?.meters_photo),
+                            () => togglePaidStatus(a.id, "meters_photo", Boolean(a.statuses?.meters_photo)),
+                            false
+                          )}
                         </div>
                         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
                           <div style={{ fontSize: 12, color: "#444" }}>Оплата аренды</div>

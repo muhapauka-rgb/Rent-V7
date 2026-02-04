@@ -611,8 +611,6 @@ async def start_cmd(message: types.Message):
         wrap = await _fetch_bill_wrap(message.chat.id, _current_ym())
         if wrap and wrap.get("ok"):
             CONTACT_CONFIRMED.add(int(message.chat.id))
-        else:
-            CONTACT_CONFIRMED.discard(int(message.chat.id))
     except Exception:
         pass
     await message.reply(
@@ -636,11 +634,11 @@ async def on_contact(message: types.Message):
         return
 
     CHAT_PHONES[message.chat.id] = c.phone_number
+    CONTACT_CONFIRMED.add(int(message.chat.id))
     username = message.from_user.username if message.from_user else None
     res = await _post_contact_now(message.chat.id, username, c.phone_number)
 
     if not res or not res.get("ok"):
-        CONTACT_CONFIRMED.discard(int(message.chat.id))
         await message.reply(
             "✅ Контакт получен.\n"
             "Но квартиру по номеру пока не нашёл.\n"
@@ -648,8 +646,6 @@ async def on_contact(message: types.Message):
             reply_markup=_kb_main(message.chat.id),
         )
         return
-
-    CONTACT_CONFIRMED.add(int(message.chat.id))
 
     await message.reply(
         "✅ Контакт получен.\n"
