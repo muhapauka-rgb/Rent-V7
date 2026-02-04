@@ -300,3 +300,67 @@ def bot_mark_meters_paid(apartment_id: int, ym: str):
             {"aid": int(apartment_id)},
         )
     return {"ok": True}
+
+
+@router.post("/bot/apartments/{apartment_id}/months/{ym}/rent-paid/toggle")
+def bot_toggle_rent_paid(apartment_id: int, ym: str):
+    if not db_ready():
+        raise HTTPException(status_code=500, detail="DB is not configured")
+    ensure_tables()
+    with engine.begin() as conn:
+        cur = conn.execute(
+            text("SELECT COALESCE(rent_paid, false) FROM apartment_month_statuses WHERE apartment_id=:aid AND ym=:ym"),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        ).scalar()
+        new_val = not bool(cur)
+        conn.execute(
+            text("""
+                INSERT INTO apartment_month_statuses (apartment_id, ym, rent_paid, updated_at, created_at)
+                VALUES (:aid, :ym, :v, now(), now())
+                ON CONFLICT (apartment_id, ym)
+                DO UPDATE SET rent_paid=:v, updated_at=now()
+            """),
+            {"aid": int(apartment_id), "ym": str(ym), "v": bool(new_val)},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO apartment_statuses (apartment_id, rent_paid, updated_at)
+                VALUES (:aid, :v, now())
+                ON CONFLICT (apartment_id)
+                DO UPDATE SET rent_paid=:v, updated_at=now()
+            """),
+            {"aid": int(apartment_id), "v": bool(new_val)},
+        )
+    return {"ok": True, "value": bool(new_val)}
+
+
+@router.post("/bot/apartments/{apartment_id}/months/{ym}/meters-paid/toggle")
+def bot_toggle_meters_paid(apartment_id: int, ym: str):
+    if not db_ready():
+        raise HTTPException(status_code=500, detail="DB is not configured")
+    ensure_tables()
+    with engine.begin() as conn:
+        cur = conn.execute(
+            text("SELECT COALESCE(meters_paid, false) FROM apartment_month_statuses WHERE apartment_id=:aid AND ym=:ym"),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        ).scalar()
+        new_val = not bool(cur)
+        conn.execute(
+            text("""
+                INSERT INTO apartment_month_statuses (apartment_id, ym, meters_paid, updated_at, created_at)
+                VALUES (:aid, :ym, :v, now(), now())
+                ON CONFLICT (apartment_id, ym)
+                DO UPDATE SET meters_paid=:v, updated_at=now()
+            """),
+            {"aid": int(apartment_id), "ym": str(ym), "v": bool(new_val)},
+        )
+        conn.execute(
+            text("""
+                INSERT INTO apartment_statuses (apartment_id, meters_paid, updated_at)
+                VALUES (:aid, :v, now())
+                ON CONFLICT (apartment_id)
+                DO UPDATE SET meters_paid=:v, updated_at=now()
+            """),
+            {"aid": int(apartment_id), "v": bool(new_val)},
+        )
+    return {"ok": True, "value": bool(new_val)}

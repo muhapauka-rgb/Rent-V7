@@ -350,25 +350,30 @@ def _choose_meter_index_from_missing(missing: List[str]) -> int:
     return 1
 
 
-async def _mark_paid_by_chat(chat_id: int, ym: str, which: str) -> bool:
+async def _mark_paid_by_chat(chat_id: int, ym: str, which: str) -> Optional[bool]:
     wrap = await _fetch_bill_wrap(chat_id, ym)
     if not wrap or not wrap.get("ok"):
-        return False
+        return None
     apartment_id = wrap.get("apartment_id")
     if not apartment_id:
-        return False
+        return None
 
     if which == "rent":
-        url = f"{API_BASE}/bot/apartments/{int(apartment_id)}/months/{ym}/rent-paid"
+        url = f"{API_BASE}/bot/apartments/{int(apartment_id)}/months/{ym}/rent-paid/toggle"
     else:
-        url = f"{API_BASE}/bot/apartments/{int(apartment_id)}/months/{ym}/meters-paid"
+        url = f"{API_BASE}/bot/apartments/{int(apartment_id)}/months/{ym}/meters-paid/toggle"
 
     try:
         resp = await _http_post(url, json_body={}, read_timeout=HTTP_READ_TIMEOUT_FAST)
-        return resp.status_code == 200
+        if resp.status_code != 200:
+            return None
+        js = resp.json()
+        if not isinstance(js, dict) or not bool(js.get("ok")):
+            return None
+        return bool(js.get("value"))
     except Exception:
         logging.exception("_mark_paid_by_chat failed")
-        return False
+        return None
 
 
 async def _start_month(chat_id: int, ym: str) -> Optional[dict]:
@@ -718,13 +723,23 @@ async def on_text(message: types.Message):
         return
 
     if text_in == "Аренда оплачена":
-        ok = await _mark_paid_by_chat(message.chat.id, ym, "rent")
-        await message.reply(("✅ Отметил аренду как оплаченную за " + ym) if ok else "Не получилось отметить оплату аренды. Проверьте привязку квартиры.", reply_markup=_kb_main())
+        v = await _mark_paid_by_chat(message.chat.id, ym, "rent")
+        if v is None:
+            await message.reply("Не получилось изменить отметку аренды. Проверьте привязку квартиры.", reply_markup=_kb_main())
+        elif v:
+            await message.reply("✅ Отметил аренду как оплаченную за " + ym, reply_markup=_kb_main())
+        else:
+            await message.reply("↩️ Снял отметку оплаты аренды за " + ym, reply_markup=_kb_main())
         return
 
     if text_in == "Счётчики оплачены":
-        ok = await _mark_paid_by_chat(message.chat.id, ym, "meters")
-        await message.reply(("✅ Отметил счётчики как оплаченные за " + ym) if ok else "Не получилось отметить оплату счётчиков. Проверьте привязку квартиры.", reply_markup=_kb_main())
+        v = await _mark_paid_by_chat(message.chat.id, ym, "meters")
+        if v is None:
+            await message.reply("Не получилось изменить отметку счётчиков. Проверьте привязку квартиры.", reply_markup=_kb_main())
+        elif v:
+            await message.reply("✅ Отметил счётчики как оплаченные за " + ym, reply_markup=_kb_main())
+        else:
+            await message.reply("↩️ Снял отметку оплаты счётчиков за " + ym, reply_markup=_kb_main())
         return
 
     if text_in == "Сообщить об ошибке распознавания":

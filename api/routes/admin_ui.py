@@ -60,6 +60,13 @@ def ui_list_apartments(ym: Optional[str] = None):
         phone = _get_active_contact(aid, "phone")
         telegram = _get_active_contact(aid, "telegram")
         statuses = _get_month_statuses(aid, ym_)
+        all_photos_received = False
+        try:
+            with engine.begin() as conn:
+                bill = _calc_month_bill(conn, apartment_id=int(aid), ym=str(ym_))
+                all_photos_received = bool(bill.get("is_complete_photos"))
+        except Exception:
+            all_photos_received = False
         items.append(
             UIApartmentItem(
                 id=aid,
@@ -70,7 +77,12 @@ def ui_list_apartments(ym: Optional[str] = None):
                 ls_account=r[5],
                 electric_expected=int(r[6]) if r[6] is not None else 3,
                 contacts=UIContacts(phone=phone, telegram=telegram),
-                statuses=statuses,
+                statuses=UIStatuses(
+                    rent_paid=bool(getattr(statuses, "rent_paid", False)),
+                    meters_photo=bool(getattr(statuses, "meters_photo", False)),
+                    meters_paid=bool(getattr(statuses, "meters_paid", False)),
+                    all_photos_received=bool(all_photos_received),
+                ),
             ).model_dump()
         )
 

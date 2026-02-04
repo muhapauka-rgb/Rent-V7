@@ -11,6 +11,7 @@ class UIStatuses(BaseModel):
     rent_paid: bool = False
     meters_photo: bool = False
     meters_paid: bool = False
+    all_photos_received: bool = False
 
 
 class UIApartmentItem(BaseModel):
@@ -21,6 +22,8 @@ class UIApartmentItem(BaseModel):
     note: Optional[str] = None
     ls_account: Optional[str] = None
     electric_expected: Optional[int] = None
+    contacts: Optional[UIContacts] = None
+    statuses: Optional[UIStatuses] = None
 
 
 class UIApartmentCreate(BaseModel):

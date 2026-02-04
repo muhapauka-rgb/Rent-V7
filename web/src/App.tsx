@@ -1,7 +1,17 @@
 import React, { useEffect, useMemo, useState } from "react";
 import MetersTable from "./components/MetersTable";
 
-type ApartmentItem = { id: number; title: string; address?: string | null; electric_expected?: number | null };
+type ApartmentItem = {
+  id: number;
+  title: string;
+  address?: string | null;
+  electric_expected?: number | null;
+  statuses?: {
+    all_photos_received: boolean;
+    rent_paid: boolean;
+    meters_paid: boolean;
+  };
+};
 
 type ApartmentsResp = { ok: boolean; ym: string; items: ApartmentItem[] };
 
@@ -486,6 +496,11 @@ export default function App() {
       title: x.title,
       address: x.address ?? null,
       electric_expected: x.electric_expected ?? null,
+      statuses: {
+        all_photos_received: Boolean((x as any)?.statuses?.all_photos_received),
+        rent_paid: Boolean((x as any)?.statuses?.rent_paid),
+        meters_paid: Boolean((x as any)?.statuses?.meters_paid),
+      },
     }));
 
     setApartments(items);
@@ -515,6 +530,23 @@ export default function App() {
       setReviewFlags([]);
     } finally {
       setLoadingHistory(false);
+    }
+  }
+
+  async function togglePaidStatus(apartmentId: number, key: "rent_paid" | "meters_paid", current: boolean) {
+    try {
+      setErr(null);
+      const ym = (serverYm || "").trim();
+      const q = ym ? `?ym=${encodeURIComponent(ym)}` : "";
+      const r = await fetch(`/api/admin/ui/apartments/${apartmentId}/statuses${q}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ [key]: !current }),
+      });
+      if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+      await loadApartments(false);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
     }
   }
 
@@ -969,6 +1001,47 @@ export default function App() {
 
   }, [latest, latestTariff]);
 
+  function renderStatusSwitch(
+    checked: boolean,
+    onToggle?: () => void,
+    readOnly: boolean = false
+  ) {
+    const bg = checked ? "#0A84FF" : "#C9972B";
+    return (
+      <button
+        type="button"
+        onClick={(e) => {
+          e.stopPropagation();
+          if (!readOnly && onToggle) onToggle();
+        }}
+        style={{
+          width: 42,
+          height: 24,
+          borderRadius: 999,
+          border: "none",
+          padding: 2,
+          background: bg,
+          display: "flex",
+          alignItems: "center",
+          justifyContent: checked ? "flex-end" : "flex-start",
+          cursor: readOnly ? "default" : "pointer",
+          opacity: readOnly ? 0.9 : 1,
+          transition: "all 160ms ease",
+        }}
+      >
+        <span
+          style={{
+            width: 20,
+            height: 20,
+            borderRadius: "50%",
+            background: "white",
+            boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
+          }}
+        />
+      </button>
+    );
+  }
+
   return (
     <>
     <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", padding: 24 }}>
@@ -1069,6 +1142,28 @@ export default function App() {
                     >
                       <div style={{ fontWeight: 900 }}>{a.title}</div>
                       {a.address ? <div style={{ fontSize: 12, color: "#666" }}>{a.address}</div> : null}
+                      <div style={{ marginTop: 8, display: "grid", gap: 6 }}>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                          <div style={{ fontSize: 12, color: "#444" }}>Фото счетчиков</div>
+                          {renderStatusSwitch(Boolean(a.statuses?.all_photos_received), undefined, true)}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                          <div style={{ fontSize: 12, color: "#444" }}>Оплата аренды</div>
+                          {renderStatusSwitch(
+                            Boolean(a.statuses?.rent_paid),
+                            () => togglePaidStatus(a.id, "rent_paid", Boolean(a.statuses?.rent_paid)),
+                            false
+                          )}
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                          <div style={{ fontSize: 12, color: "#444" }}>Оплата счетчиков</div>
+                          {renderStatusSwitch(
+                            Boolean(a.statuses?.meters_paid),
+                            () => togglePaidStatus(a.id, "meters_paid", Boolean(a.statuses?.meters_paid)),
+                            false
+                          )}
+                        </div>
+                      </div>
                     </button>
                   );
                 })}
