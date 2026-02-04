@@ -12,7 +12,7 @@ from core.billing import (
     find_apartment_for_chat,
 )
 from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort
-from core.schemas import BotContactIn, BotManualReadingIn, BotDuplicateResolveIn
+from core.schemas import BotContactIn, BotManualReadingIn, BotDuplicateResolveIn, BotWrongReadingReportIn
 
 router = APIRouter()
 
@@ -187,6 +187,61 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
 
         bill = _calc_month_bill(conn, apartment_id, ym)
         return {"ok": True, "bill": bill}
+
+
+@router.post("/bot/report-wrong-reading")
+def bot_report_wrong_reading(payload: BotWrongReadingReportIn):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="DB not ready")
+    ensure_tables()
+
+    chat_id = str(payload.chat_id or "").strip()
+    ym = str(payload.ym or "").strip()
+    meter_type = str(payload.meter_type or "").strip()
+    meter_index = int(payload.meter_index or 1)
+    comment = (payload.comment or "").strip() or None
+
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id_required")
+    if not is_ym(ym):
+        raise HTTPException(status_code=400, detail="ym_invalid")
+    if meter_type not in ("cold", "hot", "electric", "sewer"):
+        raise HTTPException(status_code=400, detail="meter_type_invalid")
+    if meter_type != "electric":
+        meter_index = 1
+    elif meter_index not in (1, 2, 3):
+        raise HTTPException(status_code=400, detail="meter_index_invalid")
+
+    apartment_id = find_apartment_by_chat(chat_id)
+    if not apartment_id:
+        return {"ok": False, "reason": "not_bound"}
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO meter_review_flags(
+                    apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                )
+                VALUES(:aid, :ym, :mt, :mi, 'open', 'user_report_wrong_ocr', :comment, now(), NULL)
+                """
+            ),
+            {
+                "aid": int(apartment_id),
+                "ym": ym,
+                "mt": meter_type,
+                "mi": int(meter_index),
+                "comment": comment,
+            },
+        )
+
+    return {
+        "ok": True,
+        "apartment_id": int(apartment_id),
+        "ym": ym,
+        "meter_type": meter_type,
+        "meter_index": int(meter_index),
+    }
 
 
 # -----------------------

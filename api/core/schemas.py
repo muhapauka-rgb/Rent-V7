@@ -95,3 +95,11 @@ class BotDuplicateResolveIn(BaseModel):
 class BillApproveIn(BaseModel):
     ym: str
     send: bool = True
+
+
+class BotWrongReadingReportIn(BaseModel):
+    chat_id: str
+    ym: str
+    meter_type: Literal["cold", "hot", "electric", "sewer"]
+    meter_index: int = 1
+    comment: Optional[str] = None

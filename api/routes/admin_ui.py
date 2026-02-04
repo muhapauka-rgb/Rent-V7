@@ -340,6 +340,90 @@ def ui_apartment_history(apartment_id: int):
     return {"apartment_id": apartment_id, "history": history}
 
 
+@router.get("/admin/ui/apartments/{apartment_id}/review-flags")
+def ui_list_review_flags(apartment_id: int, ym: Optional[str] = None, status: str = "open"):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    ym_ = (ym or "").strip() or None
+    status_ = (status or "open").strip().lower()
+
+    allowed_status = {"open", "resolved", "all"}
+    if status_ not in allowed_status:
+        raise HTTPException(status_code=400, detail="status must be open|resolved|all")
+
+    where = ["apartment_id=:aid"]
+    params: Dict[str, Any] = {"aid": int(apartment_id)}
+    if ym_:
+        where.append("ym=:ym")
+        params["ym"] = str(ym_)
+    if status_ != "all":
+        where.append("status=:st")
+        params["st"] = status_
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT id, apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at, resolved_by
+                FROM meter_review_flags
+                WHERE {' AND '.join(where)}
+                ORDER BY created_at DESC
+                """
+            ),
+            params,
+        ).mappings().all()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "id": int(r["id"]),
+                "apartment_id": int(r["apartment_id"]),
+                "ym": r["ym"],
+                "meter_type": r["meter_type"],
+                "meter_index": int(r["meter_index"] or 1),
+                "status": r["status"],
+                "reason": r["reason"],
+                "comment": r["comment"],
+                "created_at": (r["created_at"].isoformat() if r["created_at"] else None),
+                "resolved_at": (r["resolved_at"].isoformat() if r["resolved_at"] else None),
+                "resolved_by": r["resolved_by"],
+            }
+        )
+
+    return {"ok": True, "apartment_id": int(apartment_id), "items": items}
+
+
+@router.post("/admin/ui/review-flags/{flag_id}/resolve")
+def ui_resolve_review_flag(flag_id: int):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    with engine.begin() as conn:
+        row = conn.execute(
+            text("SELECT id, status FROM meter_review_flags WHERE id=:id"),
+            {"id": int(flag_id)},
+        ).mappings().first()
+        if not row:
+            raise HTTPException(status_code=404, detail="flag_not_found")
+
+        if str(row["status"] or "") != "resolved":
+            conn.execute(
+                text(
+                    """
+                    UPDATE meter_review_flags
+                    SET status='resolved', resolved_at=now(), resolved_by='admin_ui'
+                    WHERE id=:id
+                    """
+                ),
+                {"id": int(flag_id)},
+            )
+
+    return {"ok": True, "id": int(flag_id), "status": "resolved"}
+
+
 @router.get("/admin/ui/apartments/{apartment_id}/bill")
 def ui_get_bill(apartment_id: int, ym: Optional[str] = None):
     if not db_ready():

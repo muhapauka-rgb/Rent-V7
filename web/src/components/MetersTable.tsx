@@ -33,11 +33,13 @@ type Props = {
     rub: number | null,
     tariff: number | null,
     rubEnabled: boolean,
-    highlightMissing?: boolean
+    highlightMode?: "none" | "missing" | "review"
   ) => React.ReactNode;
 
   fmtRub: (n: number | null | undefined) => string;
   openEdit: (month: string) => void;
+  getReviewFlag: (month: string, meterType: string, meterIndex: number) => { id: number } | null;
+  onResolveReviewFlag: (flagId: number) => void;
 };
 
 export default function MetersTable(props: Props) {
@@ -51,6 +53,8 @@ export default function MetersTable(props: Props) {
     cellTriplet,
     fmtRub,
     openEdit,
+    getReviewFlag,
+    onResolveReviewFlag,
   } = props;
 
   const n = Math.max(1, Math.min(3, Number.isFinite(eN) ? eN : 3));
@@ -111,6 +115,13 @@ export default function MetersTable(props: Props) {
             const missingE2 = n >= 2 && e2cur == null;
             const missingE3 = n >= 3 && (e3cur == null || e3src !== "ocr");
 
+            const fCold = getReviewFlag(h.month, "cold", 1);
+            const fHot = getReviewFlag(h.month, "hot", 1);
+            const fE1 = getReviewFlag(h.month, "electric", 1);
+            const fE2 = getReviewFlag(h.month, "electric", 2);
+            const fE3 = getReviewFlag(h.month, "electric", 3);
+            const fSewer = getReviewFlag(h.month, "sewer", 1);
+
             // Если в квартире ожидается 3 электро-индекса — сумму НЕ показываем, пока не пришёл T3
             const isComplete =
               !missingCold &&
@@ -128,33 +139,75 @@ export default function MetersTable(props: Props) {
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap" }}>{h.month}</td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, missingCold)}
+                  {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, fCold ? "review" : (missingCold ? "missing" : "none"))}
+                  {fCold ? (
+                    <div style={{ marginTop: 6 }}>
+                      <button onClick={() => onResolveReviewFlag(fCold.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                        Проверить значение
+                      </button>
+                    </div>
+                  ) : null}
                 </td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, missingHot)}
+                  {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, fHot ? "review" : (missingHot ? "missing" : "none"))}
+                  {fHot ? (
+                    <div style={{ marginTop: 6 }}>
+                      <button onClick={() => onResolveReviewFlag(fHot.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                        Проверить значение
+                      </button>
+                    </div>
+                  ) : null}
                 </td>
 
                 {n >= 1 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, missingE1)}
+                    {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, fE1 ? "review" : (missingE1 ? "missing" : "none"))}
+                    {fE1 ? (
+                      <div style={{ marginTop: 6 }}>
+                        <button onClick={() => onResolveReviewFlag(fE1.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                          Проверить значение
+                        </button>
+                      </div>
+                    ) : null}
                   </td>
                 )}
 
                 {n >= 2 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, missingE2)}
+                    {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, fE2 ? "review" : (missingE2 ? "missing" : "none"))}
+                    {fE2 ? (
+                      <div style={{ marginTop: 6 }}>
+                        <button onClick={() => onResolveReviewFlag(fE2.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                          Проверить значение
+                        </button>
+                      </div>
+                    ) : null}
                   </td>
                 )}
 
                 {n >= 3 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    {cellTriplet(t3fb.current, de3, null, null, false, missingE3)}
+                    {cellTriplet(t3fb.current, de3, null, null, false, fE3 ? "review" : (missingE3 ? "missing" : "none"))}
+                    {fE3 ? (
+                      <div style={{ marginTop: 6 }}>
+                        <button onClick={() => onResolveReviewFlag(fE3.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                          Проверить значение
+                        </button>
+                      </div>
+                    ) : null}
                   </td>
                 )}
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  {cellTriplet(h.meters?.sewer?.current ?? null, ds, rs, t.sewer, true)}
+                  {cellTriplet(h.meters?.sewer?.current ?? null, ds, rs, t.sewer, true, fSewer ? "review" : "none")}
+                  {fSewer ? (
+                    <div style={{ marginTop: 6 }}>
+                      <button onClick={() => onResolveReviewFlag(fSewer.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                        Проверить значение
+                      </button>
+                    </div>
+                  ) : null}
                 </td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 900 }}>
@@ -186,6 +239,7 @@ export default function MetersTable(props: Props) {
       <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
         Пояснение: ₽ = Δ × тариф месяца. Водоотведение: если sewer.delta пустой — считаем как Δ(ХВС)+Δ(ГВС). Электро: тарифицируем только T1 и T2. T3 — без тарифа (инфо).
         Оранжевым выделены значения, по которым ещё ждём фото от клиента.
+        Красным и меткой "Проверить значение" отмечены жалобы клиента на неверное распознавание.
       </div>
     </div>
   );

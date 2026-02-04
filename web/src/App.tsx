@@ -70,6 +70,18 @@ type BillResp = {
   state: BillState;
 };
 
+type ReviewFlagItem = {
+  id: number;
+  apartment_id: number;
+  ym: string;
+  meter_type: string;
+  meter_index: number;
+  status: string;
+  reason?: string | null;
+  comment?: string | null;
+};
+type ReviewFlagsResp = { ok: boolean; apartment_id: number; items: ReviewFlagItem[] };
+
 
 type UnassignedPhoto = {
   id: number;
@@ -304,6 +316,7 @@ export default function App() {
 
   // History
   const [history, setHistory] = useState<HistoryResp["history"]>([]);
+  const [reviewFlags, setReviewFlags] = useState<ReviewFlagItem[]>([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
 
   // Edit readings modal
@@ -490,13 +503,30 @@ export default function App() {
     setLoadingHistory(true);
     try {
       setErr(null);
-      const data = await apiGet<HistoryResp>(`/admin/ui/apartments/${apartmentId}/history`);
+      const [data, flags] = await Promise.all([
+        apiGet<HistoryResp>(`/admin/ui/apartments/${apartmentId}/history`),
+        apiGet<ReviewFlagsResp>(`/admin/ui/apartments/${apartmentId}/review-flags?status=open`),
+      ]);
       setHistory(data.history ?? []);
+      setReviewFlags(flags.items ?? []);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
       setHistory([]);
+      setReviewFlags([]);
     } finally {
       setLoadingHistory(false);
+    }
+  }
+
+  async function resolveReviewFlag(flagId: number) {
+    try {
+      setErr(null);
+      await apiPost(`/admin/ui/review-flags/${flagId}/resolve`, {});
+      if (selectedId != null) {
+        await loadHistory(selectedId);
+      }
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
     }
   }
 
@@ -853,6 +883,20 @@ export default function App() {
   // сколько столбцов электро показывать (T1/T2/T3)
   const eN = Math.max(1, Math.min(3, Number((selected as any)?.electric_expected ?? 1) || 1));
 
+  function getReviewFlag(month: string, meterType: string, meterIndex: number): ReviewFlagItem | null {
+    const mt = String(meterType || "").toLowerCase();
+    const mi = Number(meterIndex || 1);
+    return (
+      reviewFlags.find(
+        (f) =>
+          String(f.ym || "") === String(month || "") &&
+          String(f.meter_type || "").toLowerCase() === mt &&
+          Number(f.meter_index || 1) === mi &&
+          String(f.status || "").toLowerCase() === "open"
+      ) || null
+    );
+  }
+
   function calcSewerDelta(h: HistoryResp["history"][number]) {
     const d = h?.meters?.sewer?.delta;
     if (d != null && Number.isFinite(d)) return d;
@@ -876,11 +920,12 @@ export default function App() {
     rub: number | null,
     tariff: number | null,
     rubEnabled: boolean,
-    highlightMissing: boolean = false
+    highlightMode: "none" | "missing" | "review" = "none"
   ) {
+    const color = highlightMode === "review" ? "#b91c1c" : highlightMode === "missing" ? "#d97706" : "#111";
     return (
       <div style={{ display: "grid", gap: 2, lineHeight: 1.25 }}>
-        <div style={{ fontWeight: 900, color: highlightMissing ? "#d97706" : "#111" }}>{fmtNum(current, 3)}</div>
+        <div style={{ fontWeight: 900, color }}>{fmtNum(current, 3)}</div>
         <div style={{ color: "#666", fontSize: 12 }}>Δ {fmtNum(delta, 3)}</div>
         <div style={{ color: "#111", fontSize: 12, fontWeight: 800 }}>{rubEnabled ? (rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`) : "₽ —"}</div>
         <div style={{ color: "#777", fontSize: 11 }}>тариф: {tariff == null ? "—" : fmtNum(tariff, 3)}</div>
@@ -1120,6 +1165,8 @@ export default function App() {
                     calcSumRub={calcSumRub}
                     fmtRub={fmtRub}
                     openEdit={openEdit}
+                    getReviewFlag={getReviewFlag}
+                    onResolveReviewFlag={resolveReviewFlag}
                   />
 
                   <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>

@@ -190,6 +190,28 @@ def ensure_tables() -> None:
                         );
                     """))
 
+                    # --- meter_review_flags (bot/user reports wrong reading) ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS meter_review_flags (
+                            id BIGSERIAL PRIMARY KEY,
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            ym TEXT NOT NULL,
+                            meter_type TEXT NOT NULL,
+                            meter_index INTEGER NOT NULL DEFAULT 1,
+                            status TEXT NOT NULL DEFAULT 'open', -- open | resolved
+                            reason TEXT NOT NULL DEFAULT 'user_report_wrong_ocr',
+                            comment TEXT NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            resolved_at TIMESTAMPTZ NULL,
+                            resolved_by TEXT NULL
+                        );
+                    """))
+                    try:
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meter_review_flags_apartment_ym ON meter_review_flags(apartment_id, ym)"))
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_meter_review_flags_status ON meter_review_flags(status)"))
+                    except Exception:
+                        pass
+
                     # Postgres-only indexes (no-op on other DBs).
                     try:
                         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_status ON photo_events(status)"))

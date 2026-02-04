@@ -85,6 +85,7 @@ def _kb_main() -> ReplyKeyboardMarkup:
         keyboard=[
             [KeyboardButton("Передать контакт", request_contact=True)],
             [KeyboardButton("Старт месяца")],
+            [KeyboardButton("Сообщить об ошибке распознавания")],
             [KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены")],
         ],
     )
@@ -96,6 +97,19 @@ def _kb_manual_start() -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text="✍️ Ввести вручную", callback_data="manual_start")],
             [InlineKeyboardButton(text="📸 Пришлю новое фото", callback_data="manual_photo")],
+        ]
+    )
+
+
+def _kb_report_wrong_pick() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="ХВС", callback_data="report_pick|cold|1")],
+            [InlineKeyboardButton(text="ГВС", callback_data="report_pick|hot|1")],
+            [InlineKeyboardButton(text="Электро T1", callback_data="report_pick|electric|1")],
+            [InlineKeyboardButton(text="Электро T2", callback_data="report_pick|electric|2")],
+            [InlineKeyboardButton(text="Электро T3", callback_data="report_pick|electric|3")],
+            [InlineKeyboardButton(text="Отмена", callback_data="report_cancel")],
         ]
     )
 def _kb_fix_fields() -> InlineKeyboardMarkup:
@@ -364,6 +378,27 @@ async def _manual_write(chat_id: int, ym: str, meter_type: str, meter_index: int
         logging.exception("_manual_write failed")
         return None
 
+
+async def _report_wrong_reading(chat_id: int, ym: str, meter_type: str, meter_index: int, comment: Optional[str] = None) -> Optional[dict]:
+    url = f"{API_BASE}/bot/report-wrong-reading"
+    payload = {
+        "chat_id": str(chat_id),
+        "ym": str(ym),
+        "meter_type": str(meter_type),
+        "meter_index": int(meter_index),
+        "comment": (comment or "").strip() or None,
+    }
+    try:
+        resp = await _http_post(url, json_body=payload, read_timeout=HTTP_READ_TIMEOUT_FAST)
+        if resp.status_code != 200:
+            logging.warning(f"_report_wrong_reading: non-200 status={resp.status_code} text={resp.text[:300]!r}")
+            return None
+        return resp.json()
+    except Exception:
+        logging.exception("_report_wrong_reading failed")
+        return None
+
+
 async def _post_contact_now(chat_id: int, telegram_username: Optional[str], phone: Optional[str]) -> Optional[dict]:
     url = f"{API_BASE}/bot/contact"
     payload = {
@@ -506,6 +541,43 @@ async def on_fix_cancel(call: types.CallbackQuery):
     await bot.send_message(call.message.chat.id, "Ок. Исправление отменено.", reply_markup=_kb_main())
 
 
+@dp.callback_query_handler(lambda c: c.data == "report_cancel")
+async def on_report_cancel(call: types.CallbackQuery):
+    await call.answer("Ок", show_alert=False)
+    await bot.send_message(call.message.chat.id, "Ок, отменил сообщение об ошибке.", reply_markup=_kb_main())
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("report_pick|"))
+async def on_report_pick(call: types.CallbackQuery):
+    await call.answer("Отправляю", show_alert=False)
+    parts = (call.data or "").split("|")
+    if len(parts) < 3:
+        await bot.send_message(call.message.chat.id, "Ошибка выбора счётчика.", reply_markup=_kb_main())
+        return
+
+    meter_type = parts[1]
+    try:
+        meter_index = int(parts[2])
+    except Exception:
+        meter_index = 1
+
+    ym = _current_ym()
+    res = await _report_wrong_reading(call.message.chat.id, ym, meter_type, meter_index)
+    if not res or not res.get("ok"):
+        await bot.send_message(
+            call.message.chat.id,
+            "Не получилось отправить отметку администратору. Попробуйте ещё раз.",
+            reply_markup=_kb_main(),
+        )
+        return
+
+    await bot.send_message(
+        call.message.chat.id,
+        "Спасибо, отправил администратору пометку: \"Проверить значение\".",
+        reply_markup=_kb_main(),
+    )
+
+
 @dp.message_handler(commands=["start"])
 async def start_cmd(message: types.Message):
     MANUAL_CTX.pop(message.chat.id, None)
@@ -624,6 +696,13 @@ async def on_text(message: types.Message):
         await message.reply(("✅ Отметил счётчики как оплаченные за " + ym) if ok else "Не получилось отметить оплату счётчиков. Проверьте привязку квартиры.", reply_markup=_kb_main())
         return
 
+    if text_in == "Сообщить об ошибке распознавания":
+        await message.reply(
+            "Выберите счётчик, где значение распознано неверно:",
+            reply_markup=_kb_report_wrong_pick(),
+        )
+        return
+
     await message.reply(
         "Пришлите фото/файл счётчика.",
         reply_markup=_kb_main(),
@@ -700,10 +779,6 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     if ocr_type or ocr_reading:
         msg += f"\nРаспознано: {ocr_type or '—'} / {ocr_reading or '—'}"
     await message.reply(msg, reply_markup=_kb_main())
-    await message.reply(
-        "Если распознано неверно — выберите, что исправить:",
-        reply_markup=_kb_fix_fields(),
-    )
 
 
     dup = _extract_duplicate_info(js)
