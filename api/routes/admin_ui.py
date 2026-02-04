@@ -21,7 +21,7 @@ from core.billing import (
     _set_month_extra_state,
     is_ym,
 )
-from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort, _normalize_electric_expected3
+from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort, _auto_fill_t3_from_t1_t2_if_needed
 from core.integrations import _tg_send_message
 from core.schemas import (
     UIContacts,
@@ -370,6 +370,44 @@ def ui_approve_bill(apartment_id: int, payload: BillApproveIn):
         return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
 
 
+@router.post("/admin/ui/apartments/{apartment_id}/bill/send-without-t3-photo")
+def ui_send_bill_without_t3_photo(apartment_id: int, payload: BillApproveIn):
+    """
+    Manual override: allow sending sum when only missing photo is electric_3.
+    Keeps all other billing rules unchanged.
+    """
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    ym_ = (payload.ym or "").strip() or current_ym()
+
+    with engine.begin() as conn:
+        strict_bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym_))
+        missing = strict_bill.get("missing") or []
+        if (strict_bill.get("reason") != "missing_photos") or (set(missing) != {"electric_3"}):
+            raise HTTPException(status_code=400, detail="override_allowed_only_for_missing_electric_3")
+
+        bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym_), allow_missing_t3_photo=True)
+        if (bill.get("reason") != "ok") or (bill.get("total_rub") is None):
+            raise HTTPException(status_code=400, detail=f"cannot_send_reason_{bill.get('reason')}")
+
+        chat_id = _get_active_chat_id(conn, int(apartment_id))
+        if not chat_id:
+            raise HTTPException(status_code=400, detail="no_active_chat")
+
+        st = _get_month_bill_state(conn, int(apartment_id), str(ym_))
+        from core.billing import _same_total  # local import to avoid cycles
+        if _same_total(st.get("sent_total"), bill.get("total_rub")):
+            return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": False, "reason": "same_total_already_sent"}
+
+        msg = f"Сумма оплаты по счётчикам за {ym_}: {float(bill.get('total_rub')):.2f} ₽"
+        sent = _tg_send_message(str(chat_id), msg)
+        if sent:
+            _set_month_bill_state(conn, int(apartment_id), str(ym_), sent_at=True, sent_total=bill.get("total_rub"))
+
+        return {"ok": True, "apartment_id": int(apartment_id), "ym": str(ym_), "sent": bool(sent), "bill": bill}
+
+
 @router.post("/admin/ui/apartments/{apartment_id}/months/{ym}/electric-extra/accept")
 def admin_accept_electric_extra(apartment_id: int, ym: str):
     """Админ подтверждает, что “лишний” столбец электро нужно принять: увеличиваем electric_expected на +1 (макс 3) и снимаем блокировку."""
@@ -487,13 +525,13 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
                 source="manual",
             )
 
-        # Normalize electricity slots after bulk manual edit (if expected=3)
+        # For expected=3: after manual T1/T2 edits set T3=T1+T2
         try:
             if any(k == "electric" for (k, _, _) in updates):
                 with engine.begin() as conn:
                     expected = _get_apartment_electric_expected(conn, int(apartment_id))
                     if int(expected) == 3:
-                        _normalize_electric_expected3(conn, int(apartment_id), str(ym))
+                        _auto_fill_t3_from_t1_t2_if_needed(conn, int(apartment_id), str(ym))
         except Exception:
             pass
 
@@ -557,12 +595,12 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
             source="manual",
         )
 
-    # Normalize electricity slots after single manual edit as well (if expected=3)
+    # For expected=3: after manual T1/T2 edit set T3=T1+T2
     try:
         with engine.begin() as conn:
             expected = _get_apartment_electric_expected(conn, int(apartment_id))
-            if int(expected) == 3:
-                _normalize_electric_expected3(conn, int(apartment_id), str(month))
+            if int(expected) == 3 and int(meter_index) in (1, 2):
+                _auto_fill_t3_from_t1_t2_if_needed(conn, int(apartment_id), str(month))
     except Exception:
         pass
 

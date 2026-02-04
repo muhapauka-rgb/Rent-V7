@@ -731,6 +731,17 @@ export default function App() {
     }
   }
 
+  async function sendBillWithoutT3Photo(apartmentId: number, ym: string) {
+    try {
+      setBillErr(null);
+      await apiPost(`/admin/ui/apartments/${apartmentId}/bill/send-without-t3-photo`, { ym, send: true });
+      await loadBill(apartmentId, ym);
+      await loadHistory(apartmentId);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+    }
+  }
+
   async function saveEdit() {
     if (!selectedId) return;
 
@@ -1328,6 +1339,28 @@ export default function App() {
                           }}
                         >
                           Согласовать без отправки
+                        </button>
+                      </div>
+                    ) : null}
+
+                    {billInfo.bill?.reason === "missing_photos" &&
+                    Array.isArray(billInfo.bill?.missing) &&
+                    billInfo.bill.missing.length === 1 &&
+                    billInfo.bill.missing[0] === "electric_3" ? (
+                      <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+                        <button
+                          onClick={() => sendBillWithoutT3Photo(selected.id, editMonth)}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid #111",
+                            background: "#111",
+                            color: "white",
+                            cursor: "pointer",
+                            fontWeight: 900,
+                          }}
+                        >
+                          Отправить сумму без фото T3
                         </button>
                       </div>
                     ) : null}

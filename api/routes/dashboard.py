@@ -13,7 +13,7 @@ from core.billing import (
     _same_total,
     _get_apartment_electric_expected,
 )
-from core.meters import _normalize_electric_expected3
+from core.meters import _auto_fill_t3_from_t1_t2_if_needed
 from core.admin_helpers import update_apartment_statuses
 from core.integrations import _tg_send_message
 from core.schemas import MeterCurrentPatch, UIStatusesPatch
@@ -207,9 +207,9 @@ def dashboard_apartment_meters(apartment_id: int):
         hot_delta = entry["kinds"]["hot"]["delta"]
         if cold_delta is not None and hot_delta is not None:
             sewer_delta = cold_delta + hot_delta
-            entry["sewer"]["delta"] = sewer_delta
-            if entry["sewer"]["tariff"] is not None:
-                entry["sewer"]["rub"] = float(sewer_delta) * float(entry["sewer"]["tariff"])
+            entry["kinds"]["sewer"]["delta"] = sewer_delta
+            if entry["kinds"]["sewer"]["tariff"] is not None:
+                entry["kinds"]["sewer"]["rub"] = float(sewer_delta) * float(entry["kinds"]["sewer"]["tariff"])
 
         # total_rub (month sum)
         rubs = [
@@ -218,7 +218,7 @@ def dashboard_apartment_meters(apartment_id: int):
             entry["kinds"]["electric"]["t1"]["rub"],
             entry["kinds"]["electric"]["t2"]["rub"],
             entry["kinds"]["electric"]["t3"]["rub"],
-            entry["sewer"]["rub"],
+            entry["kinds"]["sewer"]["rub"],
         ]
         if all(x is not None for x in rubs):
             entry["total_rub"] = float(sum(float(x) for x in rubs if x is not None))
@@ -289,12 +289,12 @@ def patch_current_month_readings(apartment_id: int, payload: MeterCurrentPatch):
                 },
             )
 
-        # Normalize electricity slots after dashboard edit (if expected=3)
+        # For expected=3: after manual T1/T2 edit set T3=T1+T2 if T3 is not OCR
         try:
-            if any(k.startswith("electric") for k in updates.keys()):
+            if any(k in ("electric_t1", "electric_t2") for k in updates.keys()):
                 expected = _get_apartment_electric_expected(conn, int(apartment_id))
                 if int(expected) == 3:
-                    _normalize_electric_expected3(conn, int(apartment_id), str(m))
+                    _auto_fill_t3_from_t1_t2_if_needed(conn, int(apartment_id), str(m))
         except Exception:
             pass
 

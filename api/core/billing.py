@@ -310,7 +310,7 @@ def _set_month_bill_state(
     conn.execute(text(sql), params)
 
 
-def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
+def _calc_month_bill(conn, apartment_id: int, ym: str, *, allow_missing_t3_photo: bool = False) -> Dict[str, Any]:
     """
     Возвращает:
       - is_complete_photos: есть ли все текущие показания, нужные для расчета (cold/hot + electric 1..N)
@@ -338,7 +338,7 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     # текущие показания (ВАЖНО: вода хранится с meter_index=1)
     cur = conn.execute(
         text(
-            "SELECT meter_type, meter_index, value "
+            "SELECT meter_type, meter_index, value, source "
             "FROM meter_readings "
             "WHERE apartment_id=:aid AND ym=:ym AND source IN ('ocr','manual')"
         ),
@@ -346,26 +346,37 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
     ).mappings().all()
 
     cur_map: Dict[str, Dict[int, Optional[float]]] = {"cold": {}, "hot": {}, "electric": {}}
+    cur_src: Dict[str, Dict[int, Optional[str]]] = {"cold": {}, "hot": {}, "electric": {}}
     for r in cur:
         mt = r["meter_type"]
         mi = int(r["meter_index"] or 0)
         cur_map.setdefault(mt, {})[mi] = r["value"]
+        cur_src.setdefault(mt, {})[mi] = (r.get("source") or None)
 
     # --- completeness rules ---
     # For electricity:
     #   - if electric_expected == 1 -> require only T1
-    #   - if electric_expected >= 2 -> require T1 and T2
-    #   - T3 is ALWAYS derived as (T1 + T2) when possible and is NOT required for completeness.
+    #   - if electric_expected == 2 -> require T1 and T2
+    #   - if electric_expected >= 3 -> require T1/T2/T3
+    #   - for required T3 we only accept OCR/photo value
+    #   - exception: allow_missing_t3_photo=True (manual admin override path)
     missing: List[str] = []
     if cur_map.get("cold", {}).get(1) is None:
         missing.append("cold")
     if cur_map.get("hot", {}).get(1) is None:
         missing.append("hot")
 
-    req_electric = [1] if int(electric_expected) <= 1 else [1, 2]
+    req_electric = [1] if int(electric_expected) <= 1 else ([1, 2] if int(electric_expected) == 2 else [1, 2, 3])
     for i in req_electric:
-        if cur_map.get("electric", {}).get(i) is None:
+        val = cur_map.get("electric", {}).get(i)
+        if val is None:
             missing.append(f"electric_{i}")
+            continue
+        if int(i) == 3 and int(electric_expected) >= 3:
+            src = (cur_src.get("electric", {}).get(i) or "").lower()
+            if (src != "ocr") and (not allow_missing_t3_photo):
+                # T3 is present, but not from photo yet.
+                missing.append("electric_3")
 
     is_complete_photos = len(missing) == 0
     if not is_complete_photos:
@@ -418,11 +429,16 @@ def _calc_month_bill(conn, apartment_id: int, ym: str) -> Dict[str, Any]:
         text(
             "SELECT meter_type, meter_index, value "
             "FROM meter_readings "
-            "WHERE apartment_id=:aid AND ym=:ym AND source IN ('ocr','manual')"
+            "WHERE apartment_id=:aid AND ym=:pym AND source IN ('ocr','manual')"
         ),
-        {"aid": apartment_id, "ym": prev_ym},
+        {"aid": apartment_id, "pym": prev_ym},
     ).mappings().all()
 
+    prev_map: Dict[str, Dict[int, Optional[float]]] = {"cold": {}, "hot": {}, "electric": {}}
+    for r in prev:
+        mt = r["meter_type"]
+        mi = int(r["meter_index"] or 0)
+        prev_map.setdefault(mt, {})[mi] = r["value"]
     prev_map: Dict[str, Dict[int, Optional[float]]] = {"cold": {}, "hot": {}, "electric": {}}
     for r in prev:
         mt = r["meter_type"]
