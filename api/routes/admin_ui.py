@@ -148,7 +148,11 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
         sets.append("electric_expected=:electric_expected")
         params["electric_expected"] = int(body.electric_expected)
 
-    if not sets and (body.phone is None and body.telegram is None):
+    body_data = body.model_dump(exclude_unset=True)
+    has_phone = "phone" in body_data
+    has_telegram = "telegram" in body_data
+
+    if not sets and (not has_phone and not has_telegram):
         return {"ok": True, "updated": []}
 
     with engine.begin() as conn:
@@ -166,9 +170,9 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
                 params,
             )
 
-    if body.phone is not None:
+    if has_phone:
         _set_contact(apartment_id, "phone", body.phone)
-    if body.telegram is not None:
+    if has_telegram:
         _set_contact(apartment_id, "telegram", body.telegram)
 
     return {"ok": True, "updated": list(params.keys())}
@@ -214,6 +218,7 @@ def ui_apartment_card(apartment_id: int):
                 SELECT chat_id, is_active, updated_at, created_at
                 FROM chat_bindings
                 WHERE apartment_id=:id
+                  AND is_active=true
                 ORDER BY is_active DESC, updated_at DESC
             """),
             {"id": int(apartment_id)},

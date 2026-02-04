@@ -161,16 +161,40 @@ def _set_contact(apartment_id: int, kind: str, value: Optional[str]) -> None:
             return
 
         # 2) если значение есть — выключаем остальные активные контакты этого типа
+        # у квартиры, но не трогаем текущее значение (если оно уже есть)
         conn.execute(
             text("""
                 UPDATE apartment_contacts
                 SET is_active=false
                 WHERE apartment_id=:aid AND kind=:kind AND is_active=true
+                  AND value <> :value
             """),
-            {"aid": int(apartment_id), "kind": kind},
+            {"aid": int(apartment_id), "kind": kind, "value": v},
         )
 
-        # 3) добавляем новый активный
+        # 3) пытаемся переиспользовать существующую запись (в БД может быть UNIQUE(kind, value))
+        existing = conn.execute(
+            text("""
+                SELECT id, apartment_id
+                FROM apartment_contacts
+                WHERE kind=:kind AND value=:value
+                LIMIT 1
+            """),
+            {"kind": kind, "value": v},
+        ).fetchone()
+
+        if existing:
+            conn.execute(
+                text("""
+                    UPDATE apartment_contacts
+                    SET apartment_id=:aid, is_active=true
+                    WHERE id=:id
+                """),
+                {"aid": int(apartment_id), "id": int(existing[0])},
+            )
+            return
+
+        # 4) если записи нет — добавляем новую активную
         conn.execute(
             text("""
                 INSERT INTO apartment_contacts(apartment_id, kind, value, is_active, created_at)
