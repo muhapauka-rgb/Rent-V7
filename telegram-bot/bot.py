@@ -2,6 +2,7 @@ import os
 import asyncio
 import re
 import requests
+import io
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 
@@ -68,9 +69,6 @@ SENT_BILL: set[Tuple[int, str]] = set()          # (chat_id, ym)
 PENDING_NOTICE: set[Tuple[int, str]] = set()     # (chat_id, ym)
 REMIND_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
 
-# Duplicate confirm flow
-DUP_PENDING: Dict[int, Dict[str, Any]] = {}      # photo_event_id -> {ym, dup}
-
 # Manual entry flow
 MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step, meter_type, meter_index}
 
@@ -91,25 +89,6 @@ def _kb_main() -> ReplyKeyboardMarkup:
         ],
     )
 
-
-
-def _kb_duplicate(photo_event_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Это разные счётчики (оставить)",
-                    callback_data=f"dup_ok|{photo_event_id}",
-                ),
-            ],
-            [
-                InlineKeyboardButton(
-                    text="Это повтор (пришлю другое фото)",
-                    callback_data=f"dup_repeat|{photo_event_id}",
-                ),
-            ],
-        ]
-    )
 
 
 def _kb_manual_start() -> InlineKeyboardMarkup:
@@ -402,23 +381,6 @@ async def _post_contact_now(chat_id: int, telegram_username: Optional[str], phon
         logging.exception("_post_contact_now failed")
         return None
 
-
-
-async def _resolve_duplicate(photo_event_id: int, action: str) -> Optional[dict]:
-    url = f"{API_BASE}/bot/duplicate/resolve"
-    try:
-        resp = await _http_post(
-            url,
-            json_body={"photo_event_id": int(photo_event_id), "action": str(action)},
-            read_timeout=HTTP_READ_TIMEOUT_FAST
-        )
-        if resp.status_code != 200:
-            logging.warning(f"_resolve_duplicate: non-200 status={resp.status_code} text={resp.text[:300]!r}")
-            return None
-        return resp.json()
-    except Exception:
-        logging.exception("_resolve_duplicate failed")
-        return None
 
 
 def _try_send_bill_if_ready(chat_id: int, ym: str, bill: dict):
@@ -745,14 +707,30 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
 
     dup = _extract_duplicate_info(js)
-    photo_event_id = js.get("photo_event_id")
-    if dup and ym and photo_event_id:
-        DUP_PENDING[int(photo_event_id)] = {"ym": ym, "dup": dup}
-        await message.reply(
-            "Похоже, вы прислали одно и то же фото/значение для разных счётчиков.\n\n"
-            "Выберите, что делать дальше:",
-            reply_markup=_kb_duplicate(int(photo_event_id)),
+    if dup and ym:
+        mt = dup.get("meter_type")
+        mi = dup.get("meter_index")
+        val = dup.get("value")
+        caption = (
+            "Похоже, это дубликат уже присланного значения.\n"
+            f"Совпало с: {mt} #{mi}, значение {val}."
         )
+        try:
+            await bot.send_photo(
+                message.chat.id,
+                photo=types.InputFile(io.BytesIO(file_bytes), filename=filename or "duplicate.jpg"),
+                caption=caption,
+                reply_markup=_kb_main(),
+            )
+        except Exception:
+            await message.reply(caption, reply_markup=_kb_main())
+
+        bill = js.get("bill")
+        if isinstance(bill, dict) and bill.get("reason") == "missing_photos":
+            missing = bill.get("missing") or []
+            if missing:
+                await message.reply("Сейчас не хватает: " + _missing_to_text(missing), reply_markup=_kb_main())
+                _schedule_missing_reminder(message.chat.id, ym)
         return
 
     bill = js.get("bill")
@@ -910,80 +888,6 @@ async def on_manual_cancel(call: types.CallbackQuery):
     await call.answer("Ок", show_alert=False)
     MANUAL_CTX.pop(call.message.chat.id, None)
     await bot.send_message(call.message.chat.id, "Ок. Отменил ручной ввод.", reply_markup=_kb_main())
-
-
-# -------------------------
-# Callback: duplicates
-# -------------------------
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("dup_ok|"))
-async def on_dup_ok(call: types.CallbackQuery):
-    try:
-        _, peid_raw = call.data.split("|", 1)
-        photo_event_id = int(peid_raw)
-    except Exception:
-        await call.answer("Ошибка", show_alert=True)
-        return
-
-    payload = DUP_PENDING.pop(photo_event_id, None)
-    ym = (payload or {}).get("ym") if isinstance(payload, dict) else None
-
-    await call.answer("Ок", show_alert=False)
-
-    res = await _resolve_duplicate(photo_event_id, "ok")
-    bill = None
-    if isinstance(res, dict):
-        bill = (res.get("bill") or None)
-
-    if ym and not bill:
-        bill = await _fetch_bill(call.message.chat.id, ym)
-
-    if ym and bill:
-        out = _try_send_bill_if_ready(call.message.chat.id, ym, bill)
-        if out:
-            text, kb = out
-            await bot.send_message(call.message.chat.id, text, reply_markup=kb)
-
-
-@dp.callback_query_handler(lambda c: c.data and c.data.startswith("dup_repeat|"))
-async def on_dup_repeat(call: types.CallbackQuery):
-    try:
-        _, peid_raw = call.data.split("|", 1)
-        photo_event_id = int(peid_raw)
-    except Exception:
-        await call.answer("Ошибка", show_alert=True)
-        return
-
-    payload = DUP_PENDING.pop(photo_event_id, None)
-    ym = (payload or {}).get("ym") if isinstance(payload, dict) else None
-    dup = (payload or {}).get("dup") if isinstance(payload, dict) else None
-
-    await call.answer("Ок", show_alert=False)
-
-    await _resolve_duplicate(photo_event_id, "repeat")
-
-    extra = ""
-    if isinstance(dup, dict):
-        mt = dup.get("meter_type")
-        mi = dup.get("meter_index")
-        val = dup.get("value")
-        extra = f"\n(Повтор: {mt} idx={mi}, значение={val})"
-
-    await bot.send_message(
-        call.message.chat.id,
-        "Понял. Тогда пришлите, пожалуйста, другое фото нужного счётчика." + extra,
-        reply_markup=_kb_main(),
-    )
-
-    if ym:
-        bill = await _fetch_bill(call.message.chat.id, ym)
-        if bill and bill.get("reason") == "missing_photos":
-            missing = bill.get("missing") or []
-            await bot.send_message(
-                call.message.chat.id,
-                "Сейчас не хватает: " + _missing_to_text(missing),
-                reply_markup=_kb_main(),
-            )
 
 
 if __name__ == "__main__":
