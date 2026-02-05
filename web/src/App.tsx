@@ -1820,9 +1820,6 @@ export default function App() {
                     <option value="2">2 (T1, T2)</option>
                     <option value="3">3 (T1, T2, T3)</option>
                   </select>
-                  <div style={{ color: "#666", fontSize: 12 }}>
-                    Это влияет на интерфейс (сколько колонок электро показываем) и на то, сколько фото электро ожидаем от жильца.
-                  </div>
                 </label>
 
                 <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
@@ -1849,7 +1846,6 @@ export default function App() {
                         placeholder="Только цифры и тире"
                         style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
                       />
-                      <div style={{ color: "#666", fontSize: 12 }}>Авто-определение заполняет только если пусто. После ручного ввода больше не перезаписывает.</div>
                     </label>
 
                     <label style={{ display: "grid", gap: 6 }}>
@@ -1860,7 +1856,6 @@ export default function App() {
                         placeholder="Только цифры и тире"
                         style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
                       />
-                      <div style={{ color: "#666", fontSize: 12 }}>Авто-определение заполняет только если пусто. После ручного ввода больше не перезаписывает.</div>
                     </label>
                   </div>
                 </div>
@@ -1877,13 +1872,11 @@ export default function App() {
                         placeholder="+7 999 111-22-33 или 8 999 111-22-33"
                         style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
                       />
-                      <div style={{ color: "#666", fontSize: 12 }}>Можно в любом формате: пробелы, +7, 8 — сервер сам нормализует.</div>
                     </label>
 
                     <label style={{ display: "grid", gap: 6 }}>
                       <div style={{ fontWeight: 800 }}>Telegram username</div>
                       <input value={infoTelegram} onChange={(e) => setInfoTelegram(e.target.value)} placeholder="@username" style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
-                      <div style={{ color: "#666", fontSize: 12 }}>Можно с @ или без — сервер сам нормализует.</div>
                     </label>
                   </div>
                 </div>
@@ -1935,9 +1928,6 @@ export default function App() {
                     <button onClick={() => bindChatToApartment(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                       Привязать
                     </button>
-                  </div>
-                  <div style={{ color: "#666", fontSize: 12, marginTop: 6 }}>
-                    Обычно ручная привязка не нужна: если у жильца совпадёт телефон или username — привязка создастся сама при первом фото.
                   </div>
                 </div>
 
