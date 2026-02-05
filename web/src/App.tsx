@@ -223,6 +223,8 @@ export default function App() {
   const [notifLoading, setNotifLoading] = useState(false);
   const [unreadCount, setUnreadCount] = useState(0);
   const [notifHighlight, setNotifHighlight] = useState<{ ym: string; meter_type: string; meter_index: number } | null>(null);
+  const [ocrRunLoading, setOcrRunLoading] = useState(false);
+  const [ocrRunMsg, setOcrRunMsg] = useState("");
 
   const [apartments, setApartments] = useState<ApartmentItem[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -370,6 +372,21 @@ export default function App() {
       await loadNotifications(true);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
+    }
+  }
+
+  async function runOcrDatasetNow() {
+    if (ocrRunLoading) return;
+    try {
+      setOcrRunLoading(true);
+      setOcrRunMsg("");
+      const resp = await apiPost<{ ok: boolean; message?: string }>(`/admin/ocr-dataset/run`, {});
+      setOcrRunMsg(resp?.message || "Запуск инициирован.");
+    } catch (e: any) {
+      setOcrRunMsg("Ошибка запуска OCR-датасета.");
+      setErr(String(e?.message ?? e));
+    } finally {
+      setOcrRunLoading(false);
     }
   }
 
@@ -1258,13 +1275,31 @@ export default function App() {
             >
               <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
                 <div style={{ fontWeight: 900 }}>Уведомления</div>
-                <button
-                onClick={() => clearReadNotifications()}
-                style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800, fontSize: 12 }}
-              >
-                Очистить прочитанные
-              </button>
-            </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button
+                    onClick={() => runOcrDatasetNow()}
+                    style={{
+                      padding: "6px 8px",
+                      borderRadius: 8,
+                      border: "1px solid #ddd",
+                      background: "white",
+                      cursor: "pointer",
+                      fontWeight: 800,
+                      fontSize: 12,
+                      opacity: ocrRunLoading ? 0.6 : 1,
+                    }}
+                  >
+                    {ocrRunLoading ? "Запуск..." : "Собрать OCR"}
+                  </button>
+                  <button
+                    onClick={() => clearReadNotifications()}
+                    style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800, fontSize: 12 }}
+                  >
+                    Очистить прочитанные
+                  </button>
+                </div>
+              </div>
+              {ocrRunMsg ? <div style={{ color: "#666", fontSize: 12, marginBottom: 6 }}>{ocrRunMsg}</div> : null}
 
             <div
               style={{

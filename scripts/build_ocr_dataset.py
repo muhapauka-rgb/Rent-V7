@@ -20,17 +20,13 @@ def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
 
-def _should_run_today() -> bool:
-    now = datetime.now()
-    return now.day == 2
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=2000)
     parser.add_argument("--rate", type=float, default=0.5)  # seconds between downloads
     parser.add_argument("--ydisk-root", type=str, default=os.getenv("OCR_DATASET_ROOT", "ocr-datasets"))
     parser.add_argument("--keep-months", type=int, default=3)
+    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
     if not db_ready():
@@ -42,24 +38,22 @@ def main() -> int:
         logger.warning("ydisk not configured")
         return 1
 
-    if not _should_run_today():
-        logger.info("skip: not the 2nd day of month")
-        return 0
-
     run_month = datetime.now().strftime("%Y-%m")
+    run_date = datetime.now().strftime("%Y-%m-%d")
 
     with engine.begin() as conn:
         already = conn.execute(
-            text("SELECT 1 FROM ocr_training_runs WHERE run_month=:m LIMIT 1"),
-            {"m": run_month},
+            text("SELECT 1 FROM ocr_training_runs WHERE run_month LIKE :p LIMIT 1"),
+            {"p": f"{run_date}%"},
         ).fetchone()
-        if already:
-            logger.info("skip: already ran for %s", run_month)
+        if already and not args.force:
+            logger.info("skip: already ran for %s", run_date)
             return 0
 
+        run_key = run_date if not args.force else datetime.now().strftime("%Y-%m-%d_%H%M%S")
         conn.execute(
             text("INSERT INTO ocr_training_runs(run_month) VALUES(:m)"),
-            {"m": run_month},
+            {"m": run_key},
         )
 
     labels = []
@@ -168,7 +162,7 @@ def main() -> int:
             text("UPDATE ocr_training_runs SET finished_at=now() WHERE run_month=:m"),
             {"m": run_month},
         )
-        msg = f"OCR датасет {run_month}: обработано {processed}, ошибок {errors}"
+        msg = f"OCR датасет {run_month} ({run_date}): обработано {processed}, ошибок {errors}"
         conn.execute(
             text(
                 """

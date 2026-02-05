@@ -1,6 +1,8 @@
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import text
+import threading
+import subprocess
 
 from core.config import engine
 from core.db import db_ready, ensure_tables
@@ -38,6 +40,31 @@ from core.learning import capture_training_sample
 router = APIRouter()
 
 StatusPatch = UIStatusesPatch
+
+
+def _start_ocr_dataset_job(force: bool = True) -> None:
+    cmd = [
+        "python",
+        "/app/scripts/build_ocr_dataset.py",
+        "--limit",
+        "2000",
+        "--rate",
+        "0.5",
+        "--ydisk-root",
+        "ocr-datasets",
+        "--keep-months",
+        "3",
+    ]
+    if force:
+        cmd.append("--force")
+
+    def _run():
+        try:
+            subprocess.run(cmd, check=False)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
 
 
 @router.get("/admin/ui/apartments")
@@ -796,6 +823,15 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
 # -----------------------
 # Admin: notifications (bell)
 # -----------------------
+
+@router.post("/admin/ocr-dataset/run")
+def ui_run_ocr_dataset():
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    _start_ocr_dataset_job(force=True)
+    return {"ok": True, "message": "Запуск сборки OCR-датасета поставлен в очередь."}
+
 
 @router.get("/admin/notifications")
 def ui_list_notifications(status: str = "unread", limit: int = 50, offset: int = 0):
