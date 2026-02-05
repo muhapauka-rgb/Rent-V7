@@ -136,6 +136,18 @@ def _digits_len(value: float) -> int:
         return 0
 
 
+def _last5_serial(value: str | None) -> str:
+    if not value:
+        return ""
+    s = _normalize_serial(value)
+    if not s:
+        return ""
+    digits = "".join(ch for ch in s if ch.isdigit())
+    if len(digits) < 5:
+        return digits
+    return digits[-5:]
+
+
 def _find_close_water(conn, apartment_id: int, ym: str, value: float, threshold: float) -> str | None:
     rows = conn.execute(
         text(
@@ -608,7 +620,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     with engine.begin() as conn:
                         if kind in ("cold", "hot"):
                             vals = _get_same_month_water_values(conn, int(apartment_id), str(ym))
-                            existing = [v for _, v in vals]
+                            existing = [v for mt, v in vals if mt == str(kind)]
                         elif kind == "electric":
                             existing = _get_same_month_electric_values(conn, int(apartment_id), str(ym))
                         else:
@@ -722,14 +734,145 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     is_water = (kind in ("cold", "hot")) or is_water_unknown
                     water_uncertain = False
                     if is_water:
+                        # --- serial-based routing: if serial matches apartment, force meter_type ---
+                        force_kind = None
+                        force_no_sort = False
+                        try:
+                            if serial_norm:
+                                row = conn.execute(
+                                    text(
+                                        """
+                                        SELECT cold_serial, hot_serial
+                                        FROM apartments
+                                        WHERE id=:aid
+                                        """
+                                    ),
+                                    {"aid": int(apartment_id)},
+                                ).mappings().first()
+                                cold_serial = row.get("cold_serial") if row else None
+                                hot_serial = row.get("hot_serial") if row else None
+
+                                s_last5 = _last5_serial(serial_norm)
+                                cold_last5 = _last5_serial(cold_serial)
+                                hot_last5 = _last5_serial(hot_serial)
+
+                                if s_last5 and cold_last5 and s_last5 == cold_last5:
+                                    force_kind = "cold"
+                                    force_no_sort = True
+                                elif s_last5 and hot_last5 and s_last5 == hot_last5:
+                                    force_kind = "hot"
+                                    force_no_sort = True
+                                elif s_last5 and (cold_last5 or hot_last5):
+                                    # serial recognized but doesn't match stored serials -> block and notify
+                                    reason = {
+                                        "reason": "serial_mismatch_route",
+                                        "serial_last5": s_last5,
+                                        "cold_last5": cold_last5,
+                                        "hot_last5": hot_last5,
+                                    }
+                                    diag["warnings"].append({"serial_mismatch": reason})
+                                    # create review flag + notification and block writing
+                                    mt = str(kind or "unknown")
+                                    mi = 1
+                                    exists = conn.execute(
+                                        text(
+                                            """
+                                            SELECT 1
+                                            FROM meter_review_flags
+                                            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                                              AND status='open' AND reason='serial_mismatch'
+                                            LIMIT 1
+                                            """
+                                        ),
+                                        {"aid": int(apartment_id), "ym": str(ym), "mt": mt, "mi": int(mi)},
+                                    ).fetchone()
+                                    if not exists:
+                                        conn.execute(
+                                            text(
+                                                """
+                                                INSERT INTO meter_review_flags(
+                                                    apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                                                )
+                                                VALUES(:aid, :ym, :mt, :mi, 'open', 'serial_mismatch', :comment, now(), NULL)
+                                                """
+                                            ),
+                                            {
+                                                "aid": int(apartment_id),
+                                                "ym": str(ym),
+                                                "mt": mt,
+                                                "mi": int(mi),
+                                                "comment": json.dumps(reason, ensure_ascii=False),
+                                            },
+                                        )
+                                    username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
+                                    related = json.dumps(
+                                        {"ym": str(ym), "meter_type": mt, "meter_index": int(mi), "ydisk_path": ydisk_path},
+                                        ensure_ascii=False,
+                                    )
+                                    msg = f"Несовпадение серийника ХВС/ГВС. Файл: {ydisk_path}"
+                                    conn.execute(
+                                        text(
+                                            """
+                                            INSERT INTO notifications(
+                                                chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                                            )
+                                            VALUES(:chat_id, :username, :apartment_id, 'serial_mismatch', :message, CAST(:related AS JSONB), 'unread', now())
+                                            """
+                                        ),
+                                        {
+                                            "chat_id": str(chat_id),
+                                            "username": username,
+                                            "apartment_id": int(apartment_id),
+                                            "message": msg,
+                                            "related": related,
+                                        },
+                                    )
+                                    if photo_event_id:
+                                        diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+                                        conn.execute(
+                                            text(
+                                                """
+                                                UPDATE photo_events
+                                                SET
+                                                    meter_written = false,
+                                                    stage = 'needs_review',
+                                                    stage_updated_at = now(),
+                                                    diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                                                WHERE id = :id
+                                                """
+                                            ),
+                                            {"id": int(photo_event_id), "diag_json": diag_json_str},
+                                        )
+                                    return JSONResponse(
+                                        status_code=200,
+                                        content={
+                                            "status": "ok",
+                                            "chat_id": str(chat_id),
+                                            "telegram_username": telegram_username,
+                                            "phone": phone,
+                                            "photo_event_id": photo_event_id,
+                                            "ydisk_path": ydisk_path,
+                                            "apartment_id": apartment_id,
+                                            "event_status": status,
+                                            "ocr": ocr_data,
+                                            "meter_written": False,
+                                            "ocr_failed": False,
+                                            "diag": diag,
+                                            "assigned_meter_index": assigned_meter_index,
+                                            "ym": ym,
+                                            "bill": None,
+                                        },
+                                    )
+                        except Exception:
+                            force_kind = None
+                            force_no_sort = False
+
                         # если OCR не уверен в типе, сортируем как max->ХВС, min->ГВС
                         water_uncertain = is_water_unknown or (kind in ("cold", "hot") and ocr_conf < WATER_TYPE_CONF_MIN)
                         if water_uncertain:
                             diag["warnings"].append({"water_type_uncertain": {"confidence": ocr_conf, "ocr_type": ocr_type}})
                         force_sort = _has_open_water_uncertain_flag(conn, int(apartment_id), str(ym))
                         # if new value is very close to an existing water reading, overwrite that specific meter
-                        force_kind = None
-                        force_no_sort = False
                         rows = conn.execute(
                             text(
                                 """
@@ -755,6 +898,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             force_kind = best[1]
                             force_no_sort = True
                             diag["warnings"].append({"retake_overwrite": {"meter_type": str(force_kind), "meter_index": 1}})
+
+                        # If serial matched, do not force sort even if uncertain
+                        if force_kind and force_no_sort:
+                            force_sort = False
 
                         assigned_kind = _write_water_ocr_with_uncertainty(
                             conn,
