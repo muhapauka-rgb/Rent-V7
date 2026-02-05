@@ -1,5 +1,6 @@
 import requests
 from datetime import datetime
+from xml.etree import ElementTree as ET
 
 from core.config import (
     TG_BOT_TOKEN,
@@ -67,6 +68,50 @@ def ydisk_get(path: str) -> bytes:
     if r.status_code != 200:
         raise RuntimeError(f"Download failed {r.status_code}: {r.text}")
     return r.content
+
+
+def ydisk_exists(path: str) -> bool:
+    url = f"{YANDEX_WEBDAV_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    r = requests.head(url, auth=ydisk_auth(), timeout=20)
+    return r.status_code == 200
+
+
+def ydisk_delete(path: str) -> None:
+    url = f"{YANDEX_WEBDAV_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    r = requests.request("DELETE", url, auth=ydisk_auth(), timeout=30)
+    if r.status_code not in (200, 204, 404):
+        raise RuntimeError(f"Delete failed {r.status_code}: {r.text}")
+
+
+def ydisk_list(path: str) -> list[str]:
+    """
+    List direct children (names) of a folder via PROPFIND.
+    Returns names (last path segment).
+    """
+    url = f"{YANDEX_WEBDAV_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    headers = {"Depth": "1"}
+    r = requests.request("PROPFIND", url, auth=ydisk_auth(), headers=headers, timeout=30)
+    if r.status_code not in (207, 200):
+        raise RuntimeError(f"List failed {r.status_code}: {r.text}")
+
+    names = []
+    try:
+        root = ET.fromstring(r.text)
+        ns = {"d": "DAV:"}
+        for resp in root.findall("d:response", ns):
+            href = resp.find("d:href", ns)
+            if href is None:
+                continue
+            full = href.text or ""
+            if full.endswith("/"):
+                full = full[:-1]
+            name = full.split("/")[-1]
+            if name and name != path.rstrip("/").split("/")[-1]:
+                names.append(name)
+    except Exception:
+        return []
+
+    return names
 
 
 def _safe_part(s: str, max_len: int = 40) -> str:
