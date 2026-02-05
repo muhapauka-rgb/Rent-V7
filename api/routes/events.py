@@ -343,11 +343,78 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
             wrote_meter = True
 
-            # 6.35) auto-fill serial number (only if not manually set)
+            # 6.35) auto-fill serial number (only if not manually set) + notify on mismatch
             try:
                 if serial_norm and kind in ("cold", "hot"):
                     col = "cold_serial" if kind == "cold" else "hot_serial"
                     col_src = "cold_serial_source" if kind == "cold" else "hot_serial_source"
+                    with engine.begin() as conn:
+                        row = conn.execute(
+                            text(
+                                f"""
+                                SELECT {col} AS serial, {col_src} AS src
+                                FROM apartments
+                                WHERE id=:aid
+                                """
+                            ),
+                            {"aid": int(apartment_id)},
+                        ).mappings().first()
+
+                        existing = (row.get("serial") if row else None) or ""
+                        existing_norm = _normalize_serial(existing)
+                        src = (row.get("src") if row else None) or ""
+
+                        if src == "manual" and existing_norm and (existing_norm != serial_norm):
+                            # notify admin about mismatch, do not overwrite
+                            username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
+                            related = json.dumps(
+                                {"ym": str(ym), "meter_type": str(kind), "meter_index": 1},
+                                ensure_ascii=False,
+                            )
+                            # avoid duplicate notifications for same apartment+ym+meter_type
+                            dup = conn.execute(
+                                text(
+                                    """
+                                    SELECT 1
+                                    FROM notifications
+                                    WHERE apartment_id=:aid
+                                      AND type='serial_mismatch'
+                                      AND status='unread'
+                                      AND related->>'ym' = :ym
+                                      AND related->>'meter_type' = :mt
+                                    LIMIT 1
+                                    """
+                                ),
+                                {"aid": int(apartment_id), "ym": str(ym), "mt": str(kind)},
+                            ).fetchone()
+                            if not dup:
+                                msg = (
+                                    f"Несовпадение серийного номера {('ХВС' if kind=='cold' else 'ГВС')}: "
+                                    f"OCR={serial_norm}, вручную={existing_norm}"
+                                )
+                                conn.execute(
+                                    text(
+                                        """
+                                        INSERT INTO notifications(
+                                            chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                                        )
+                                        VALUES(
+                                            :chat_id, :username, :apartment_id, 'serial_mismatch', :message,
+                                            CAST(:related AS JSONB),
+                                            'unread', now()
+                                        )
+                                        """
+                                    ),
+                                    {
+                                        "chat_id": str(chat_id),
+                                        "username": username,
+                                        "apartment_id": int(apartment_id),
+                                        "message": msg,
+                                        "related": related,
+                                    },
+                                )
+
+                    # auto-fill only if not manually set
                     with engine.begin() as conn:
                         conn.execute(
                             text(
