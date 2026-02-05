@@ -99,8 +99,8 @@ def _kb_main(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
     rows.extend(
         [
             [KeyboardButton("Старт месяца")],
-            [KeyboardButton("Сообщить об ошибке распознавания")],
             [KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены")],
+            [KeyboardButton("Сообщить об ошибке распознавания")],
         ]
     )
 
@@ -611,7 +611,10 @@ async def start_cmd(message: types.Message):
         wrap = await _fetch_bill_wrap(message.chat.id, _current_ym())
         if wrap and wrap.get("ok"):
             CONTACT_CONFIRMED.add(int(message.chat.id))
+        else:
+            CONTACT_CONFIRMED.discard(int(message.chat.id))
     except Exception:
+        CONTACT_CONFIRMED.discard(int(message.chat.id))
         pass
     await message.reply(
         "Привет!\n"
