@@ -66,6 +66,7 @@ def main() -> int:
     labels_path = os.path.join(out_dir, "labels.jsonl")
 
     processed = 0
+    errors = 0
     with engine.begin() as conn:
         rows = conn.execute(
             text(
@@ -124,12 +125,25 @@ def main() -> int:
                 time.sleep(max(0.0, float(args.rate)))
             except Exception as e:
                 logger.warning("sample failed id=%s err=%s", r.get("id"), str(e))
+                errors += 1
                 continue
 
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE ocr_training_runs SET finished_at=now() WHERE run_month=:m"),
             {"m": run_month},
+        )
+        msg = f"OCR датасет {run_month}: обработано {processed}, ошибок {errors}"
+        conn.execute(
+            text(
+                """
+                INSERT INTO notifications(
+                    chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                )
+                VALUES(NULL, NULL, NULL, 'ocr_training', :message, NULL, 'unread', now())
+                """
+            ),
+            {"message": msg},
         )
 
     logger.info("done. processed=%s", processed)
