@@ -1632,7 +1632,19 @@ export default function App() {
             padding: 16,
           }}
         >
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 640, maxWidth: "100%", background: "white", borderRadius: 14, padding: 14 }}>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 600,
+              maxWidth: "96vw",
+              maxHeight: "92vh",
+              overflow: "auto",
+              background: "white",
+              borderRadius: 12,
+              padding: 12,
+              fontSize: 13,
+            }}
+          >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 900, fontSize: 18 }}>Редактировать показания: {editMonth}</div>
               <button onClick={() => setEditOpen(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
@@ -1784,7 +1796,19 @@ export default function App() {
             padding: 16,
           }}
         >
-          <div onClick={(e) => e.stopPropagation()} style={{ width: 640, maxWidth: "100%", background: "white", borderRadius: 14, padding: 14 }}>
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 600,
+              maxWidth: "96vw",
+              maxHeight: "92vh",
+              overflow: "auto",
+              background: "white",
+              borderRadius: 12,
+              padding: 12,
+              fontSize: 13,
+            }}
+          >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
               <div style={{ fontWeight: 900, fontSize: 18 }}>Карточка квартиры</div>
               <button onClick={() => setInfoOpen(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
@@ -1795,26 +1819,26 @@ export default function App() {
             {infoLoading ? (
               <div style={{ marginTop: 12, color: "#666" }}>Загрузка...</div>
             ) : (
-              <div style={{ marginTop: 12, display: "grid", gap: 12 }}>
-                <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-                  <label style={{ display: "grid", gap: 6 }}>
+              <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+                <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                  <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Название квартиры *</div>
-                    <input value={infoTitle} onChange={(e) => setInfoTitle(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                    <input value={infoTitle} onChange={(e) => setInfoTitle(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
 
-                  <label style={{ display: "grid", gap: 6 }}>
+                  <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Адрес (необязательно)</div>
-                    <input value={infoAddress} onChange={(e) => setInfoAddress(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                    <input value={infoAddress} onChange={(e) => setInfoAddress(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
                 </div>
 
                 {/* <-- добавили: выбор количества фото электро */}
-                <label style={{ display: "grid", gap: 6 }}>
+                <label style={{ display: "grid", gap: 4 }}>
                   <div style={{ fontWeight: 800 }}>Электро: сколько фото ждём (сколько столбцов показывать)</div>
                   <select
                     value={infoElectricExpected}
                     onChange={(e) => setInfoElectricExpected(e.target.value)}
-                    style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
+                    style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
                   >
                     <option value="1">1 (T1)</option>
                     <option value="2">2 (T1, T2)</option>
@@ -1822,39 +1846,39 @@ export default function App() {
                   </select>
                 </label>
 
-                <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-                  <label style={{ display: "grid", gap: 6 }}>
+                <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                  <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Жилец: имя (для отображения)</div>
-                    <input value={infoTenantName} onChange={(e) => setInfoTenantName(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                    <input value={infoTenantName} onChange={(e) => setInfoTenantName(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
 
-                  <label style={{ display: "grid", gap: 6 }}>
+                  <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Комментарий (необязательно)</div>
-                    <input value={infoNote} onChange={(e) => setInfoNote(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                    <input value={infoNote} onChange={(e) => setInfoNote(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
                 </div>
 
                 <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
                   <div style={{ fontWeight: 900, marginBottom: 8 }}>Серийные номера счётчиков</div>
 
-                  <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-                    <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                    <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>ХВС серийный номер</div>
                       <input
                         value={infoColdSerial}
                         onChange={(e) => setInfoColdSerial(e.target.value)}
                         placeholder="Только цифры и тире"
-                        style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
                       />
                     </label>
 
-                    <label style={{ display: "grid", gap: 6 }}>
+                    <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>ГВС серийный номер</div>
                       <input
                         value={infoHotSerial}
                         onChange={(e) => setInfoHotSerial(e.target.value)}
                         placeholder="Только цифры и тире"
-                        style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
                       />
                     </label>
                   </div>
@@ -1863,20 +1887,20 @@ export default function App() {
                 <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
                   <div style={{ fontWeight: 900, marginBottom: 8 }}>Контакты для авто-привязки фото</div>
 
-                  <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
-                    <label style={{ display: "grid", gap: 6 }}>
+                  <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                    <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>Телефон</div>
                       <input
                         value={infoPhone}
                         onChange={(e) => setInfoPhone(e.target.value)}
                         placeholder="+7 999 111-22-33 или 8 999 111-22-33"
-                        style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
                       />
                     </label>
 
-                    <label style={{ display: "grid", gap: 6 }}>
+                    <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>Telegram username</div>
-                      <input value={infoTelegram} onChange={(e) => setInfoTelegram(e.target.value)} placeholder="@username" style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                      <input value={infoTelegram} onChange={(e) => setInfoTelegram(e.target.value)} placeholder="@username" style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
                     </label>
                   </div>
                 </div>
