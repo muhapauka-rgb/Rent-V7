@@ -242,6 +242,82 @@ def _get_same_month_electric_values(conn, apartment_id: int, ym: str) -> list[fl
     return out
 
 
+def _flag_manual_overwrite(
+    conn,
+    *,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    meter_index: int,
+    prev_value: float,
+    new_value: float,
+    ydisk_path: str | None,
+    chat_id: str,
+    telegram_username: str | None,
+) -> None:
+    mt = str(meter_type or "unknown")
+    mi = int(meter_index or 1)
+    reason = {
+        "reason": "ocr_overwrite_manual",
+        "prev": float(prev_value),
+        "curr": float(new_value),
+        "ydisk_path": ydisk_path,
+    }
+    exists = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM meter_review_flags
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+              AND status='open' AND reason='ocr_overwrite_manual'
+            LIMIT 1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": mt, "mi": int(mi)},
+    ).fetchone()
+    if not exists:
+        conn.execute(
+            text(
+                """
+                INSERT INTO meter_review_flags(
+                    apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                )
+                VALUES(:aid, :ym, :mt, :mi, 'open', 'ocr_overwrite_manual', :comment, now(), NULL)
+                """
+            ),
+            {
+                "aid": int(apartment_id),
+                "ym": str(ym),
+                "mt": mt,
+                "mi": int(mi),
+                "comment": json.dumps(reason, ensure_ascii=False),
+            },
+        )
+
+    username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
+    related = json.dumps(
+        {"ym": str(ym), "meter_type": mt, "meter_index": int(mi), "ydisk_path": ydisk_path},
+        ensure_ascii=False,
+    )
+    msg = f"OCR перезаписал ручное значение ({mt}): было {prev_value}, стало {new_value}. Файл: {ydisk_path}"
+    conn.execute(
+        text(
+            """
+            INSERT INTO notifications(
+                chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+            )
+            VALUES(:chat_id, :username, :apartment_id, 'ocr_overwrite_manual', :message, CAST(:related AS JSONB), 'unread', now())
+            """
+        ),
+        {
+            "chat_id": str(chat_id),
+            "username": username,
+            "apartment_id": int(apartment_id),
+            "message": msg,
+            "related": related,
+        },
+    )
+
 @router.post("/events/photo")
 async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
@@ -675,6 +751,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 # By default always auto-sort.
                 # First: if value is very close to an existing one, overwrite that slot.
                 close_idx = None
+                prev_manual = None
+                prev_manual_value = None
                 with engine.begin() as conn:
                     rows = conn.execute(
                         text(
@@ -697,22 +775,56 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         if diff <= ELECTRIC_RETAKE_THRESHOLD:
                             if (best is None) or (diff < best[0]):
                                 best = (diff, int(mi))
-                    if best:
-                        close_idx = int(best[1])
-                        _write_electric_overwrite_then_sort(
-                            conn,
-                            int(apartment_id),
-                            str(ym),
-                            int(close_idx),
-                            float(value_float),
-                            source="ocr",
-                        )
-                        assigned_meter_index = int(close_idx)
-                        diag["warnings"].append({"retake_overwrite": {"meter_type": "electric", "meter_index": int(close_idx)}})
+                        if best:
+                            close_idx = int(best[1])
+                            try:
+                                row = conn.execute(
+                                    text(
+                                        """
+                                        SELECT value, source
+                                        FROM meter_readings
+                                        WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=:mi
+                                        LIMIT 1
+                                        """
+                                    ),
+                                    {"aid": int(apartment_id), "ym": str(ym), "mi": int(close_idx)},
+                                ).fetchone()
+                                if row and str(row[1]) == "manual":
+                                    prev_manual = True
+                                    prev_manual_value = float(row[0])
+                            except Exception:
+                                pass
+                            _write_electric_overwrite_then_sort(
+                                conn,
+                                int(apartment_id),
+                                str(ym),
+                                int(close_idx),
+                                float(value_float),
+                                source="ocr",
+                            )
+                            assigned_meter_index = int(close_idx)
+                            diag["warnings"].append({"retake_overwrite": {"meter_type": "electric", "meter_index": int(close_idx)}})
 
                 if close_idx is None:
                     if (meter_index_mode == "explicit") and (raw_meter_index is not None):
                         with engine.begin() as conn:
+                            try:
+                                row = conn.execute(
+                                    text(
+                                        """
+                                        SELECT value, source
+                                        FROM meter_readings
+                                        WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=:mi
+                                        LIMIT 1
+                                        """
+                                    ),
+                                    {"aid": int(apartment_id), "ym": str(ym), "mi": int(meter_index)},
+                                ).fetchone()
+                                if row and str(row[1]) == "manual":
+                                    prev_manual = True
+                                    prev_manual_value = float(row[0])
+                            except Exception:
+                                pass
                             assigned_meter_index = _write_electric_explicit(
                                 conn,
                                 int(apartment_id),
@@ -721,6 +833,31 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 float(value_float),
                             )
                     else:
+                        with engine.begin() as conn:
+                            # find closest existing manual value for potential overwrite notice
+                            try:
+                                rows = conn.execute(
+                                    text(
+                                        """
+                                        SELECT meter_index, value, source
+                                        FROM meter_readings
+                                        WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric'
+                                        """
+                                    ),
+                                    {"aid": int(apartment_id), "ym": str(ym)},
+                                ).fetchall()
+                                best = None
+                                for mi, v, src in (rows or []):
+                                    if v is None or str(src) != "manual":
+                                        continue
+                                    diff = abs(float(v) - float(value_float))
+                                    if (best is None) or (diff < best[0]):
+                                        best = (diff, float(v), int(mi))
+                                if best:
+                                    prev_manual = True
+                                    prev_manual_value = float(best[1])
+                            except Exception:
+                                pass
                         assigned_meter_index = _assign_and_write_electric_sorted(
                             int(apartment_id),
                             ym,
@@ -734,6 +871,24 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     is_water = (kind in ("cold", "hot")) or is_water_unknown
                     water_uncertain = False
                     if is_water:
+                        prev_map = {}
+                        try:
+                            rows = conn.execute(
+                                text(
+                                    """
+                                    SELECT meter_type, value, source
+                                    FROM meter_readings
+                                    WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+                                    """
+                                ),
+                                {"aid": int(apartment_id), "ym": str(ym)},
+                            ).fetchall()
+                            for mt, v, src in (rows or []):
+                                if v is None:
+                                    continue
+                                prev_map[str(mt)] = (float(v), str(src))
+                        except Exception:
+                            prev_map = {}
                         # --- serial-based routing: if serial matches apartment, force meter_type ---
                         force_kind = None
                         force_no_sort = False
@@ -916,6 +1071,25 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             force_no_sort=force_no_sort,
                         )
                         kind = assigned_kind
+
+                        try:
+                            if assigned_kind in prev_map:
+                                prev_val, prev_src = prev_map[assigned_kind]
+                                if prev_src == "manual" and abs(float(prev_val) - float(value_float)) > 1e-6:
+                                    _flag_manual_overwrite(
+                                        conn,
+                                        apartment_id=int(apartment_id),
+                                        ym=str(ym),
+                                        meter_type=str(assigned_kind),
+                                        meter_index=1,
+                                        prev_value=float(prev_val),
+                                        new_value=float(value_float),
+                                        ydisk_path=ydisk_path,
+                                        chat_id=str(chat_id),
+                                        telegram_username=telegram_username,
+                                    )
+                        except Exception:
+                            pass
                     else:
                         # если OCR не распознал тип — ничего не пишем
                         raise Exception("water_type_unknown")
@@ -984,6 +1158,26 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 diag["warnings"].append({"apartment_status_update_failed": str(e)})
 
             wrote_meter = True
+
+            # notify if OCR overwrote manual for electric
+            if kind == "electric" and prev_manual and (prev_manual_value is not None):
+                try:
+                    with engine.begin() as conn:
+                        if abs(float(prev_manual_value) - float(value_float)) > 1e-6:
+                            _flag_manual_overwrite(
+                                conn,
+                                apartment_id=int(apartment_id),
+                                ym=str(ym),
+                                meter_type="electric",
+                                meter_index=int(assigned_meter_index),
+                                prev_value=float(prev_manual_value),
+                                new_value=float(value_float),
+                                ydisk_path=ydisk_path,
+                                chat_id=str(chat_id),
+                                telegram_username=telegram_username,
+                            )
+                except Exception:
+                    pass
 
             # 6.35) auto-fill serial number (only if not manually set) + notify on mismatch
             try:
