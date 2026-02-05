@@ -238,6 +238,44 @@ def ensure_tables() -> None:
                     except Exception:
                         pass
 
+                    # --- ocr training samples ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS ocr_training_samples (
+                            id BIGSERIAL PRIMARY KEY,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            processed_at TIMESTAMPTZ NULL,
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            ym TEXT NOT NULL,
+                            meter_type TEXT NOT NULL,
+                            meter_index INTEGER NOT NULL DEFAULT 1,
+                            photo_event_id BIGINT NULL REFERENCES photo_events(id) ON DELETE SET NULL,
+                            ydisk_path TEXT NULL,
+                            ocr_value NUMERIC(14,3) NULL,
+                            correct_value NUMERIC(14,3) NOT NULL,
+                            source TEXT NULL
+                        );
+                    """))
+                    try:
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ocr_training_samples_processed ON ocr_training_samples(processed_at)"))
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ocr_training_samples_photo_event ON ocr_training_samples(photo_event_id)"))
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_ocr_training_samples_apartment_ym ON ocr_training_samples(apartment_id, ym)"))
+                    except Exception:
+                        pass
+
+                    # --- ocr training runs ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS ocr_training_runs (
+                            id BIGSERIAL PRIMARY KEY,
+                            run_month TEXT NOT NULL,
+                            started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            finished_at TIMESTAMPTZ NULL
+                        );
+                    """))
+                    try:
+                        conn.execute(text("CREATE UNIQUE INDEX IF NOT EXISTS idx_ocr_training_runs_month ON ocr_training_runs(run_month)"))
+                    except Exception:
+                        pass
+
                     # Postgres-only indexes (no-op on other DBs).
                     try:
                         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_status ON photo_events(status)"))

@@ -13,6 +13,7 @@ from core.billing import (
     find_apartment_for_chat,
 )
 from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort
+from core.learning import capture_training_sample
 from core.schemas import BotContactIn, BotManualReadingIn, BotDuplicateResolveIn, BotWrongReadingReportIn, BotNotificationIn
 
 router = APIRouter()
@@ -105,6 +106,19 @@ def bot_manual_reading(payload: BotManualReadingIn):
             value=float(value),
             source="manual",
         )
+    try:
+        with engine.begin() as conn:
+            capture_training_sample(
+                conn,
+                apartment_id=int(apartment_id),
+                ym=str(ym),
+                meter_type=str(meter_type),
+                meter_index=int(meter_index),
+                correct_value=float(value),
+                source="bot_manual",
+            )
+    except Exception:
+        pass
 
     # return updated bill
     bill = None

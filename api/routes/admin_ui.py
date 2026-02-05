@@ -33,6 +33,7 @@ from core.schemas import (
     UIStatusesPatch,
     BillApproveIn,
 )
+from core.learning import capture_training_sample
 
 router = APIRouter()
 
@@ -659,6 +660,19 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
                 value=v,
                 source="manual",
             )
+            try:
+                with engine.begin() as conn:
+                    capture_training_sample(
+                        conn,
+                        apartment_id=int(apartment_id),
+                        ym=str(ym),
+                        meter_type=str(kind),
+                        meter_index=int(mi),
+                        correct_value=float(v),
+                        source="admin_ui_bulk",
+                    )
+            except Exception:
+                pass
 
         # For expected=3: after manual T1/T2 edits set T3=T1+T2
         try:
@@ -729,6 +743,20 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
             value=value_f,
             source="manual",
         )
+
+    try:
+        with engine.begin() as conn:
+            capture_training_sample(
+                conn,
+                apartment_id=int(apartment_id),
+                ym=str(month),
+                meter_type=str(kind),
+                meter_index=int(meter_index),
+                correct_value=float(value_f),
+                source="admin_ui_single",
+            )
+    except Exception:
+        pass
 
     # For expected=3: after manual T1/T2 edit set T3=T1+T2
     try:

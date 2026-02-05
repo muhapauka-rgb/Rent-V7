@@ -61,6 +61,14 @@ def ydisk_put(path: str, content: bytes) -> None:
         raise RuntimeError(f"Upload failed {r.status_code}: {r.text}")
 
 
+def ydisk_get(path: str) -> bytes:
+    url = f"{YANDEX_WEBDAV_BASE_URL.rstrip('/')}/{path.lstrip('/')}"
+    r = requests.get(url, auth=ydisk_auth(), timeout=60)
+    if r.status_code != 200:
+        raise RuntimeError(f"Download failed {r.status_code}: {r.text}")
+    return r.content
+
+
 def _safe_part(s: str, max_len: int = 40) -> str:
     s = (s or "").strip()
     if not s:
