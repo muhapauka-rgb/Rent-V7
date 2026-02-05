@@ -833,6 +833,28 @@ def ui_run_ocr_dataset():
     return {"ok": True, "message": "Запуск сборки OCR-датасета поставлен в очередь."}
 
 
+@router.get("/admin/ocr-dataset/last")
+def ui_last_ocr_dataset():
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    with engine.begin() as conn:
+        row = conn.execute(
+            text(
+                """
+                SELECT message, created_at
+                FROM notifications
+                WHERE type='ocr_training'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            )
+        ).mappings().first()
+    if not row:
+        return {"ok": True, "message": None, "created_at": None}
+    return {"ok": True, "message": row.get("message"), "created_at": str(row.get("created_at"))}
+
+
 @router.get("/admin/notifications")
 def ui_list_notifications(status: str = "unread", limit: int = 50, offset: int = 0):
     if not db_ready():

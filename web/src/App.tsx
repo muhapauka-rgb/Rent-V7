@@ -382,6 +382,18 @@ export default function App() {
       setOcrRunMsg("");
       const resp = await apiPost<{ ok: boolean; message?: string }>(`/admin/ocr-dataset/run`, {});
       setOcrRunMsg(resp?.message || "Запуск инициирован.");
+      setTimeout(async () => {
+        try {
+          const last = await apiGet<{ ok: boolean; message?: string; created_at?: string }>(`/admin/ocr-dataset/last`);
+          if (last?.message) {
+            setOcrRunMsg(`${last.message}${last.created_at ? ` (${last.created_at})` : ""}`);
+          } else {
+            setOcrRunMsg("Результат пока не готов.");
+          }
+        } catch (e: any) {
+          setOcrRunMsg("Не удалось получить результат.");
+        }
+      }, 2000);
     } catch (e: any) {
       setOcrRunMsg("Ошибка запуска OCR-датасета.");
       setErr(String(e?.message ?? e));
