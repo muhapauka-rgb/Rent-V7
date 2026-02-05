@@ -133,6 +133,8 @@ type ApartmentCardResp = {
     tenant_name?: string | null;
     note?: string | null;
     electric_expected?: number | null; // <-- добавили (может приходить, а может нет)
+    cold_serial?: string | null;
+    hot_serial?: string | null;
   };
   contacts: { phone: string | null; telegram: string | null };
   chats: Array<{ chat_id: string; is_active: boolean; updated_at: string; created_at: string }>;
@@ -241,6 +243,8 @@ export default function App() {
   const [infoNote, setInfoNote] = useState("");
   const [infoChats, setInfoChats] = useState<Array<{ chat_id: string; is_active: boolean; updated_at: string; created_at: string }>>([]);
   const [bindChatInput, setBindChatInput] = useState("");
+  const [infoColdSerial, setInfoColdSerial] = useState("");
+  const [infoHotSerial, setInfoHotSerial] = useState("");
 
   // <-- добавили: сколько фото электро ждём (1..3)
   const [infoElectricExpected, setInfoElectricExpected] = useState<string>("1");
@@ -260,6 +264,8 @@ export default function App() {
       setInfoNote((data.apartment?.note ?? "") as any);
       setInfoPhone(data.contacts?.phone ?? "");
       setInfoTelegram(data.contacts?.telegram ?? "");
+      setInfoColdSerial((data.apartment as any)?.cold_serial ?? "");
+      setInfoHotSerial((data.apartment as any)?.hot_serial ?? "");
       setInfoChats(data.chats ?? []);
       setBindChatInput("");
 
@@ -299,6 +305,8 @@ export default function App() {
           note: infoNote.trim() || null,
           phone: infoPhone.trim() || null,
           telegram: infoTelegram.trim() || null,
+          cold_serial: infoColdSerial.trim() || null,
+          hot_serial: infoHotSerial.trim() || null,
           electric_expected: ee, // <-- добавили
         }),
       }).then(async (r) => {
@@ -1827,6 +1835,34 @@ export default function App() {
                     <div style={{ fontWeight: 800 }}>Комментарий (необязательно)</div>
                     <input value={infoNote} onChange={(e) => setInfoNote(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
+                </div>
+
+                <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Серийные номера счётчиков</div>
+
+                  <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <div style={{ fontWeight: 800 }}>ХВС серийный номер</div>
+                      <input
+                        value={infoColdSerial}
+                        onChange={(e) => setInfoColdSerial(e.target.value)}
+                        placeholder="Только цифры и тире"
+                        style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                      />
+                      <div style={{ color: "#666", fontSize: 12 }}>Авто-определение заполняет только если пусто. После ручного ввода больше не перезаписывает.</div>
+                    </label>
+
+                    <label style={{ display: "grid", gap: 6 }}>
+                      <div style={{ fontWeight: 800 }}>ГВС серийный номер</div>
+                      <input
+                        value={infoHotSerial}
+                        onChange={(e) => setInfoHotSerial(e.target.value)}
+                        placeholder="Только цифры и тире"
+                        style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }}
+                      />
+                      <div style={{ color: "#666", fontSize: 12 }}>Авто-определение заполняет только если пусто. После ручного ввода больше не перезаписывает.</div>
+                    </label>
+                  </div>
                 </div>
 
                 <div style={{ borderTop: "1px solid #eee", paddingTop: 12 }}>

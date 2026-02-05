@@ -67,6 +67,10 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS ls_account TEXT NULL;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS electric_expected INTEGER NOT NULL DEFAULT 3;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT now();"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS cold_serial TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS hot_serial TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS cold_serial_source TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS hot_serial_source TEXT NULL;"))
 
                     # --- tariffs ---
                     conn.execute(text("""

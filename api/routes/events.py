@@ -32,6 +32,7 @@ from core.admin_helpers import (
     _upsert_month_statuses,
     _ocr_to_kind,
     _parse_reading_to_float,
+    _normalize_serial,
     update_apartment_statuses,
 )
 from core.schemas import UIStatusesPatch
@@ -97,13 +98,16 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     ocr_type = None
     ocr_reading = None
     ocr_confidence = None
+    ocr_serial = None
     if isinstance(ocr_data, dict):
         ocr_type = ocr_data.get("type")
         ocr_reading = ocr_data.get("reading")
         ocr_confidence = ocr_data.get("confidence")
+        ocr_serial = ocr_data.get("serial")
 
     kind = _ocr_to_kind(ocr_type)
     value_float = _parse_reading_to_float(ocr_reading)
+    serial_norm = _normalize_serial(ocr_serial)
     try:
         ocr_conf = float(ocr_confidence) if ocr_confidence is not None else 0.0
     except Exception:
@@ -339,6 +343,31 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
             wrote_meter = True
 
+            # 6.35) auto-fill serial number (only if not manually set)
+            try:
+                if serial_norm and kind in ("cold", "hot"):
+                    col = "cold_serial" if kind == "cold" else "hot_serial"
+                    col_src = "cold_serial_source" if kind == "cold" else "hot_serial_source"
+                    with engine.begin() as conn:
+                        conn.execute(
+                            text(
+                                f"""
+                                UPDATE apartments
+                                SET {col} = CASE WHEN {col} IS NULL OR {col} = '' THEN :serial ELSE {col} END,
+                                    {col_src} = CASE
+                                        WHEN {col_src} = 'manual' THEN {col_src}
+                                        WHEN {col} IS NULL OR {col} = '' THEN 'auto'
+                                        ELSE {col_src}
+                                    END
+                                WHERE id = :aid
+                                  AND COALESCE({col_src}, '') <> 'manual'
+                                """
+                            ),
+                            {"aid": int(apartment_id), "serial": serial_norm},
+                        )
+            except Exception:
+                pass
+
             # 6.4) update photo_events with diag_json
             if db_ready() and photo_event_id:
                 try:
@@ -360,8 +389,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             {
                                 "id": int(photo_event_id),
                                 "meter_index": int(assigned_meter_index),
-                                "meter_kind": str(kind),
-                                "meter_value": float(value_float),
+                    "meter_kind": str(kind),
+                    "meter_value": float(value_float),
                                 "diag_json": diag_json_str,
                             },
                         )

@@ -10,6 +10,7 @@ from core.admin_helpers import (
     _set_contact,
     _get_month_statuses,
     _upsert_month_statuses,
+    _normalize_serial,
 )
 from core.billing import (
     _calc_month_bill,
@@ -48,7 +49,7 @@ def ui_list_apartments(ym: Optional[str] = None):
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
-                SELECT id, title, address, tenant_name, note, ls_account, electric_expected
+                SELECT id, title, address, tenant_name, note, ls_account, electric_expected, cold_serial, hot_serial
                 FROM apartments
                 ORDER BY id DESC
             """)
@@ -76,6 +77,8 @@ def ui_list_apartments(ym: Optional[str] = None):
                 note=r[4],
                 ls_account=r[5],
                 electric_expected=int(r[6]) if r[6] is not None else 3,
+                cold_serial=r[7],
+                hot_serial=r[8],
                 contacts=UIContacts(phone=phone, telegram=telegram),
                 statuses=UIStatuses(
                     rent_paid=bool(getattr(statuses, "rent_paid", False)),
@@ -151,8 +154,10 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
     body_data = body.model_dump(exclude_unset=True)
     has_phone = "phone" in body_data
     has_telegram = "telegram" in body_data
+    has_cold_serial = "cold_serial" in body_data
+    has_hot_serial = "hot_serial" in body_data
 
-    if not sets and (not has_phone and not has_telegram):
+    if not sets and (not has_phone and not has_telegram) and (not has_cold_serial and not has_hot_serial):
         return {"ok": True, "updated": []}
 
     with engine.begin() as conn:
@@ -174,6 +179,28 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
         _set_contact(apartment_id, "phone", body.phone)
     if has_telegram:
         _set_contact(apartment_id, "telegram", body.telegram)
+    if has_cold_serial:
+        params["cold_serial"] = _normalize_serial(body.cold_serial) or None
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE apartments
+                    SET cold_serial=:cold_serial, cold_serial_source='manual'
+                    WHERE id=:id
+                """),
+                {"id": int(apartment_id), "cold_serial": params["cold_serial"]},
+            )
+    if has_hot_serial:
+        params["hot_serial"] = _normalize_serial(body.hot_serial) or None
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    UPDATE apartments
+                    SET hot_serial=:hot_serial, hot_serial_source='manual'
+                    WHERE id=:id
+                """),
+                {"id": int(apartment_id), "hot_serial": params["hot_serial"]},
+            )
 
     return {"ok": True, "updated": list(params.keys())}
 
@@ -205,7 +232,7 @@ def ui_apartment_card(apartment_id: int):
     with engine.begin() as conn:
         a = conn.execute(
             text("""
-                SELECT id, title, address, tenant_name, note, electric_expected
+                SELECT id, title, address, tenant_name, note, electric_expected, cold_serial, hot_serial
                 FROM apartments WHERE id=:id
             """),
             {"id": int(apartment_id)},

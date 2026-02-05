@@ -15,11 +15,13 @@ SYSTEM_PROMPT = """Ты — OCR-ассистент для коммунальны
 Твоя задача:
 1) Определить тип счётчика: строго один из ["ХВС","ГВС","Электро","unknown"].
 2) Считать показание как число (может быть дробным). Если не уверен — null.
-3) Дать confidence 0..1.
+3) Найти серийный номер счётчика (если виден). Если не уверен — null.
+4) Дать confidence 0..1.
 Вернуть ТОЛЬКО валидный JSON строго по схеме:
 {
   "type": "ХВС|ГВС|Электро|unknown",
   "reading": <number|null>,
+  "serial": <string|null>,
   "confidence": <number>,
   "notes": "<коротко: на что опирался>"
 }
@@ -39,6 +41,12 @@ SYSTEM_PROMPT = """Ты — OCR-ассистент для коммунальны
 Определение ХВС vs ГВС:
 - Используй подсказки: надписи "ГВС", "горячая", "HOT", "t°", "90°C"; цветовые маркеры: красный чаще ГВС, синий чаще ХВС.
 - Если видно водяной счётчик, но уверенно отличить ХВС/ГВС нельзя — type="unknown" (лучше так, чем ошибиться).
+
+Серийный номер (serial):
+- Обычно это строка рядом с "№", "No", "Serial", "S/N".
+- Может быть только цифры или цифры с тире.
+- Не путай с показанием, годом выпуска, ГОСТ, моделями.
+- Если сомневаешься — serial=null.
 
 -------------------------
 ЭЛЕКТРО (Электро):
@@ -243,6 +251,11 @@ async def recognize(file: UploadFile = File(...)):
     # reading
     reading = _normalize_reading(resp.get("reading", None))
 
+    # serial
+    serial = resp.get("serial", None)
+    if isinstance(serial, str):
+        serial = serial.strip() or None
+
     # confidence
     conf = _clamp_confidence(resp.get("confidence", 0.0))
 
@@ -261,6 +274,7 @@ async def recognize(file: UploadFile = File(...)):
     return {
         "type": t,
         "reading": reading if (isinstance(reading, (int, float)) or reading is None) else None,
+        "serial": serial,
         "confidence": conf,
         "notes": notes,
     }

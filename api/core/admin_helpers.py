@@ -315,3 +315,16 @@ def _parse_reading_to_float(reading: str | None) -> float | None:
         return float(s)
     except Exception:
         return None
+
+
+def _normalize_serial(value: str | None) -> str:
+    if value is None:
+        return ""
+    s = str(value).strip()
+    if not s:
+        return ""
+    out = []
+    for ch in s:
+        if ch.isdigit() or ch == "-":
+            out.append(ch)
+    return "".join(out)

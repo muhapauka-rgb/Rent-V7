@@ -22,6 +22,8 @@ class UIApartmentItem(BaseModel):
     note: Optional[str] = None
     ls_account: Optional[str] = None
     electric_expected: Optional[int] = None
+    cold_serial: Optional[str] = None
+    hot_serial: Optional[str] = None
     contacts: Optional[UIContacts] = None
     statuses: Optional[UIStatuses] = None
 
@@ -33,6 +35,8 @@ class UIApartmentCreate(BaseModel):
     tenant_name: Optional[str] = None
     ls_account: Optional[str] = None
     electric_expected: Optional[int] = None
+    cold_serial: Optional[str] = None
+    hot_serial: Optional[str] = None
 
 
 class UIApartmentPatch(BaseModel):
@@ -44,6 +48,8 @@ class UIApartmentPatch(BaseModel):
     phone: Optional[str] = None
     telegram: Optional[str] = None
     electric_expected: Optional[int] = None
+    cold_serial: Optional[str] = None
+    hot_serial: Optional[str] = None
 
 
 class UIStatusesPatch(BaseModel):
