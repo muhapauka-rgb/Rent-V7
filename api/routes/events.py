@@ -1050,9 +1050,77 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 if (best is None) or (diff < best[0]):
                                     best = (diff, str(mt))
                         if best:
-                            force_kind = best[1]
-                            force_no_sort = True
-                            diag["warnings"].append({"retake_overwrite": {"meter_type": str(force_kind), "meter_index": 1}})
+                            best_kind = str(best[1])
+                            # If OCR confidently says the other type, don't overwrite by proximity.
+                            if kind in ("cold", "hot") and ocr_conf >= WATER_TYPE_CONF_MIN and best_kind != str(kind):
+                                reason = {
+                                    "reason": "ocr_type_conflict",
+                                    "ocr_type": str(kind),
+                                    "matched_type": best_kind,
+                                    "value": float(value_float),
+                                    "ydisk_path": ydisk_path,
+                                }
+                                diag["warnings"].append({"ocr_type_conflict": reason})
+                                # notify admin + flag for review
+                                try:
+                                    exists = conn.execute(
+                                        text(
+                                            """
+                                            SELECT 1
+                                            FROM meter_review_flags
+                                            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=1
+                                              AND status='open' AND reason='ocr_type_conflict'
+                                            LIMIT 1
+                                            """
+                                        ),
+                                        {"aid": int(apartment_id), "ym": str(ym), "mt": str(kind)},
+                                    ).fetchone()
+                                    if not exists:
+                                        conn.execute(
+                                            text(
+                                                """
+                                                INSERT INTO meter_review_flags(
+                                                    apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                                                )
+                                                VALUES(:aid, :ym, :mt, 1, 'open', 'ocr_type_conflict', :comment, now(), NULL)
+                                                """
+                                            ),
+                                            {
+                                                "aid": int(apartment_id),
+                                                "ym": str(ym),
+                                                "mt": str(kind),
+                                                "comment": json.dumps(reason, ensure_ascii=False),
+                                            },
+                                        )
+                                    username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
+                                    related = json.dumps(
+                                        {"ym": str(ym), "meter_type": str(kind), "meter_index": 1, "ydisk_path": ydisk_path},
+                                        ensure_ascii=False,
+                                    )
+                                    msg = f"OCR тип конфликтует со значением в месяце: {reason}. Файл: {ydisk_path}"
+                                    conn.execute(
+                                        text(
+                                            """
+                                            INSERT INTO notifications(
+                                                chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                                            )
+                                            VALUES(:chat_id, :username, :apartment_id, 'ocr_type_conflict', :message, CAST(:related AS JSONB), 'unread', now())
+                                            """
+                                        ),
+                                        {
+                                            "chat_id": str(chat_id),
+                                            "username": username,
+                                            "apartment_id": int(apartment_id),
+                                            "message": msg,
+                                            "related": related,
+                                        },
+                                    )
+                                except Exception:
+                                    pass
+                            else:
+                                force_kind = best_kind
+                                force_no_sort = True
+                                diag["warnings"].append({"retake_overwrite": {"meter_type": str(force_kind), "meter_index": 1}})
 
                         # If serial matched, do not force sort even if uncertain
                         if force_kind and force_no_sort:
