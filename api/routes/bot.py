@@ -1,3 +1,4 @@
+import json
 from typing import Optional
 from fastapi import APIRouter, HTTPException
 from sqlalchemy import text
@@ -12,7 +13,7 @@ from core.billing import (
     find_apartment_for_chat,
 )
 from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort
-from core.schemas import BotContactIn, BotManualReadingIn, BotDuplicateResolveIn, BotWrongReadingReportIn
+from core.schemas import BotContactIn, BotManualReadingIn, BotDuplicateResolveIn, BotWrongReadingReportIn, BotNotificationIn
 
 router = APIRouter()
 
@@ -185,8 +186,57 @@ def bot_duplicate_resolve(payload: BotDuplicateResolveIn):
                 {"id": peid},
             )
 
-        bill = _calc_month_bill(conn, apartment_id, ym)
-        return {"ok": True, "bill": bill}
+    bill = _calc_month_bill(conn, apartment_id, ym)
+    return {"ok": True, "bill": bill}
+
+
+@router.post("/bot/notify")
+def bot_notify(payload: BotNotificationIn):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="DB not ready")
+    ensure_tables()
+
+    chat_id = str(payload.chat_id or "").strip()
+    message = (payload.message or "").strip()
+    if not chat_id:
+        raise HTTPException(status_code=400, detail="chat_id_required")
+    if not message:
+        raise HTTPException(status_code=400, detail="message_required")
+
+    username = (payload.telegram_username or "").strip().lstrip("@").lower()
+    if not username:
+        username = "Без username"
+
+    ntype = str(payload.type or "user_message").strip() or "user_message"
+    related = payload.related or None
+
+    with engine.begin() as conn:
+        apt = find_apartment_for_chat(conn, chat_id)
+        apartment_id = int(apt["id"]) if apt else None
+        conn.execute(
+            text(
+                """
+                INSERT INTO notifications(
+                    chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                )
+                VALUES(
+                    :chat_id, :username, :apartment_id, :type, :message,
+                    CASE WHEN :related IS NULL THEN NULL ELSE CAST(:related AS JSONB) END,
+                    'unread', now()
+                )
+                """
+            ),
+            {
+                "chat_id": str(chat_id),
+                "username": username,
+                "apartment_id": apartment_id,
+                "type": ntype,
+                "message": message,
+                "related": (json.dumps(related, ensure_ascii=False) if related is not None else None),
+            },
+        )
+
+    return {"ok": True, "apartment_id": apartment_id}
 
 
 @router.post("/bot/report-wrong-reading")

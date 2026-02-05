@@ -736,3 +736,102 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
         "meter_index": int(meter_index),
         "value": value_f,
     }
+
+
+# -----------------------
+# Admin: notifications (bell)
+# -----------------------
+
+@router.get("/admin/notifications")
+def ui_list_notifications(status: str = "unread", limit: int = 50, offset: int = 0):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    status_ = (status or "unread").strip().lower()
+    if status_ not in {"unread", "all"}:
+        raise HTTPException(status_code=400, detail="status must be unread|all")
+
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+
+    where = []
+    params: Dict[str, Any] = {"limit": limit, "offset": offset}
+    if status_ == "unread":
+        where.append("n.status='unread'")
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    with engine.begin() as conn:
+        unread_count = conn.execute(
+            text("SELECT COUNT(*) FROM notifications WHERE status='unread'")
+        ).scalar() or 0
+
+        rows = conn.execute(
+            text(
+                f"""
+                SELECT
+                    n.id, n.created_at, n.read_at, n.status,
+                    n.chat_id, n.telegram_username, n.apartment_id,
+                    n.type, n.message, n.related,
+                    a.title AS apartment_title
+                FROM notifications n
+                LEFT JOIN apartments a ON a.id = n.apartment_id
+                {where_sql}
+                ORDER BY n.created_at DESC
+                LIMIT :limit OFFSET :offset
+                """
+            ),
+            params,
+        ).mappings().all()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "id": int(r["id"]),
+                "created_at": (r["created_at"].isoformat() if r["created_at"] else None),
+                "read_at": (r["read_at"].isoformat() if r["read_at"] else None),
+                "status": r["status"],
+                "chat_id": r["chat_id"],
+                "telegram_username": r["telegram_username"] or "Без username",
+                "apartment_id": r["apartment_id"],
+                "apartment_title": r["apartment_title"],
+                "type": r["type"],
+                "message": r["message"],
+                "related": r["related"],
+            }
+        )
+
+    return {"ok": True, "items": items, "unread_count": int(unread_count)}
+
+
+@router.post("/admin/notifications/{notification_id}/read")
+def ui_mark_notification_read(notification_id: int):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                UPDATE notifications
+                SET status='read', read_at=now()
+                WHERE id=:id
+                """
+            ),
+            {"id": int(notification_id)},
+        )
+    return {"ok": True, "id": int(notification_id)}
+
+
+@router.post("/admin/notifications/clear-read")
+def ui_clear_read_notifications():
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM notifications WHERE status='read'"))
+    return {"ok": True}

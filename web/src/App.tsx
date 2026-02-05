@@ -108,6 +108,22 @@ type UnassignedPhoto = {
 
 type UnassignedResp = { ok: boolean; items: UnassignedPhoto[] };
 
+type NotificationItem = {
+  id: number;
+  created_at: string | null;
+  read_at: string | null;
+  status: "unread" | "read" | string;
+  chat_id: string | null;
+  telegram_username: string;
+  apartment_id: number | null;
+  apartment_title: string | null;
+  type: string;
+  message: string;
+  related?: any;
+};
+
+type NotificationsResp = { ok: boolean; items: NotificationItem[]; unread_count: number };
+
 type ApartmentCardResp = {
   ok: boolean;
   apartment: {
@@ -198,6 +214,13 @@ function addMonths(ym: string, delta: number): string {
 export default function App() {
   const [tab, setTab] = useState<"apartments" | "ops">("apartments");
   const [err, setErr] = useState<string | null>(null);
+  const [notifOpen, setNotifOpen] = useState(false);
+  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notifOffset, setNotifOffset] = useState(0);
+  const [notifHasMore, setNotifHasMore] = useState(true);
+  const [notifLoading, setNotifLoading] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+  const [notifHighlight, setNotifHighlight] = useState<{ ym: string; meter_type: string; meter_index: number } | null>(null);
 
   const [apartments, setApartments] = useState<ApartmentItem[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
@@ -287,6 +310,56 @@ export default function App() {
       await loadHistory(apartmentId);
 
       setInfoOpen(false);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    }
+  }
+
+  async function loadNotifications(reset: boolean = false) {
+    if (notifLoading) return;
+    const limit = 30;
+    const offset = reset ? 0 : notifOffset;
+    try {
+      setNotifLoading(true);
+      const data = await apiGet<NotificationsResp>(`/admin/notifications?status=all&limit=${limit}&offset=${offset}`);
+      setUnreadCount(Number(data.unread_count || 0));
+      if (reset) {
+        setNotifications(data.items || []);
+      } else {
+        setNotifications((prev) => [...prev, ...(data.items || [])]);
+      }
+      setNotifOffset(offset + (data.items?.length || 0));
+      setNotifHasMore((data.items?.length || 0) >= limit);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    } finally {
+      setNotifLoading(false);
+    }
+  }
+
+  async function refreshUnreadCount() {
+    try {
+      const data = await apiGet<NotificationsResp>(`/admin/notifications?status=unread&limit=1&offset=0`);
+      setUnreadCount(Number(data.unread_count || 0));
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    }
+  }
+
+  async function markNotificationRead(id: number) {
+    try {
+      await apiPost(`/admin/notifications/${id}/read`, {});
+      setNotifications((prev) => prev.map((n) => (n.id === id ? { ...n, status: "read", read_at: n.read_at || new Date().toISOString() } : n)));
+      refreshUnreadCount();
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    }
+  }
+
+  async function clearReadNotifications() {
+    try {
+      await apiPost(`/admin/notifications/clear-read`, {});
+      await loadNotifications(true);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
     }
@@ -852,6 +925,7 @@ export default function App() {
     loadApartments(true).catch((e: any) => setErr(String(e?.message ?? e)));
     loadTariffs().catch(() => {});
     loadUnassigned().catch(() => {});
+    refreshUnreadCount().catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -1047,10 +1121,49 @@ export default function App() {
   return (
     <>
     <div style={{ fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, Arial", padding: 24 }}>
-      <div style={{ display: "flex", gap: 10, alignItems: "center", justifyContent: "space-between" }}>
+      <div style={{ display: "flex", gap: 10, alignItems: "center", justifyContent: "space-between", position: "relative" }}>
         <h1 style={{ margin: 0 }}>Rent Web</h1>
 
         <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button
+            onClick={() => {
+              const next = !notifOpen;
+              setNotifOpen(next);
+              if (next) loadNotifications(true);
+            }}
+            style={{
+              position: "relative",
+              width: 38,
+              height: 38,
+              borderRadius: 10,
+              border: "1px solid #ddd",
+              background: "white",
+              cursor: "pointer",
+            }}
+            title="Уведомления"
+          >
+            <svg viewBox="0 0 24 24" width="20" height="20" style={{ display: "block", margin: "0 auto", color: "#111" }}>
+              <path
+                d="M12 22a2.5 2.5 0 0 0 2.45-2h-4.9A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 1 0-14 0v5l-2 2v1h18v-1l-2-2Z"
+                fill="currentColor"
+              />
+            </svg>
+            {unreadCount > 0 ? (
+              <span
+                style={{
+                  position: "absolute",
+                  top: 6,
+                  right: 6,
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  background: "#d946ef",
+                  boxShadow: "0 0 0 2px white",
+                }}
+              />
+            ) : null}
+          </button>
+
           <button
             onClick={() => setTab("apartments")}
             style={{
@@ -1108,6 +1221,99 @@ export default function App() {
             Удалить
           </button>
         </div>
+
+        {notifOpen ? (
+          <div
+            style={{
+              position: "absolute",
+              right: 0,
+              top: 50,
+              width: 360,
+              maxWidth: "90vw",
+              background: "white",
+              border: "1px solid #eee",
+              borderRadius: 12,
+              boxShadow: "0 10px 30px rgba(0,0,0,0.12)",
+              padding: 10,
+              zIndex: 50,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+              <div style={{ fontWeight: 900 }}>Уведомления</div>
+              <button
+                onClick={() => clearReadNotifications()}
+                style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800, fontSize: 12 }}
+              >
+                Очистить прочитанные
+              </button>
+            </div>
+
+            <div
+              style={{
+                maxHeight: 360,
+                overflowY: "auto",
+                display: "flex",
+                flexDirection: "column",
+                gap: 8,
+              }}
+              onScroll={(e) => {
+                const el = e.currentTarget;
+                if (!notifHasMore || notifLoading) return;
+                if (el.scrollTop + el.clientHeight >= el.scrollHeight - 10) {
+                  loadNotifications(false);
+                }
+              }}
+            >
+              {!notifications.length ? (
+                <div style={{ color: "#666" }}>Нет уведомлений.</div>
+              ) : (
+                notifications.map((n) => {
+                  const unread = String(n.status || "") !== "read";
+                  return (
+                    <div
+                      key={n.id}
+                      onClick={() => {
+                        if (unread) markNotificationRead(n.id);
+                        if (n.apartment_id) {
+                          setTab("apartments");
+                          setSelectedId(n.apartment_id);
+                        }
+                        if (n.related?.ym && n.related?.meter_type) {
+                          setNotifHighlight({
+                            ym: String(n.related.ym),
+                            meter_type: String(n.related.meter_type),
+                            meter_index: Number(n.related.meter_index || 1),
+                          });
+                        } else {
+                          setNotifHighlight(null);
+                        }
+                      }}
+                      style={{
+                        border: "1px solid #eee",
+                        borderRadius: 10,
+                        padding: 10,
+                        background: unread ? "#fff7fb" : "white",
+                        cursor: "pointer",
+                        display: "grid",
+                        gap: 6,
+                      }}
+                    >
+                      <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                        <div style={{ fontWeight: 900 }}>{n.telegram_username || "Без username"}</div>
+                        <div style={{ color: "#666", fontSize: 11 }}>{n.created_at ? new Date(n.created_at).toLocaleString() : ""}</div>
+                      </div>
+                      <div style={{ color: "#111" }}>{n.message}</div>
+                      <div style={{ color: "#666", fontSize: 12 }}>
+                        Квартира: {n.apartment_title || (n.apartment_id ? `#${n.apartment_id}` : "—")}
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+              {notifLoading ? <div style={{ color: "#666", fontSize: 12 }}>Загрузка…</div> : null}
+            </div>
+          </div>
+        ) : null}
       </div>
 
       {err ? (
@@ -1268,6 +1474,7 @@ export default function App() {
                     openEdit={openEdit}
                     getReviewFlag={getReviewFlag}
                     onResolveReviewFlag={resolveReviewFlag}
+                    notificationHighlight={notifHighlight}
                   />
 
                   <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>

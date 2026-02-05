@@ -40,6 +40,7 @@ type Props = {
   openEdit: (month: string) => void;
   getReviewFlag: (month: string, meterType: string, meterIndex: number) => { id: number } | null;
   onResolveReviewFlag: (flagId: number) => void;
+  notificationHighlight?: { ym: string; meter_type: string; meter_index: number } | null;
 };
 
 export default function MetersTable(props: Props) {
@@ -55,6 +56,7 @@ export default function MetersTable(props: Props) {
     openEdit,
     getReviewFlag,
     onResolveReviewFlag,
+    notificationHighlight,
   } = props;
 
   const n = Math.max(1, Math.min(3, Number.isFinite(eN) ? eN : 3));
@@ -122,6 +124,13 @@ export default function MetersTable(props: Props) {
             const fE3 = getReviewFlag(h.month, "electric", 3);
             const fSewer = getReviewFlag(h.month, "sewer", 1);
 
+            const nCold = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "cold" && Number(notificationHighlight.meter_index || 1) === 1;
+            const nHot = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "hot" && Number(notificationHighlight.meter_index || 1) === 1;
+            const nE1 = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "electric" && Number(notificationHighlight.meter_index || 1) === 1;
+            const nE2 = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "electric" && Number(notificationHighlight.meter_index || 1) === 2;
+            const nE3 = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "electric" && Number(notificationHighlight.meter_index || 1) === 3;
+            const nSewer = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "sewer" && Number(notificationHighlight.meter_index || 1) === 1;
+
             // Если в квартире ожидается 3 электро-индекса — сумму НЕ показываем, пока не пришёл T3
             const isComplete =
               !missingCold &&
@@ -139,7 +148,7 @@ export default function MetersTable(props: Props) {
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap" }}>{h.month}</td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, fCold ? "review" : (missingCold ? "missing" : "none"))}
+                  {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, nCold ? "review" : (fCold ? "review" : (missingCold ? "missing" : "none")))}
                   {fCold ? (
                     <div style={{ marginTop: 6 }}>
                       <button onClick={() => onResolveReviewFlag(fCold.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
@@ -150,7 +159,7 @@ export default function MetersTable(props: Props) {
                 </td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, fHot ? "review" : (missingHot ? "missing" : "none"))}
+                  {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, nHot ? "review" : (fHot ? "review" : (missingHot ? "missing" : "none")))}
                   {fHot ? (
                     <div style={{ marginTop: 6 }}>
                       <button onClick={() => onResolveReviewFlag(fHot.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
@@ -162,7 +171,7 @@ export default function MetersTable(props: Props) {
 
                 {n >= 1 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, fE1 ? "review" : (missingE1 ? "missing" : "none"))}
+                    {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, nE1 ? "review" : (fE1 ? "review" : (missingE1 ? "missing" : "none")))}
                     {fE1 ? (
                       <div style={{ marginTop: 6 }}>
                         <button onClick={() => onResolveReviewFlag(fE1.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
@@ -175,7 +184,7 @@ export default function MetersTable(props: Props) {
 
                 {n >= 2 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, fE2 ? "review" : (missingE2 ? "missing" : "none"))}
+                    {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, nE2 ? "review" : (fE2 ? "review" : (missingE2 ? "missing" : "none")))}
                     {fE2 ? (
                       <div style={{ marginTop: 6 }}>
                         <button onClick={() => onResolveReviewFlag(fE2.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
@@ -188,7 +197,7 @@ export default function MetersTable(props: Props) {
 
                 {n >= 3 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    {cellTriplet(t3fb.current, de3, null, null, false, fE3 ? "review" : (missingE3 ? "missing" : "none"))}
+                    {cellTriplet(t3fb.current, de3, null, null, false, nE3 ? "review" : (fE3 ? "review" : (missingE3 ? "missing" : "none")))}
                     {fE3 ? (
                       <div style={{ marginTop: 6 }}>
                         <button onClick={() => onResolveReviewFlag(fE3.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
@@ -200,7 +209,7 @@ export default function MetersTable(props: Props) {
                 )}
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  {cellTriplet(h.meters?.sewer?.current ?? null, ds, rs, t.sewer, true, fSewer ? "review" : "none")}
+                  {cellTriplet(h.meters?.sewer?.current ?? null, ds, rs, t.sewer, true, nSewer ? "review" : (fSewer ? "review" : "none"))}
                   {fSewer ? (
                     <div style={{ marginTop: 6 }}>
                       <button onClick={() => onResolveReviewFlag(fSewer.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>

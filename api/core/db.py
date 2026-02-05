@@ -212,6 +212,28 @@ def ensure_tables() -> None:
                     except Exception:
                         pass
 
+                    # --- notifications (web bell) ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS notifications (
+                            id BIGSERIAL PRIMARY KEY,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            read_at TIMESTAMPTZ NULL,
+                            status TEXT NOT NULL DEFAULT 'unread', -- unread | read
+                            chat_id TEXT NULL,
+                            telegram_username TEXT NULL,
+                            apartment_id BIGINT NULL REFERENCES apartments(id) ON DELETE SET NULL,
+                            type TEXT NOT NULL DEFAULT 'user_message',
+                            message TEXT NOT NULL,
+                            related JSONB NULL
+                        );
+                    """))
+                    try:
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notifications_status ON notifications(status)"))
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notifications_apartment_id ON notifications(apartment_id)"))
+                        conn.execute(text("CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON notifications(created_at DESC)"))
+                    except Exception:
+                        pass
+
                     # Postgres-only indexes (no-op on other DBs).
                     try:
                         conn.execute(text("CREATE INDEX IF NOT EXISTS idx_photo_events_status ON photo_events(status)"))

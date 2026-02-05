@@ -443,6 +443,32 @@ async def _post_contact_now(chat_id: int, telegram_username: Optional[str], phon
         return None
 
 
+async def _post_notification(
+    chat_id: int,
+    telegram_username: Optional[str],
+    message: str,
+    ntype: str = "user_message",
+    related: Optional[dict] = None,
+) -> Optional[dict]:
+    url = f"{API_BASE}/bot/notify"
+    payload = {
+        "chat_id": str(chat_id),
+        "telegram_username": telegram_username or "",
+        "message": message,
+        "type": ntype,
+        "related": related or None,
+    }
+    try:
+        resp = await _http_post(url, json_body=payload, read_timeout=HTTP_READ_TIMEOUT_FAST)
+        if resp.status_code != 200:
+            logging.warning(f"_post_notification: non-200 status={resp.status_code} text={resp.text[:300]!r}")
+            return None
+        return resp.json()
+    except Exception:
+        logging.exception("_post_notification failed")
+        return None
+
+
 
 def _try_send_bill_if_ready(chat_id: int, ym: str, bill: dict):
     if not bill:
@@ -693,6 +719,12 @@ async def on_text(message: types.Message):
         return
     text_in = (message.text or "").strip()
 
+    # Любое пользовательское сообщение (кроме служебных кнопок/команд) шлём в уведомления
+    sys_texts = {"Старт месяца", "Аренда оплачена", "Счётчики оплачены", "Сообщить об ошибке распознавания"}
+    if text_in and not text_in.startswith("/") and text_in not in sys_texts:
+        username = message.from_user.username if message.from_user else None
+        await _post_notification(message.chat.id, username, text_in, "user_message")
+
     # Главные кнопки
     ym = _current_ym()
 
@@ -742,6 +774,8 @@ async def on_text(message: types.Message):
         return
 
     if text_in == "Сообщить об ошибке распознавания":
+        username = message.from_user.username if message.from_user else None
+        await _post_notification(message.chat.id, username, "Нажал: Сообщить об ошибке распознавания", "bot_warning")
         await message.reply(
             "Выберите счётчик, где значение распознано неверно:",
             reply_markup=_kb_report_wrong_pick(),

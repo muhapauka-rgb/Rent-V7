@@ -106,3 +106,11 @@ class BotWrongReadingReportIn(BaseModel):
     meter_type: Literal["cold", "hot", "electric", "sewer"]
     meter_index: int = 1
     comment: Optional[str] = None
+
+
+class BotNotificationIn(BaseModel):
+    chat_id: str
+    telegram_username: Optional[str] = None
+    message: str
+    type: Optional[str] = "user_message"
+    related: Optional[Dict[str, Any]] = None
