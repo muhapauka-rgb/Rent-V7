@@ -269,11 +269,22 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     except Exception:
         pass
 
-    # Variant 3: rotate if likely rotated (portrait)
+    # Variant 3: rotate if likely rotated (portrait); otherwise center-crop
     try:
         if img.height > img.width:
             v3 = img.rotate(90, expand=True)
             variants.append(("rotate90", _encode_jpeg(v3, quality=90)))
+        else:
+            w, h = img.size
+            cx, cy = w // 2, h // 2
+            cw, ch = int(w * 0.8), int(h * 0.8)
+            left = max(0, cx - cw // 2)
+            upper = max(0, cy - ch // 2)
+            right = min(w, left + cw)
+            lower = min(h, upper + ch)
+            v3 = img.crop((left, upper, right, lower))
+            v3 = ImageEnhance.Contrast(v3).enhance(1.3)
+            variants.append(("center_crop", _encode_jpeg(v3, quality=92)))
     except Exception:
         pass
 

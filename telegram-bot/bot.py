@@ -237,6 +237,15 @@ def _extract_duplicate_info(js: dict) -> Optional[dict]:
     return None
 
 
+def _has_anomaly_warning(js: dict) -> bool:
+    diag = js.get("diag") or {}
+    warnings = diag.get("warnings") or []
+    for w in warnings:
+        if isinstance(w, dict) and "anomaly_jump" in w:
+            return True
+    return False
+
+
 def _parse_float(text: str) -> Optional[float]:
     if text is None:
         return None
@@ -841,6 +850,14 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
     meter_written = js.get("meter_written")
     ocr_failed = bool(js.get("ocr_failed"))
+
+    if _has_anomaly_warning(js):
+        await message.reply(
+            "Фото получено, но значение сильно отличается от прошлого месяца.\n"
+            "Мы передали это администратору для проверки.",
+            reply_markup=_kb_main(),
+        )
+        return
 
     if (meter_written is False) or ocr_failed:
         await message.reply(
