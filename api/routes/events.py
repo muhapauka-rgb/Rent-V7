@@ -77,6 +77,65 @@ def _get_prev_reading(conn, apartment_id: int, ym: str, meter_type: str, meter_i
         return None
 
 
+def _get_last_reading_before(conn, apartment_id: int, ym: str, meter_type: str, meter_index: int = 1) -> float | None:
+    row = conn.execute(
+        text(
+            """
+            SELECT value
+            FROM meter_readings
+            WHERE apartment_id=:aid
+              AND ym < :ym
+              AND meter_type=:mt
+              AND meter_index=:mi
+            ORDER BY ym DESC
+            LIMIT 1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_type), "mi": int(meter_index)},
+    ).fetchone()
+    if not row:
+        return None
+    try:
+        return float(row[0])
+    except Exception:
+        return None
+
+
+def _get_last_electric_before(conn, apartment_id: int, ym: str) -> list[float]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT value
+            FROM meter_readings
+            WHERE apartment_id=:aid
+              AND ym < :ym
+              AND meter_type='electric'
+              AND meter_index IN (1,2,3)
+            ORDER BY ym DESC
+            LIMIT 3
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+    vals = []
+    for r in rows:
+        try:
+            vals.append(float(r[0]))
+        except Exception:
+            continue
+    return vals
+
+
+def _digits_len(value: float) -> int:
+    try:
+        v = abs(float(value))
+        s = f"{v:.3f}".split(".")[0]
+        s = s.lstrip("0") or "0"
+        return len(s)
+    except Exception:
+        return 0
+
+
 def _find_close_water(conn, apartment_id: int, ym: str, value: float, threshold: float) -> str | None:
     rows = conn.execute(
         text(
@@ -326,6 +385,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 with engine.begin() as conn:
                     if kind in ("cold", "hot"):
                         prev_val = _get_prev_reading(conn, int(apartment_id), prev_ym, str(kind), 1)
+                        if prev_val is None:
+                            prev_val = _get_last_reading_before(conn, int(apartment_id), str(ym), str(kind), 1)
                         if (prev_val is not None) and (abs(float(value_float) - float(prev_val)) > WATER_ANOMALY_THRESHOLD):
                             anomaly = True
                             anomaly_reason = {"meter_type": str(kind), "threshold": WATER_ANOMALY_THRESHOLD, "prev": prev_val, "curr": float(value_float)}
@@ -346,6 +407,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 prev_vals.append(float(r[0]))
                             except Exception:
                                 continue
+                        if not prev_vals:
+                            prev_vals = _get_last_electric_before(conn, int(apartment_id), str(ym))
                         if prev_vals:
                             diffs = [abs(float(value_float) - v) for v in prev_vals]
                             min_diff = min(diffs)
@@ -470,6 +533,28 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     ),
                                     {"id": int(photo_event_id), "diag_json": diag_json_str},
                                 )
+                except Exception:
+                    pass
+
+                # Additional digit-length sanity check (guard against missing leading digits)
+                try:
+                    with engine.begin() as conn:
+                        if kind in ("cold", "hot"):
+                            last_val = _get_last_reading_before(conn, int(apartment_id), str(ym), str(kind), 1)
+                        elif kind == "electric":
+                            prev_vals = _get_last_electric_before(conn, int(apartment_id), str(ym))
+                            last_val = max(prev_vals) if prev_vals else None
+                        else:
+                            last_val = None
+                    if (last_val is not None) and (value_float is not None):
+                        if _digits_len(float(last_val)) - _digits_len(float(value_float)) >= 2:
+                            anomaly = True
+                            anomaly_reason = {
+                                "meter_type": str(kind or "unknown"),
+                                "reason": "digit_length_drop",
+                                "prev": float(last_val),
+                                "curr": float(value_float),
+                            }
                 except Exception:
                     pass
 
