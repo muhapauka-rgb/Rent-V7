@@ -1928,7 +1928,7 @@ export default function App() {
                           <div>
                             <div style={{ fontWeight: 900 }}>{c.chat_id}</div>
                             <div style={{ color: "#666", fontSize: 12 }}>
-                              {c.is_active ? "active" : "inactive"}; updated {c.updated_at}
+                              {c.is_active ? "active" : "inactive"}
                             </div>
                           </div>
                           <button
