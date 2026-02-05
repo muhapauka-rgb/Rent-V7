@@ -16,10 +16,6 @@ from core.db import db_ready, ensure_tables  # noqa: E402
 from core.integrations import ydisk_ready, ydisk_exists, ydisk_put, ydisk_list, ydisk_delete, ydisk_mkcol  # noqa: E402
 
 
-def _ensure_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=2000)
@@ -163,7 +159,7 @@ def main() -> int:
     with engine.begin() as conn:
         conn.execute(
             text("UPDATE ocr_training_runs SET finished_at=now() WHERE run_month=:m"),
-            {"m": run_month},
+            {"m": run_date},
         )
         msg = f"OCR датасет {run_month} ({run_date}): обработано {processed}, ошибок {errors}"
         conn.execute(
