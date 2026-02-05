@@ -18,7 +18,12 @@ from core.billing import (
     _set_month_bill_state,
     _same_total,
 )
-from core.meters import _write_electric_explicit, _assign_and_write_electric_sorted
+from core.meters import (
+    _write_electric_explicit,
+    _assign_and_write_electric_sorted,
+    _write_water_ocr_with_uncertainty,
+    _has_open_water_uncertain_flag,
+)
 from core.admin_helpers import (
     find_apartment_by_chat,
     find_apartment_by_contact,
@@ -32,6 +37,7 @@ from core.admin_helpers import (
 from core.schemas import UIStatusesPatch
 
 router = APIRouter()
+WATER_TYPE_CONF_MIN = 0.7
 
 
 @router.post("/events/photo")
@@ -90,12 +96,19 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     ocr_type = None
     ocr_reading = None
+    ocr_confidence = None
     if isinstance(ocr_data, dict):
         ocr_type = ocr_data.get("type")
         ocr_reading = ocr_data.get("reading")
+        ocr_confidence = ocr_data.get("confidence")
 
     kind = _ocr_to_kind(ocr_type)
     value_float = _parse_reading_to_float(ocr_reading)
+    try:
+        ocr_conf = float(ocr_confidence) if ocr_confidence is not None else 0.0
+    except Exception:
+        ocr_conf = 0.0
+    is_water_unknown = str(ocr_type or "").strip().lower() == "unknown"
 
     if kind != "electric":
         meter_index = 1
@@ -213,7 +226,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     # ym already defined above
     assigned_meter_index = int(meter_index)
 
-    if db_ready() and apartment_id and kind and (value_float is not None):
+    if db_ready() and apartment_id and (value_float is not None) and (kind or is_water_unknown):
         try:
             # 6.1) write meter_readings and get assigned_meter_index
             if kind == "electric":
@@ -238,27 +251,28 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 # water (cold/hot): always meter_index=1
                 assigned_meter_index = 1
                 with engine.begin() as conn:
-                    conn.execute(
-                        text("""
-                            INSERT INTO meter_readings
-                                (apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
-                            VALUES
-                                (:aid, :ym, :meter_type, 1, :value, 'ocr', :ocr_value)
-                            ON CONFLICT (apartment_id, ym, meter_type, meter_index)
-                            DO UPDATE SET
-                                value = EXCLUDED.value,
-                                source = 'ocr',
-                                ocr_value = EXCLUDED.ocr_value,
-                                updated_at = now()
-                        """),
-                        {
-                            "aid": int(apartment_id),
-                            "ym": ym,
-                            "meter_type": str(kind),
-                            "value": float(value_float),
-                            "ocr_value": float(value_float),
-                        },
-                    )
+                    is_water = (kind in ("cold", "hot")) or is_water_unknown
+                    water_uncertain = False
+                    if is_water:
+                        # если OCR не уверен в типе, сортируем как max->ХВС, min->ГВС
+                        water_uncertain = is_water_unknown or (kind in ("cold", "hot") and ocr_conf < WATER_TYPE_CONF_MIN)
+                        if water_uncertain:
+                            diag["warnings"].append({"water_type_uncertain": {"confidence": ocr_conf, "ocr_type": ocr_type}})
+                        force_sort = _has_open_water_uncertain_flag(conn, int(apartment_id), str(ym))
+                        assigned_kind = _write_water_ocr_with_uncertainty(
+                            conn,
+                            int(apartment_id),
+                            str(ym),
+                            float(value_float),
+                            kind if kind in ("cold", "hot") else None,
+                            float(value_float),
+                            bool(water_uncertain),
+                            bool(force_sort),
+                        )
+                        kind = assigned_kind
+                    else:
+                        # если OCR не распознал тип — ничего не пишем
+                        raise Exception("water_type_unknown")
 
             # 6.2) duplicate check
             try:
@@ -336,8 +350,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 SET
                                     meter_written = true,
                                     meter_index = :meter_index,
-                                    meter_kind = COALESCE(meter_kind, :meter_kind),
-                                    meter_value = COALESCE(meter_value, :meter_value),
+                                    meter_kind = COALESCE(:meter_kind, meter_kind),
+                                    meter_value = COALESCE(:meter_value, meter_value),
                                     stage = 'meter_written',
                                     stage_updated_at = now(),
                                     diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END

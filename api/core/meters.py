@@ -8,6 +8,210 @@ from core.billing import (
     _set_month_extra_state,
 )
 
+_WATER_UNCERTAIN_REASON = "water_type_uncertain"
+
+
+def _has_open_water_uncertain_flag(conn, apartment_id: int, ym: str) -> bool:
+    row = conn.execute(
+        text(
+            """
+            SELECT 1
+            FROM meter_review_flags
+            WHERE apartment_id=:aid AND ym=:ym
+              AND status='open'
+              AND reason=:reason
+            LIMIT 1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "reason": _WATER_UNCERTAIN_REASON},
+    ).fetchone()
+    return bool(row)
+
+
+def _ensure_review_flag(
+    conn,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    meter_index: int = 1,
+    reason: str = _WATER_UNCERTAIN_REASON,
+    comment: str | None = None,
+) -> None:
+    row = conn.execute(
+        text(
+            """
+            SELECT id
+            FROM meter_review_flags
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+              AND status='open' AND reason=:reason
+            LIMIT 1
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "ym": str(ym),
+            "mt": str(meter_type),
+            "mi": int(meter_index),
+            "reason": str(reason),
+        },
+    ).fetchone()
+    if row:
+        return
+
+    conn.execute(
+        text(
+            """
+            INSERT INTO meter_review_flags(
+                apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+            )
+            VALUES(:aid, :ym, :mt, :mi, 'open', :reason, :comment, now(), NULL)
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "ym": str(ym),
+            "mt": str(meter_type),
+            "mi": int(meter_index),
+            "reason": str(reason),
+            "comment": comment,
+        },
+    )
+
+
+def _write_water_ocr_with_uncertainty(
+    conn,
+    apartment_id: int,
+    ym: str,
+    value: float,
+    kind_hint: str | None,
+    ocr_value: float,
+    uncertain: bool,
+    force_sort: bool,
+) -> str:
+    """
+    Записываем воду (ХВС/ГВС) от OCR.
+    Если есть неуверенность хотя бы по одному счётчику — сортируем:
+      max -> ХВС, min -> ГВС.
+    Возвращаем назначенный meter_type (cold|hot).
+    """
+    ym = (str(ym).strip() or month_now())
+    kind = str(kind_hint).lower().strip() if kind_hint else ""
+    if kind not in ("cold", "hot"):
+        kind = ""
+
+    # найти, какие типы уже есть
+    rows_before = conn.execute(
+        text(
+            """
+            SELECT meter_type, value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+
+    present = {str(mt): v for mt, v in (rows_before or []) if v is not None}
+
+    if not kind:
+        if "cold" not in present:
+            kind = "cold"
+        elif "hot" not in present:
+            kind = "hot"
+        else:
+            # оба уже есть — по умолчанию перезаписываем ХВС
+            kind = "cold"
+
+    # upsert выбранный тип
+    conn.execute(
+        text(
+            """
+            INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+            VALUES(:aid,:ym,:mt,1,:val,'ocr',:ocr)
+            ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET
+              value=EXCLUDED.value,
+              source='ocr',
+              ocr_value=EXCLUDED.ocr_value,
+              updated_at=now()
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "ym": str(ym),
+            "mt": str(kind),
+            "val": float(value),
+            "ocr": float(ocr_value),
+        },
+    )
+
+    need_sort = bool(uncertain or force_sort)
+
+    # если нужно сортировать и есть оба значения — пересортируем
+    rows = conn.execute(
+        text(
+            """
+            SELECT meter_type, value, source, ocr_value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+
+    items = []
+    for mt, v, src, ocrv in (rows or []):
+        if v is None:
+            continue
+        items.append({"meter_type": str(mt), "value": float(v), "source": str(src or "manual"), "ocr_value": ocrv})
+
+    assigned_type = str(kind)
+    if need_sort and len(items) >= 2:
+        # min -> hot, max -> cold
+        items_sorted = sorted(items, key=lambda x: x["value"])
+        hot_item = items_sorted[0]
+        cold_item = items_sorted[-1]
+
+        for target_mt, it in (("hot", hot_item), ("cold", cold_item)):
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+                    VALUES(:aid,:ym,:mt,1,:val,:src,:ocr)
+                    ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET
+                      value=EXCLUDED.value,
+                      source=EXCLUDED.source,
+                      ocr_value=EXCLUDED.ocr_value,
+                      updated_at=now()
+                    """
+                ),
+                {
+                    "aid": int(apartment_id),
+                    "ym": str(ym),
+                    "mt": str(target_mt),
+                    "val": float(it["value"]),
+                    "src": str(it["source"] or "manual"),
+                    "ocr": (float(it["ocr_value"]) if it["ocr_value"] is not None else None),
+                },
+            )
+
+        # после пересортировки определяем фактический тип текущего значения
+        if abs(float(value) - float(cold_item["value"])) <= 1e-9 and abs(float(value) - float(hot_item["value"])) <= 1e-9:
+            assigned_type = "cold"
+        else:
+            assigned_type = "cold" if float(value) >= float(hot_item["value"]) else "hot"
+
+        # если есть неопределённость — подсветить только значение, которому соответствует это фото
+        if uncertain:
+            _ensure_review_flag(conn, int(apartment_id), str(ym), assigned_type, 1, _WATER_UNCERTAIN_REASON)
+
+        return str(assigned_type)
+
+    # если неопределённость, но пока только одно значение — отмечаем его
+    if uncertain:
+        _ensure_review_flag(conn, int(apartment_id), str(ym), str(kind), 1, _WATER_UNCERTAIN_REASON)
+
+    return str(kind)
+
 
 # -----------------------
 # INTERNAL DB helper (manual/ocr write into meter_readings)
