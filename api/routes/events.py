@@ -186,6 +186,50 @@ def _find_close_electric(conn, apartment_id: int, ym: str, value: float, thresho
     return best[1] if best else None
 
 
+def _get_same_month_water_values(conn, apartment_id: int, ym: str) -> list[tuple[str, float]]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT meter_type, value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+    out = []
+    for mt, v in (rows or []):
+        if v is None:
+            continue
+        try:
+            out.append((str(mt), float(v)))
+        except Exception:
+            continue
+    return out
+
+
+def _get_same_month_electric_values(conn, apartment_id: int, ym: str) -> list[float]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+    out = []
+    for (v,) in (rows or []):
+        if v is None:
+            continue
+        try:
+            out.append(float(v))
+        except Exception:
+            continue
+    return out
+
+
 @router.post("/events/photo")
 async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
@@ -553,6 +597,40 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 "meter_type": str(kind or "unknown"),
                                 "reason": "digit_length_drop",
                                 "prev": float(last_val),
+                                "curr": float(value_float),
+                            }
+                except Exception:
+                    pass
+
+                # Same-month sanity: if already have readings for this month,
+                # block huge mismatch to avoid overwriting correct manual values.
+                try:
+                    with engine.begin() as conn:
+                        if kind in ("cold", "hot"):
+                            vals = _get_same_month_water_values(conn, int(apartment_id), str(ym))
+                            existing = [v for _, v in vals]
+                        elif kind == "electric":
+                            existing = _get_same_month_electric_values(conn, int(apartment_id), str(ym))
+                        else:
+                            existing = []
+                    if existing and (value_float is not None):
+                        diffs = [abs(float(value_float) - v) for v in existing]
+                        min_diff = min(diffs)
+                        closest = existing[diffs.index(min_diff)]
+                        if _digits_len(float(closest)) - _digits_len(float(value_float)) >= 2:
+                            anomaly = True
+                            anomaly_reason = {
+                                "meter_type": str(kind or "unknown"),
+                                "reason": "digit_length_drop_same_month",
+                                "prev": float(closest),
+                                "curr": float(value_float),
+                            }
+                        elif min_diff > (WATER_ANOMALY_THRESHOLD if kind in ("cold", "hot") else ELECTRIC_ANOMALY_THRESHOLD):
+                            anomaly = True
+                            anomaly_reason = {
+                                "meter_type": str(kind or "unknown"),
+                                "reason": "mismatch_same_month",
+                                "prev": float(closest),
                                 "curr": float(value_float),
                             }
                 except Exception:
