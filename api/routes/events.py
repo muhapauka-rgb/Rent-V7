@@ -583,6 +583,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             "event_status": status,
             "ocr": ocr_data,
             "meter_written": wrote_meter,
+            "ocr_failed": bool((value_float is None) or (not kind and not is_water_unknown)),
             "diag": diag,
             "assigned_meter_index": assigned_meter_index,
             "ym": ym,

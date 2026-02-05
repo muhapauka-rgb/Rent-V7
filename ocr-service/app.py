@@ -2,6 +2,8 @@ import os
 import base64
 import json
 import requests
+from io import BytesIO
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 from typing import Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException
 
@@ -236,6 +238,49 @@ def _call_openai_vision(image_bytes: bytes, mime: str) -> dict:
     return _extract_json_object(content)
 
 
+def _encode_jpeg(img: Image.Image, quality: int = 90) -> bytes:
+    buf = BytesIO()
+    img.save(buf, format="JPEG", quality=quality, optimize=True)
+    return buf.getvalue()
+
+
+def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    variants: list[tuple[str, bytes]] = []
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return [("orig", img_bytes)]
+
+    variants.append(("orig", _encode_jpeg(img, quality=90)))
+
+    # Variant 1: auto-contrast + sharpen
+    try:
+        v1 = ImageOps.autocontrast(img.convert("L"))
+        v1 = v1.filter(ImageFilter.SHARPEN)
+        variants.append(("autocontrast", _encode_jpeg(v1.convert("RGB"), quality=92)))
+    except Exception:
+        pass
+
+    # Variant 2: stronger contrast + unsharp mask
+    try:
+        v2 = ImageEnhance.Contrast(img).enhance(1.6)
+        v2 = v2.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
+        variants.append(("contrast", _encode_jpeg(v2, quality=92)))
+    except Exception:
+        pass
+
+    # Variant 3: rotate if likely rotated (portrait)
+    try:
+        if img.height > img.width:
+            v3 = img.rotate(90, expand=True)
+            variants.append(("rotate90", _encode_jpeg(v3, quality=90)))
+    except Exception:
+        pass
+
+    # keep up to 3 variants (speed)
+    return variants[:3]
+
+
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
     img = await file.read()
@@ -243,33 +288,64 @@ async def recognize(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="empty_file")
 
     mime = _guess_mime(file.filename, file.content_type)
-    resp = _call_openai_vision(img, mime=mime)
+    variants = _make_variants(img)
 
-    # type
-    t = _sanitize_type(resp.get("type", "unknown"))
+    best = None
+    best_score = -1.0
+    chosen_label = "orig"
+    for label, b in variants:
+        resp = _call_openai_vision(b, mime=mime)
 
-    # reading
-    reading = _normalize_reading(resp.get("reading", None))
+        t = _sanitize_type(resp.get("type", "unknown"))
+        reading = _normalize_reading(resp.get("reading", None))
+        serial = resp.get("serial", None)
+        if isinstance(serial, str):
+            serial = serial.strip() or None
+        conf = _clamp_confidence(resp.get("confidence", 0.0))
 
-    # serial
-    serial = resp.get("serial", None)
-    if isinstance(serial, str):
-        serial = serial.strip() or None
+        # plausibility
+        reading, conf, note2 = _plausibility_filter(t, reading, conf)
 
-    # confidence
-    conf = _clamp_confidence(resp.get("confidence", 0.0))
+        score = float(conf)
+        if reading is not None:
+            score += 0.15
+        if t != "unknown":
+            score += 0.05
 
-    # plausibility filter
-    reading, conf, note2 = _plausibility_filter(t, reading, conf)
+        if score > best_score:
+            best_score = score
+            best = {
+                "type": t,
+                "reading": reading,
+                "serial": serial,
+                "confidence": conf,
+                "notes": str(resp.get("notes", "") or ""),
+                "note2": note2,
+            }
+            chosen_label = label
+
+        # early exit if strong
+        if conf >= 0.85 and reading is not None:
+            break
+
+    if best is None:
+        raise HTTPException(status_code=500, detail="openai_empty_response")
+
+    t = best["type"]
+    reading = best["reading"]
+    serial = best["serial"]
+    conf = best["confidence"]
+    note2 = best.get("note2") or ""
 
     # notes
-    notes = str(resp.get("notes", "") or "")
+    notes = str(best.get("notes", "") or "")
     if note2:
         if notes:
             notes = f"{notes}; {note2}"
         else:
             notes = note2
-    notes = notes.strip()[:200]
+    notes = (notes.strip() or "")
+    notes = (notes + (f"; variant={chosen_label}" if chosen_label else "")).strip()[:200]
 
     return {
         "type": t,
