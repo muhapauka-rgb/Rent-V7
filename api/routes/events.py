@@ -77,6 +77,56 @@ def _get_prev_reading(conn, apartment_id: int, ym: str, meter_type: str, meter_i
         return None
 
 
+def _find_close_water(conn, apartment_id: int, ym: str, value: float, threshold: float) -> str | None:
+    rows = conn.execute(
+        text(
+            """
+            SELECT meter_type, value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+    best = None
+    for mt, v in (rows or []):
+        if v is None:
+            continue
+        try:
+            diff = abs(float(v) - float(value))
+        except Exception:
+            continue
+        if diff <= threshold:
+            if (best is None) or (diff < best[0]):
+                best = (diff, str(mt))
+    return best[1] if best else None
+
+
+def _find_close_electric(conn, apartment_id: int, ym: str, value: float, threshold: float) -> int | None:
+    rows = conn.execute(
+        text(
+            """
+            SELECT meter_index, value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric'
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+    best = None
+    for mi, v in (rows or []):
+        if v is None:
+            continue
+        try:
+            diff = abs(float(v) - float(value))
+        except Exception:
+            continue
+        if diff <= threshold:
+            if (best is None) or (diff < best[0]):
+                best = (diff, int(mi))
+    return best[1] if best else None
+
+
 @router.post("/events/photo")
 async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
@@ -312,110 +362,138 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 anomaly = False
 
             if anomaly:
-                diag["warnings"].append({"anomaly_jump": anomaly_reason})
                 try:
                     with engine.begin() as conn:
-                        # create review flag if missing
-                        mt = str(anomaly_reason.get("meter_type") if isinstance(anomaly_reason, dict) else (kind or "unknown"))
-                        if mt != "electric":
-                            mi = 1
-                        elif meter_index_mode == "explicit" and raw_meter_index is not None:
-                            mi = int(meter_index)
-                        else:
-                            mi = 1
-                        exists = conn.execute(
-                            text(
-                                """
-                                SELECT 1
-                                FROM meter_review_flags
-                                WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
-                                  AND status='open' AND reason='anomaly_jump'
-                                LIMIT 1
-                                """
-                            ),
-                            {"aid": int(apartment_id), "ym": str(ym), "mt": mt, "mi": int(mi)},
-                        ).fetchone()
-                        if not exists:
+                        # If this is a close retake of an already stored value for the same month,
+                        # don't block it as anomaly; allow overwrite to avoid loops.
+                        try:
+                            if (kind in ("cold", "hot")) or is_water_unknown:
+                                close_mt = _find_close_water(
+                                    conn,
+                                    int(apartment_id),
+                                    str(ym),
+                                    float(value_float),
+                                    WATER_RETAKE_THRESHOLD,
+                                )
+                                if close_mt:
+                                    anomaly = False
+                            elif kind == "electric":
+                                close_mi = _find_close_electric(
+                                    conn,
+                                    int(apartment_id),
+                                    str(ym),
+                                    float(value_float),
+                                    ELECTRIC_RETAKE_THRESHOLD,
+                                )
+                                if close_mi is not None:
+                                    anomaly = False
+                        except Exception:
+                            pass
+
+                        if anomaly:
+                            diag["warnings"].append({"anomaly_jump": anomaly_reason})
+                            # create review flag if missing
+                            mt = str(anomaly_reason.get("meter_type") if isinstance(anomaly_reason, dict) else (kind or "unknown"))
+                            if mt != "electric":
+                                mi = 1
+                            elif meter_index_mode == "explicit" and raw_meter_index is not None:
+                                mi = int(meter_index)
+                            else:
+                                mi = 1
+                            exists = conn.execute(
+                                text(
+                                    """
+                                    SELECT 1
+                                    FROM meter_review_flags
+                                    WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                                      AND status='open' AND reason='anomaly_jump'
+                                    LIMIT 1
+                                    """
+                                ),
+                                {"aid": int(apartment_id), "ym": str(ym), "mt": mt, "mi": int(mi)},
+                            ).fetchone()
+                            if not exists:
+                                conn.execute(
+                                    text(
+                                        """
+                                        INSERT INTO meter_review_flags(
+                                            apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                                        )
+                                        VALUES(:aid, :ym, :mt, :mi, 'open', 'anomaly_jump', :comment, now(), NULL)
+                                        """
+                                    ),
+                                    {
+                                        "aid": int(apartment_id),
+                                        "ym": str(ym),
+                                        "mt": mt,
+                                        "mi": int(mi),
+                                        "comment": json.dumps(anomaly_reason, ensure_ascii=False),
+                                    },
+                                )
+                            # create notification for admin
+                            username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
+                            related = json.dumps(
+                                {"ym": str(ym), "meter_type": mt, "meter_index": int(mi)},
+                                ensure_ascii=False,
+                            )
+                            msg = f"Подозрительный скачок по {('ХВС' if mt=='cold' else 'ГВС' if mt=='hot' else 'Электро')}: {anomaly_reason}"
                             conn.execute(
                                 text(
                                     """
-                                    INSERT INTO meter_review_flags(
-                                        apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                                    INSERT INTO notifications(
+                                        chat_id, telegram_username, apartment_id, type, message, related, status, created_at
                                     )
-                                    VALUES(:aid, :ym, :mt, :mi, 'open', 'anomaly_jump', :comment, now(), NULL)
+                                    VALUES(:chat_id, :username, :apartment_id, 'anomaly_jump', :message, CAST(:related AS JSONB), 'unread', now())
                                     """
                                 ),
                                 {
-                                    "aid": int(apartment_id),
-                                    "ym": str(ym),
-                                    "mt": mt,
-                                    "mi": int(mi),
-                                    "comment": json.dumps(anomaly_reason, ensure_ascii=False),
+                                    "chat_id": str(chat_id),
+                                    "username": username,
+                                    "apartment_id": int(apartment_id),
+                                    "message": msg,
+                                    "related": related,
                                 },
                             )
-                        # create notification for admin
-                        username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
-                        related = json.dumps(
-                            {"ym": str(ym), "meter_type": mt, "meter_index": int(mi)},
-                            ensure_ascii=False,
-                        )
-                        msg = f"Подозрительный скачок по {('ХВС' if mt=='cold' else 'ГВС' if mt=='hot' else 'Электро')}: {anomaly_reason}"
-                        conn.execute(
-                            text(
-                                """
-                                INSERT INTO notifications(
-                                    chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                            if photo_event_id:
+                                diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+                                conn.execute(
+                                    text(
+                                        """
+                                        UPDATE photo_events
+                                        SET
+                                            meter_written = false,
+                                            stage = 'needs_review',
+                                            stage_updated_at = now(),
+                                            diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                                        WHERE id = :id
+                                        """
+                                    ),
+                                    {"id": int(photo_event_id), "diag_json": diag_json_str},
                                 )
-                                VALUES(:chat_id, :username, :apartment_id, 'anomaly_jump', :message, CAST(:related AS JSONB), 'unread', now())
-                                """
-                            ),
-                            {
-                                "chat_id": str(chat_id),
-                                "username": username,
-                                "apartment_id": int(apartment_id),
-                                "message": msg,
-                                "related": related,
-                            },
-                        )
-                        if photo_event_id:
-                            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
-                            conn.execute(
-                                text(
-                                    """
-                                    UPDATE photo_events
-                                    SET
-                                        meter_written = false,
-                                        stage = 'needs_review',
-                                        stage_updated_at = now(),
-                                        diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
-                                    WHERE id = :id
-                                    """
-                                ),
-                                {"id": int(photo_event_id), "diag_json": diag_json_str},
-                            )
                 except Exception:
                     pass
 
-                return JSONResponse(
-                    status_code=200,
-                    content={
-                        "status": "ok",
-                        "chat_id": str(chat_id),
-                        "telegram_username": telegram_username,
-                        "phone": phone,
-                        "photo_event_id": photo_event_id,
-                        "ydisk_path": ydisk_path,
-                        "apartment_id": apartment_id,
-                        "event_status": status,
-                        "ocr": ocr_data,
-                        "meter_written": False,
-                        "ocr_failed": False,
-                        "diag": diag,
-                        "assigned_meter_index": assigned_meter_index,
-                        "ym": ym,
-                        "bill": None,
-                    },
-                )
+                if anomaly:
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "status": "ok",
+                            "chat_id": str(chat_id),
+                            "telegram_username": telegram_username,
+                            "phone": phone,
+                            "photo_event_id": photo_event_id,
+                            "ydisk_path": ydisk_path,
+                            "apartment_id": apartment_id,
+                            "event_status": status,
+                            "ocr": ocr_data,
+                            "meter_written": False,
+                            "ocr_failed": False,
+                            "diag": diag,
+                            "assigned_meter_index": assigned_meter_index,
+                            "ym": ym,
+                            "bill": None,
+                        },
+                    )
 
             # 6.1) write meter_readings and get assigned_meter_index
             if kind == "electric":

@@ -253,27 +253,47 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
 
     variants.append(("orig", _encode_jpeg(img, quality=90)))
 
-    # Variant 1: auto-contrast + sharpen
+    # Helper: focused crop around dark/text-like region
+    focused = None
     try:
-        v1 = ImageOps.autocontrast(img.convert("L"))
-        v1 = v1.filter(ImageFilter.SHARPEN)
-        variants.append(("autocontrast", _encode_jpeg(v1.convert("RGB"), quality=92)))
+        gray = ImageOps.autocontrast(img.convert("L"))
+        gray = gray.filter(ImageFilter.MedianFilter(3))
+        bw = gray.point(lambda p: 0 if p < 200 else 255, "L")
+        inv = ImageOps.invert(bw)
+        bbox = inv.getbbox()
+        if bbox:
+            w, h = img.size
+            bw_box, bh_box = bbox[2] - bbox[0], bbox[3] - bbox[1]
+            if (bw_box * bh_box) >= (w * h * 0.05):
+                pad = int(min(w, h) * 0.03)
+                left = max(0, bbox[0] - pad)
+                upper = max(0, bbox[1] - pad)
+                right = min(w, bbox[2] + pad)
+                lower = min(h, bbox[3] + pad)
+                v = img.crop((left, upper, right, lower))
+                v = ImageEnhance.Contrast(v).enhance(1.5)
+                v = v.filter(ImageFilter.UnsharpMask(radius=1, percent=160, threshold=3))
+                focused = _encode_jpeg(v, quality=92)
     except Exception:
-        pass
+        focused = None
 
-    # Variant 2: stronger contrast + unsharp mask
+    # Helper: full-frame contrast boost (fallback if focused not available)
+    contrast = None
     try:
         v2 = ImageEnhance.Contrast(img).enhance(1.6)
         v2 = v2.filter(ImageFilter.UnsharpMask(radius=1, percent=150, threshold=3))
-        variants.append(("contrast", _encode_jpeg(v2, quality=92)))
+        contrast = _encode_jpeg(v2, quality=92)
     except Exception:
-        pass
+        contrast = None
 
-    # Variant 3: rotate if likely rotated (portrait); otherwise center-crop
+    # Orientation variant: rotate portrait or center-crop landscape
+    orient = None
+    orient_label = None
     try:
         if img.height > img.width:
             v3 = img.rotate(90, expand=True)
-            variants.append(("rotate90", _encode_jpeg(v3, quality=90)))
+            orient = _encode_jpeg(v3, quality=90)
+            orient_label = "rotate90"
         else:
             w, h = img.size
             cx, cy = w // 2, h // 2
@@ -284,11 +304,28 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
             lower = min(h, upper + ch)
             v3 = img.crop((left, upper, right, lower))
             v3 = ImageEnhance.Contrast(v3).enhance(1.3)
-            variants.append(("center_crop", _encode_jpeg(v3, quality=92)))
+            orient = _encode_jpeg(v3, quality=92)
+            orient_label = "center_crop"
     except Exception:
-        pass
+        orient = None
+        orient_label = None
 
-    # keep up to 3 variants (speed)
+    # Choose up to 3 variants (speed)
+    if img.height > img.width:
+        if orient and len(variants) < 3:
+            variants.append((orient_label or "rotate90", orient))
+        if focused and len(variants) < 3:
+            variants.append(("focused_crop", focused))
+        if contrast and len(variants) < 3:
+            variants.append(("contrast", contrast))
+    else:
+        if focused and len(variants) < 3:
+            variants.append(("focused_crop", focused))
+        if orient and len(variants) < 3:
+            variants.append((orient_label or "center_crop", orient))
+        if contrast and len(variants) < 3:
+            variants.append(("contrast", contrast))
+
     return variants[:3]
 
 
