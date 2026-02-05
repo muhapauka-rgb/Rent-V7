@@ -19,6 +19,9 @@ def capture_training_sample(
     mi = int(meter_index or 1)
     ym = str(ym)
 
+    if mt not in ("cold", "hot", "electric"):
+        return None
+
     row = conn.execute(
         text(
             """

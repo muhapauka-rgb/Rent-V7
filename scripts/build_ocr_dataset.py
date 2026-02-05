@@ -70,11 +70,14 @@ def main() -> int:
         rows = conn.execute(
             text(
                 """
-                SELECT id, apartment_id, ym, meter_type, meter_index,
-                       photo_event_id, ydisk_path, ocr_value, correct_value
-                FROM ocr_training_samples
-                WHERE processed_at IS NULL
-                ORDER BY id ASC
+                SELECT s.id, s.apartment_id, s.ym, s.meter_type, s.meter_index,
+                       s.photo_event_id, s.ydisk_path, s.ocr_value, s.correct_value, s.source,
+                       p.ocr_json, p.diag_json, p.ocr_type, p.ocr_reading, p.meter_kind, p.meter_value, p.stage, p.stage_updated_at
+                FROM ocr_training_samples s
+                LEFT JOIN photo_events p ON p.id = s.photo_event_id
+                WHERE s.processed_at IS NULL
+                  AND s.meter_type IN ('cold','hot','electric')
+                ORDER BY s.id ASC
                 LIMIT :limit
                 """
             ),
@@ -96,15 +99,49 @@ def main() -> int:
                 errors += 1
                 continue
 
+            ocr_json = r.get("ocr_json") or {}
+            if isinstance(ocr_json, str):
+                try:
+                    ocr_json = json.loads(ocr_json)
+                except Exception:
+                    ocr_json = {}
+            diag_json = r.get("diag_json") or {}
+            if isinstance(diag_json, str):
+                try:
+                    diag_json = json.loads(diag_json)
+                except Exception:
+                    diag_json = {}
+
+            ocr_val = float(r["ocr_value"]) if r["ocr_value"] is not None else None
+            correct_val = float(r["correct_value"])
+            delta_abs = None
+            delta_rel = None
+            if ocr_val is not None:
+                delta_abs = abs(correct_val - float(ocr_val))
+                if abs(correct_val) > 1e-9:
+                    delta_rel = delta_abs / abs(correct_val)
+
+            label_reason = "ocr_missing" if ocr_val is None else "ocr_mismatch"
+
             label = {
                 "image": ypath,  # keep only metadata with ydisk path
                 "apartment_id": int(r["apartment_id"]),
                 "ym": r["ym"],
                 "meter_type": r["meter_type"],
                 "meter_index": int(r["meter_index"] or 1),
-                "ocr_value": float(r["ocr_value"]) if r["ocr_value"] is not None else None,
-                "correct_value": float(r["correct_value"]),
+                "ocr_value": ocr_val,
+                "correct_value": correct_val,
+                "delta_abs": delta_abs,
+                "delta_rel": delta_rel,
+                "label_reason": label_reason,
+                "source": r.get("source"),
                 "photo_event_id": int(r["photo_event_id"] or 0),
+                "ocr_type": (r.get("ocr_type") or ocr_json.get("type")),
+                "ocr_confidence": (ocr_json.get("confidence") if isinstance(ocr_json, dict) else None),
+                "ocr_notes": (ocr_json.get("notes") if isinstance(ocr_json, dict) else None),
+                "diag_warnings": (diag_json.get("warnings") if isinstance(diag_json, dict) else None),
+                "stage": r.get("stage"),
+                "stage_updated_at": (str(r.get("stage_updated_at")) if r.get("stage_updated_at") is not None else None),
             }
             labels.append(label)
 
