@@ -87,6 +87,8 @@ def _write_water_ocr_with_uncertainty(
     ocr_value: float,
     uncertain: bool,
     force_sort: bool,
+    force_kind: str | None = None,
+    force_no_sort: bool = False,
 ) -> str:
     """
     Записываем воду (ХВС/ГВС) от OCR.
@@ -98,6 +100,9 @@ def _write_water_ocr_with_uncertainty(
     kind = str(kind_hint).lower().strip() if kind_hint else ""
     if kind not in ("cold", "hot"):
         kind = ""
+
+    if force_kind in ("cold", "hot"):
+        kind = force_kind
 
     # найти, какие типы уже есть
     rows_before = conn.execute(
@@ -145,6 +150,8 @@ def _write_water_ocr_with_uncertainty(
     )
 
     need_sort = bool(uncertain or force_sort)
+    if force_no_sort:
+        need_sort = False
 
     # если нужно сортировать и есть оба значения — пересортируем
     rows = conn.execute(

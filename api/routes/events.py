@@ -21,6 +21,7 @@ from core.billing import (
 from core.meters import (
     _write_electric_explicit,
     _assign_and_write_electric_sorted,
+    _write_electric_overwrite_then_sort,
     _write_water_ocr_with_uncertainty,
     _has_open_water_uncertain_flag,
 )
@@ -39,6 +40,8 @@ from core.schemas import UIStatusesPatch
 
 router = APIRouter()
 WATER_TYPE_CONF_MIN = 0.7
+WATER_RETAKE_THRESHOLD = 1.0
+ELECTRIC_RETAKE_THRESHOLD = 5.0
 
 
 @router.post("/events/photo")
@@ -235,21 +238,59 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             # 6.1) write meter_readings and get assigned_meter_index
             if kind == "electric":
                 # By default always auto-sort.
-                if (meter_index_mode == "explicit") and (raw_meter_index is not None):
-                    with engine.begin() as conn:
-                        assigned_meter_index = _write_electric_explicit(
+                # First: if value is very close to an existing one, overwrite that slot.
+                close_idx = None
+                with engine.begin() as conn:
+                    rows = conn.execute(
+                        text(
+                            """
+                            SELECT meter_index, value
+                            FROM meter_readings
+                            WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric'
+                            """
+                        ),
+                        {"aid": int(apartment_id), "ym": str(ym)},
+                    ).fetchall()
+                    best = None
+                    for mi, v in (rows or []):
+                        if v is None:
+                            continue
+                        try:
+                            diff = abs(float(v) - float(value_float))
+                        except Exception:
+                            continue
+                        if diff <= ELECTRIC_RETAKE_THRESHOLD:
+                            if (best is None) or (diff < best[0]):
+                                best = (diff, int(mi))
+                    if best:
+                        close_idx = int(best[1])
+                        _write_electric_overwrite_then_sort(
                             conn,
                             int(apartment_id),
+                            str(ym),
+                            int(close_idx),
+                            float(value_float),
+                            source="ocr",
+                        )
+                        assigned_meter_index = int(close_idx)
+                        diag["warnings"].append({"retake_overwrite": {"meter_type": "electric", "meter_index": int(close_idx)}})
+
+                if close_idx is None:
+                    if (meter_index_mode == "explicit") and (raw_meter_index is not None):
+                        with engine.begin() as conn:
+                            assigned_meter_index = _write_electric_explicit(
+                                conn,
+                                int(apartment_id),
+                                ym,
+                                int(meter_index),
+                                float(value_float),
+                            )
+                    else:
+                        assigned_meter_index = _assign_and_write_electric_sorted(
+                            int(apartment_id),
                             ym,
-                            int(meter_index),
                             float(value_float),
                         )
-                else:
-                    assigned_meter_index = _assign_and_write_electric_sorted(
-                        int(apartment_id),
-                        ym,
-                        float(value_float),
-                    )
 
             else:
                 # water (cold/hot): always meter_index=1
@@ -263,6 +304,35 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         if water_uncertain:
                             diag["warnings"].append({"water_type_uncertain": {"confidence": ocr_conf, "ocr_type": ocr_type}})
                         force_sort = _has_open_water_uncertain_flag(conn, int(apartment_id), str(ym))
+                        # if new value is very close to an existing water reading, overwrite that specific meter
+                        force_kind = None
+                        force_no_sort = False
+                        rows = conn.execute(
+                            text(
+                                """
+                                SELECT meter_type, value
+                                FROM meter_readings
+                                WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+                                """
+                            ),
+                            {"aid": int(apartment_id), "ym": str(ym)},
+                        ).fetchall()
+                        best = None
+                        for mt, v in (rows or []):
+                            if v is None:
+                                continue
+                            try:
+                                diff = abs(float(v) - float(value_float))
+                            except Exception:
+                                continue
+                            if diff <= WATER_RETAKE_THRESHOLD:
+                                if (best is None) or (diff < best[0]):
+                                    best = (diff, str(mt))
+                        if best:
+                            force_kind = best[1]
+                            force_no_sort = True
+                            diag["warnings"].append({"retake_overwrite": {"meter_type": str(force_kind), "meter_index": 1}})
+
                         assigned_kind = _write_water_ocr_with_uncertainty(
                             conn,
                             int(apartment_id),
@@ -272,6 +342,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             float(value_float),
                             bool(water_uncertain),
                             bool(force_sort),
+                            force_kind=force_kind,
+                            force_no_sort=force_no_sort,
                         )
                         kind = assigned_kind
                     else:
