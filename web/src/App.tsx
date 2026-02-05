@@ -1223,24 +1223,34 @@ export default function App() {
         </div>
 
         {notifOpen ? (
-          <div
-            style={{
-              position: "absolute",
-              right: 0,
-              top: 50,
-              width: 360,
-              maxWidth: "90vw",
-              background: "white",
-              border: "1px solid #eee",
-              borderRadius: 12,
-              boxShadow: "0 10px 30px rgba(0,0,0,0.12)",
-              padding: 10,
-              zIndex: 50,
-            }}
-          >
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
-              <div style={{ fontWeight: 900 }}>Уведомления</div>
-              <button
+          <>
+            <div
+              onClick={() => setNotifOpen(false)}
+              style={{
+                position: "fixed",
+                inset: 0,
+                background: "transparent",
+                zIndex: 40,
+              }}
+            />
+            <div
+              style={{
+                position: "absolute",
+                right: 0,
+                top: 50,
+                width: 360,
+                maxWidth: "90vw",
+                background: "white",
+                border: "1px solid #eee",
+                borderRadius: 12,
+                boxShadow: "0 10px 30px rgba(0,0,0,0.12)",
+                padding: 10,
+                zIndex: 50,
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <div style={{ fontWeight: 900 }}>Уведомления</div>
+                <button
                 onClick={() => clearReadNotifications()}
                 style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800, fontSize: 12 }}
               >
@@ -1313,6 +1323,7 @@ export default function App() {
               {notifLoading ? <div style={{ color: "#666", fontSize: 12 }}>Загрузка…</div> : null}
             </div>
           </div>
+          </>
         ) : null}
       </div>
 

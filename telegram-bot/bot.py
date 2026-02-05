@@ -646,7 +646,8 @@ async def start_cmd(message: types.Message):
         "Привет!\n"
         "1) Нажми «Старт месяца» в начале месяца.\n"
         "2) Пришли фото счётчиков (ХВС/ГВС/Электро).\n"
-        "3) Когда оплатишь — нажми «Аренда оплачена» / «Счётчики оплачены».",
+        "3) Когда оплатишь — нажми «Аренда оплачена» / «Счётчики оплачены».\n"
+        "4) Здесь вы можете отправлять любые сообщения для администратора.",
         reply_markup=_kb_main(message.chat.id),
     )
 
@@ -724,6 +725,7 @@ async def on_text(message: types.Message):
     if text_in and not text_in.startswith("/") and text_in not in sys_texts:
         username = message.from_user.username if message.from_user else None
         await _post_notification(message.chat.id, username, text_in, "user_message")
+        return
 
     # Главные кнопки
     ym = _current_ym()
@@ -782,10 +784,7 @@ async def on_text(message: types.Message):
         )
         return
 
-    await message.reply(
-        "Пришлите фото/файл счётчика.",
-        reply_markup=_kb_main(),
-    )
+    # Не отвечаем на прочий текст — он уже отправлен администратору
 
 
 async def _handle_file_message(message: types.Message, *, file_bytes: bytes, filename: str, mime_type: str):
