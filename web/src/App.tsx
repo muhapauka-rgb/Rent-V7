@@ -1,4 +1,5 @@
 import React, { useEffect, useMemo, useState } from "react";
+import * as XLSX from "xlsx-js-style";
 import MetersTable from "./components/MetersTable";
 
 type ApartmentItem = {
@@ -216,6 +217,7 @@ function addMonths(ym: string, delta: number): string {
 export default function App() {
   const [tab, setTab] = useState<"apartments" | "ops">("apartments");
   const [err, setErr] = useState<string | null>(null);
+  const [isMobile, setIsMobile] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
   const [notifOffset, setNotifOffset] = useState(0);
@@ -228,6 +230,7 @@ export default function App() {
 
   const [apartments, setApartments] = useState<ApartmentItem[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
+  const STORAGE_SELECTED_ID = "rent.selectedApartmentId";
 
   // серверный "текущий месяц"
   const [serverYm, setServerYm] = useState<string>("");
@@ -247,9 +250,46 @@ export default function App() {
   const [bindChatInput, setBindChatInput] = useState("");
   const [infoColdSerial, setInfoColdSerial] = useState("");
   const [infoHotSerial, setInfoHotSerial] = useState("");
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [showGraph, setShowGraph] = useState(false);
+  const [graphFrom, setGraphFrom] = useState<string>("");
+  const [graphTo, setGraphTo] = useState<string>("");
+  const [graphSeries, setGraphSeries] = useState({
+    cold: true,
+    hot: true,
+    t1: true,
+    t2: true,
+  });
+  const [graphMode, setGraphMode] = useState<"rub" | "reading" | "tariff">("rub");
+  const [graphHover, setGraphHover] = useState<{ index: number; x: number; y: number } | null>(null);
+  const [photoOpen, setPhotoOpen] = useState(false);
+  const [photoUrl, setPhotoUrl] = useState<string>("");
+  const [photoTitle, setPhotoTitle] = useState<string>("");
+  const [photoLoading, setPhotoLoading] = useState(false);
+  const [photoPos, setPhotoPos] = useState<{ x: number; y: number }>({ x: 80, y: 80 });
+  const [photoDrag, setPhotoDrag] = useState<{ active: boolean; dx: number; dy: number }>({ active: false, dx: 0, dy: 0 });
 
   // <-- добавили: сколько фото электро ждём (1..3)
   const [infoElectricExpected, setInfoElectricExpected] = useState<string>("1");
+
+  useEffect(() => {
+    const check = () => {
+      setIsMobile(window.innerWidth <= 820);
+    };
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, []);
+
+  useEffect(() => {
+    if (selectedId != null) {
+      try {
+        localStorage.setItem(STORAGE_SELECTED_ID, String(selectedId));
+      } catch {
+        // ignore
+      }
+    }
+  }, [selectedId]);
 
   async function openInfo(apartmentId: number) {
     setInfoOpen(true);
@@ -619,7 +659,17 @@ export default function App() {
 
     if (selectIfEmpty) {
       setSelectedId((prev) => {
-        if (prev != null) return prev;
+        const exists = (id: number | null) => id != null && items.some((i) => i.id === id);
+        if (exists(prev)) return prev;
+        let stored: number | null = null;
+        try {
+          const raw = localStorage.getItem(STORAGE_SELECTED_ID);
+          const num = raw == null ? NaN : Number(raw);
+          stored = Number.isFinite(num) ? num : null;
+        } catch {
+          stored = null;
+        }
+        if (exists(stored)) return stored;
         if (items.length) return items[0].id;
         return null;
       });
@@ -1020,11 +1070,431 @@ export default function App() {
     return h;
   }, [history, serverYm]);
 
-  const latest = historyWithFuture.length ? historyWithFuture[historyWithFuture.length - 1] : null;
-  const latestMonth = latest?.month ?? null;
+  const currentYm = isYm(serverYm) ? serverYm : null;
+  const latest = currentYm ? historyWithFuture.find((h) => h.month === currentYm) : null;
+  const latestMonth = currentYm;
   const latestMeters = latest?.meters ?? null;
 
-  const last4 = historyWithFuture.slice(-4).reverse();
+  function emptyMonthRow(month: string) {
+    return {
+      month,
+      meters: {
+        cold: { title: "ХВС", current: null, previous: null, delta: null },
+        hot: { title: "ГВС", current: null, previous: null, delta: null },
+        electric: {
+          title: "Электро",
+          t1: { title: "T1", current: null, previous: null, delta: null },
+          t2: { title: "T2", current: null, previous: null, delta: null },
+          t3: { title: "T3", current: null, previous: null, delta: null },
+        },
+        sewer: { title: "Водоотведение", current: null, previous: null, delta: null },
+      },
+    } as any;
+  }
+
+  const last4 = useMemo(() => {
+    const realLast = (history?.length ? history[history.length - 1]?.month : null) || (isYm(serverYm) ? serverYm : null);
+    if (!realLast || !isYm(realLast)) {
+      return historyWithFuture.slice(-4).reverse();
+    }
+
+    const months = [addMonths(realLast, -2), addMonths(realLast, -1), realLast, addMonths(realLast, 1)];
+    return months.map((m) => historyWithFuture.find((h) => h.month === m) || emptyMonthRow(m)).reverse();
+  }, [history, historyWithFuture, serverYm]);
+
+  const allHistoryMonths = useMemo(() => {
+    return (history ?? []).map((h) => h.month).filter(isYm).sort();
+  }, [history]);
+
+  useEffect(() => {
+    if (!allHistoryMonths.length) return;
+    setGraphFrom((prev) => (prev && isYm(prev) ? prev : allHistoryMonths[0]));
+    setGraphTo((prev) => (prev && isYm(prev) ? prev : allHistoryMonths[allHistoryMonths.length - 1]));
+  }, [allHistoryMonths]);
+
+  const graphMonths = useMemo(() => {
+    if (!graphFrom || !graphTo) return allHistoryMonths;
+    const from = graphFrom <= graphTo ? graphFrom : graphTo;
+    const to = graphFrom <= graphTo ? graphTo : graphFrom;
+    return allHistoryMonths.filter((m) => m >= from && m <= to);
+  }, [allHistoryMonths, graphFrom, graphTo]);
+
+  function getSeriesValue(h: HistoryResp["history"][number], kind: "cold" | "hot" | "t1" | "t2") {
+    const t = effectiveTariffForMonthForSelected(h.month);
+    if (graphMode === "tariff") {
+      if (kind === "cold") return t.cold ?? null;
+      if (kind === "hot") return t.hot ?? null;
+      if (kind === "t1") return t.e1 ?? null;
+      return t.e2 ?? null;
+    }
+    if (graphMode === "reading") {
+      if (kind === "cold") return h?.meters?.cold?.current ?? null;
+      if (kind === "hot") return h?.meters?.hot?.current ?? null;
+      if (kind === "t1") return h?.meters?.electric?.t1?.current ?? null;
+      return h?.meters?.electric?.t2?.current ?? null;
+    }
+    // rub
+    if (kind === "cold") {
+      const d = h?.meters?.cold?.delta ?? null;
+      return d == null ? null : d * (t.cold || 0);
+    }
+    if (kind === "hot") {
+      const d = h?.meters?.hot?.delta ?? null;
+      return d == null ? null : d * (t.hot || 0);
+    }
+    if (kind === "t1") {
+      const d = h?.meters?.electric?.t1?.delta ?? null;
+      return d == null ? null : d * (t.e1 || 0);
+    }
+    const d = h?.meters?.electric?.t2?.delta ?? null;
+    return d == null ? null : d * (t.e2 || 0);
+  }
+
+  const graphData = useMemo(() => {
+    const byMonth = new Map((history ?? []).map((h) => [h.month, h]));
+    const items = graphMonths.map((m) => {
+      const h = byMonth.get(m);
+      return {
+        month: m,
+        cold: h ? getSeriesValue(h, "cold") : null,
+        hot: h ? getSeriesValue(h, "hot") : null,
+        t1: h ? getSeriesValue(h, "t1") : null,
+        t2: h ? getSeriesValue(h, "t2") : null,
+      };
+    });
+    return items;
+  }, [graphMonths, history, graphMode]);
+
+  async function openMeterPhoto(month: string, meterType: string, meterIndex: number) {
+    if (!selectedId) return;
+    try {
+      setErr(null);
+      setPhotoLoading(true);
+      setPhotoTitle(`${month} · ${meterType.toUpperCase()}${meterType === "electric" ? ` ${meterIndex}` : ""}`);
+      const res = await fetch(
+        `/api/admin/ui/apartments/${selectedId}/photo?ym=${encodeURIComponent(month)}&meter_type=${encodeURIComponent(meterType)}&meter_index=${encodeURIComponent(String(meterIndex))}`
+      );
+      if (!res.ok) throw new Error(`Фото не найдено`);
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      setPhotoUrl((prev) => {
+        if (prev) URL.revokeObjectURL(prev);
+        return url;
+      });
+      setPhotoOpen(true);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    } finally {
+      setPhotoLoading(false);
+    }
+  }
+
+  function setGraphRangeByCount(count: number) {
+    if (!allHistoryMonths.length) return;
+    if (count <= 0) {
+      setGraphFrom(allHistoryMonths[0]);
+      setGraphTo(allHistoryMonths[allHistoryMonths.length - 1]);
+      return;
+    }
+    const to = allHistoryMonths[allHistoryMonths.length - 1];
+    const from = allHistoryMonths[Math.max(0, allHistoryMonths.length - count)];
+    setGraphFrom(from);
+    setGraphTo(to);
+  }
+
+  function renderGraph() {
+    const width = 1000;
+    const height = 280;
+    const padL = 48;
+    const padR = 18;
+    const padT = 16;
+    const padB = 34;
+
+    const seriesKeys: Array<keyof typeof graphSeries> = ["cold", "hot", "t1", "t2"];
+    const activeKeys = seriesKeys.filter((k) => graphSeries[k]);
+    const values: number[] = [];
+    for (const row of graphData) {
+      for (const k of activeKeys) {
+        const v = row[k];
+        if (v != null && Number.isFinite(v)) values.push(Number(v));
+      }
+    }
+    const maxValRaw = values.length ? Math.max(...values) : 1;
+    const maxVal = Math.max(1, maxValRaw * 1.15);
+
+    const xStep = graphData.length > 1 ? (width - padL - padR) / (graphData.length - 1) : 1;
+    const yScale = (height - padT - padB) / maxVal;
+
+    function y(v: number) {
+      return height - padB - v * yScale;
+    }
+
+    function linePoints(key: keyof typeof graphSeries) {
+      return graphData
+        .map((row, i) => {
+          const v = row[key];
+          if (v == null || !Number.isFinite(v)) return null;
+          return `${padL + i * xStep},${y(Number(v))}`;
+        })
+        .filter(Boolean)
+        .join(" ");
+    }
+
+    const colors: Record<string, string> = {
+      cold: "#2563eb",
+      hot: "#ef4444",
+      t1: "#111827",
+      t2: "#16a34a",
+    };
+
+    return (
+      <div style={{ position: "relative" }}>
+        <svg
+          viewBox={`0 0 ${width} ${height}`}
+          style={{ width: "100%", height: 280, display: "block" }}
+          onMouseMove={(e) => {
+            const rect = (e.currentTarget as any).getBoundingClientRect();
+            const x = e.clientX - rect.left;
+            const i = Math.round((x - padL) / xStep);
+            if (i < 0 || i >= graphData.length) {
+              setGraphHover(null);
+              return;
+            }
+            const cx = padL + i * xStep;
+            setGraphHover({ index: i, x: cx, y: padT });
+          }}
+          onMouseLeave={() => setGraphHover(null)}
+        >
+          {[0, 0.33, 0.66, 1].map((t) => {
+            const val = maxVal * t;
+            const yy = y(val);
+            return (
+              <g key={t}>
+                <line x1={padL} y1={yy} x2={width - padR} y2={yy} stroke="#f1f5f9" />
+                <text x={8} y={yy + 4} fontSize={10} fill="#9ca3af">
+                  {Math.round(val).toLocaleString()}
+                </text>
+              </g>
+            );
+          })}
+          <line x1={padL} y1={height - padB} x2={width - padR} y2={height - padB} stroke="#e5e7eb" />
+          <line x1={padL} y1={padT} x2={padL} y2={height - padB} stroke="#e5e7eb" />
+
+          {activeKeys.map((k) => {
+            const pts = linePoints(k);
+            if (!pts) return null;
+            return <polyline key={k} fill="none" stroke={colors[k]} strokeWidth={2.5} points={pts} />;
+          })}
+
+          {activeKeys.map((k) =>
+            graphData.map((row, i) => {
+              const v = row[k];
+              if (v == null || !Number.isFinite(v)) return null;
+              return (
+                <circle
+                  key={`${k}-${row.month}`}
+                  cx={padL + i * xStep}
+                  cy={y(Number(v))}
+                  r={3}
+                  fill={colors[k]}
+                  stroke="#fff"
+                  strokeWidth={1}
+                />
+              );
+            })
+          )}
+
+          {graphHover ? (
+            <line
+              x1={graphHover.x}
+              y1={padT}
+              x2={graphHover.x}
+              y2={height - padB}
+              stroke="#e5e7eb"
+              strokeDasharray="4 4"
+            />
+          ) : null}
+        </svg>
+
+        {graphHover ? (
+          <div
+            style={{
+              position: "absolute",
+              left: Math.min(Math.max(graphHover.x + 12, 8), 740),
+              top: 8,
+              background: "white",
+              border: "1px solid #e5e7eb",
+              borderRadius: 10,
+              padding: "8px 10px",
+              boxShadow: "0 10px 24px rgba(0,0,0,0.12)",
+              fontSize: 12,
+              minWidth: 180,
+            }}
+          >
+            <div style={{ fontWeight: 800, marginBottom: 6 }}>{graphData[graphHover.index]?.month}</div>
+            {activeKeys.map((k) => (
+              <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                <span style={{ color: colors[k] }}>{k.toUpperCase()}</span>
+                <span>
+                  {graphData[graphHover.index]?.[k] == null ? "—" : fmtRub(Number(graphData[graphHover.index]?.[k]))}
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+
+        <div style={{ display: "flex", gap: 16, marginTop: 8, flexWrap: "wrap", fontSize: 12, color: "#444" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            {activeKeys.map((k) => (
+              <div key={k} style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                <span style={{ width: 10, height: 10, borderRadius: 999, background: colors[k], display: "inline-block" }} />
+                <span>{k.toUpperCase()}</span>
+              </div>
+            ))}
+          </div>
+          {graphData.map((row) => row.month).slice(0, 6).map((m) => (
+            <div key={m}>{m}</div>
+          ))}
+          {graphData.length > 6 ? <div>…</div> : null}
+        </div>
+      </div>
+    );
+  }
+
+  function exportHistoryXlsx() {
+    const rows = (history ?? []).slice().sort((a, b) => String(a.month).localeCompare(String(b.month)));
+    const data: Array<Record<string, any>> = [];
+    for (const h of rows) {
+      const cold = h?.meters?.cold?.current ?? null;
+      const hot = h?.meters?.hot?.current ?? null;
+      const t1 = h?.meters?.electric?.t1?.current ?? null;
+      const t2 = h?.meters?.electric?.t2?.current ?? null;
+      const t3 = h?.meters?.electric?.t3?.current ?? null;
+      const sewer = h?.meters?.sewer?.current ?? null;
+
+      const dc = h?.meters?.cold?.delta ?? null;
+      const dh = h?.meters?.hot?.delta ?? null;
+      const de1 = h?.meters?.electric?.t1?.delta ?? null;
+      const de2 = h?.meters?.electric?.t2?.delta ?? null;
+      const de3 = h?.meters?.electric?.t3?.delta ?? null;
+      const ds = calcSewerDelta(h as any);
+      const tariff = effectiveTariffForMonthForSelected(h.month);
+      const rc = dc == null ? null : dc * (tariff.cold || 0);
+      const rh = dh == null ? null : dh * (tariff.hot || 0);
+      const re1 = de1 == null ? null : de1 * (tariff.e1 || 0);
+      const re2 = de2 == null ? null : de2 * (tariff.e2 || 0);
+      const rs = ds == null ? null : ds * (tariff.sewer || 0);
+      const sum = calcSumRub(rc, rh, re1, re2, rs);
+
+      data.push({
+        "Месяц": h.month,
+        "ХВС (показание)": cold,
+        "ХВС Δ": dc,
+        "ХВС ₽": rc,
+        "ГВС (показание)": hot,
+        "ГВС Δ": dh,
+        "ГВС ₽": rh,
+        "T1 (показание)": t1,
+        "T1 Δ": de1,
+        "T1 ₽": re1,
+        "T2 (показание)": t2,
+        "T2 Δ": de2,
+        "T2 ₽": re2,
+        "T3 (показание)": t3,
+        "T3 Δ": de3,
+        "Водоотведение (показание)": sewer,
+        "Водоотведение Δ": ds,
+        "Водоотведение ₽": rs,
+        "Сумма ₽": sum,
+      });
+    }
+
+    const ws = XLSX.utils.json_to_sheet(data, {
+      header: [
+        "Месяц",
+        "ХВС (показание)",
+        "ХВС Δ",
+        "ХВС ₽",
+        "ГВС (показание)",
+        "ГВС Δ",
+        "ГВС ₽",
+        "T1 (показание)",
+        "T1 Δ",
+        "T1 ₽",
+        "T2 (показание)",
+        "T2 Δ",
+        "T2 ₽",
+        "T3 (показание)",
+        "T3 Δ",
+        "Водоотведение (показание)",
+        "Водоотведение Δ",
+        "Водоотведение ₽",
+        "Сумма ₽",
+      ],
+    });
+    const headerRow = 1;
+    const headerStyle = {
+      font: { bold: true, color: { rgb: "111111" } },
+      fill: { fgColor: { rgb: "EEF2F7" } },
+      alignment: { vertical: "center", horizontal: "center", wrapText: true },
+      border: {
+        top: { style: "thin", color: { rgb: "D1D5DB" } },
+        bottom: { style: "thin", color: { rgb: "D1D5DB" } },
+        left: { style: "thin", color: { rgb: "D1D5DB" } },
+        right: { style: "thin", color: { rgb: "D1D5DB" } },
+      },
+    } as any;
+    const bodyStyle = {
+      font: { color: { rgb: "111111" } },
+      alignment: { vertical: "center", horizontal: "center" },
+      fill: { fgColor: { rgb: "F8FAFC" } },
+      border: {
+        top: { style: "thin", color: { rgb: "E5E7EB" } },
+        bottom: { style: "thin", color: { rgb: "E5E7EB" } },
+        left: { style: "thin", color: { rgb: "E5E7EB" } },
+        right: { style: "thin", color: { rgb: "E5E7EB" } },
+      },
+    } as any;
+
+    const range = XLSX.utils.decode_range(ws["!ref"] || "A1:A1");
+    for (let C = range.s.c; C <= range.e.c; C++) {
+      const cell = XLSX.utils.encode_cell({ r: headerRow - 1, c: C });
+      if (ws[cell]) ws[cell].s = headerStyle;
+    }
+
+    for (let R = range.s.r + 1; R <= range.e.r; R++) {
+      for (let C = range.s.c; C <= range.e.c; C++) {
+        const cell = XLSX.utils.encode_cell({ r: R, c: C });
+        if (ws[cell]) ws[cell].s = bodyStyle;
+      }
+    }
+
+    ws["!freeze"] = { xSplit: 0, ySplit: 1 };
+    ws["!cols"] = [
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 10 },
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 10 },
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 10 },
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 10 },
+      { wch: 10 },
+      { wch: 14 },
+      { wch: 10 },
+      { wch: 18 },
+      { wch: 12 },
+      { wch: 14 },
+      { wch: 12 },
+    ];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "История");
+    XLSX.writeFile(wb, `history_${selected?.title ?? "apartment"}.xlsx`);
+  }
   // сколько столбцов электро показывать (T1/T2/T3)
   const eN = Math.max(1, Math.min(3, Number((selected as any)?.electric_expected ?? 1) || 1));
 
@@ -1070,9 +1540,9 @@ export default function App() {
     const color = highlightMode === "review" ? "#b91c1c" : highlightMode === "missing" ? "#d97706" : "#111";
     return (
       <div style={{ display: "grid", gap: 2, lineHeight: 1.25 }}>
-        <div style={{ fontWeight: 900, color }}>{fmtNum(current, 3)}</div>
+        <div style={{ fontWeight: 900, color }}>{rubEnabled ? (rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`) : "₽ —"}</div>
+        <div style={{ color: "#111", fontSize: 12, fontWeight: 800 }}>{fmtNum(current, 3)}</div>
         <div style={{ color: "#666", fontSize: 12 }}>Δ {fmtNum(delta, 3)}</div>
-        <div style={{ color: "#111", fontSize: 12, fontWeight: 800 }}>{rubEnabled ? (rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`) : "₽ —"}</div>
         <div style={{ color: "#777", fontSize: 11 }}>тариф: {tariff == null ? "—" : fmtNum(tariff, 3)}</div>
       </div>
     );
@@ -1087,7 +1557,7 @@ export default function App() {
   // Для карточек вверху (последний месяц)
   const latestTariff = useMemo(() => (latestMonth ? effectiveTariffForMonth(latestMonth) : null), [latestMonth, tariffs]);
   const latestRowComputed = useMemo(() => {
-    if (!latest || !latestTariff) return { sum: null };
+    if (!latest || !latestTariff) return { water: null, electric: null, sum: null };
     const h = latest as any;
 
     const dc = h?.meters?.cold?.delta ?? null;
@@ -1109,8 +1579,10 @@ export default function App() {
       (eN < 2 || h?.meters?.electric?.t2?.current != null) &&
       (eN < 3 || h?.meters?.electric?.t3?.current != null);
 
+    const water = isComplete ? calcSumRub(rc, rh, rs, null, null) : null;
+    const electric = isComplete ? calcSumRub(re1, re2, null, null, null) : null;
     const sum = isComplete ? calcSumRub(rc, rh, re1, re2, rs) : null;
-    return { sum };
+    return { water, electric, sum };
 
   }, [latest, latestTariff]);
 
@@ -1119,7 +1591,9 @@ export default function App() {
     onToggle?: () => void,
     readOnly: boolean = false
   ) {
-    const bg = checked ? "#0A84FF" : "#C9972B";
+    const lamp = checked
+      ? { base: "#D9FF3F", glow: "rgba(217,255,63,0.65)" } // желтый (ok)
+      : { base: "#FF2D8F", glow: "rgba(255,45,143,0.65)" }; // розовый (плохо)
     return (
       <button
         type="button"
@@ -1128,27 +1602,28 @@ export default function App() {
           if (!readOnly && onToggle) onToggle();
         }}
         style={{
-          width: 42,
+          width: 24,
           height: 24,
-          borderRadius: 999,
-          border: "none",
-          padding: 2,
-          background: bg,
-          display: "flex",
-          alignItems: "center",
-          justifyContent: checked ? "flex-end" : "flex-start",
+          borderRadius: "50%",
+          border: "1px solid rgba(0,0,0,0.06)",
+          padding: 0,
+          background: "transparent",
+          display: "grid",
+          placeItems: "center",
           cursor: readOnly ? "default" : "pointer",
           opacity: readOnly ? 0.9 : 1,
           transition: "all 160ms ease",
         }}
+        aria-label={checked ? "Ок" : "Проблема"}
+        title={checked ? "Ок" : "Проблема"}
       >
         <span
           style={{
-            width: 20,
-            height: 20,
+            width: 14,
+            height: 14,
             borderRadius: "50%",
-            background: "white",
-            boxShadow: "0 1px 3px rgba(0,0,0,0.25)",
+            background: lamp.base,
+            boxShadow: `0 0 0 2px rgba(255,255,255,0.9), 0 0 10px ${lamp.glow}, 0 0 18px ${lamp.glow}`,
           }}
         />
       </button>
@@ -1390,9 +1865,17 @@ export default function App() {
       ) : null}
 
       {tab === "apartments" ? (
-        <div style={{ marginTop: 16, display: "grid", gridTemplateColumns: "320px 1fr", gap: 16, alignItems: "start" }}>
+        <div
+          style={{
+            marginTop: 16,
+            display: "grid",
+            gridTemplateColumns: isMobile ? "1fr" : "320px 1fr",
+            gap: isMobile ? 12 : 16,
+            alignItems: "start",
+          }}
+        >
           {/* LEFT */}
-          <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+          <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, order: 0 }}>
             <div style={{ fontWeight: 900, marginBottom: 10 }}>Квартиры</div>
 
             {!apartments.length ? (
@@ -1450,13 +1933,9 @@ export default function App() {
           </div>
 
           {/* RIGHT */}
-          <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12 }}>
+          <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 12, order: isMobile ? 1 : 0 }}>
             <div style={{ fontWeight: 900, marginBottom: 8 }}>Показания (последние 4 месяца)</div>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-              <div style={{ color: "#666", fontSize: 13 }}>
-                В каждой ячейке: текущее / Δ / ₽ / тариф. Следующий месяц добавлен автоматически — можно сразу редактировать.
-              </div>
-              
+            <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", marginBottom: 10 }}>
               <div style={{ display: "flex", gap: 8 }}>
                 <button
                   disabled={!selected}
@@ -1493,6 +1972,44 @@ export default function App() {
                 >
                   Инфо
                 </button>
+
+                <button
+                  disabled={!selected}
+                  onClick={() => selected && setHistoryOpen(true)}
+                  style={{
+                    padding: "8px 10px",
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "white",
+                    cursor: selected ? "pointer" : "not-allowed",
+                    fontWeight: 800,
+                    opacity: selected ? 1 : 0.5,
+                  }}
+                >
+                  История
+                </button>
+
+                <button
+                  disabled={!selected}
+                  onClick={() => setShowGraph((v) => !v)}
+                  style={{
+                    width: 36,
+                    height: 36,
+                    borderRadius: 10,
+                    border: "1px solid #ddd",
+                    background: "white",
+                    cursor: selected ? "pointer" : "not-allowed",
+                    display: "grid",
+                    placeItems: "center",
+                    opacity: selected ? 1 : 0.5,
+                  }}
+                  title="График"
+                >
+                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#111" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 3v18h18" />
+                    <path d="M6 15l4-4 3 3 5-6" />
+                  </svg>
+                </button>
               </div>
             </div>
 
@@ -1504,48 +2021,133 @@ export default function App() {
               <div style={{ color: "#666" }}>Пока нет показаний по этой квартире.</div>
             ) : (
               <>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10 }}>
-                  <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 10 }}>
+                <div
+                  style={{
+                    border: "1px solid #eee",
+                    borderRadius: 12,
+                    padding: 12,
+                    display: "grid",
+                    gridTemplateColumns: "1.2fr 1fr 1fr 1fr",
+                    gap: 16,
+                    alignItems: "center",
+                  }}
+                >
+                  <div>
                     <div style={{ fontWeight: 800 }}>Месяц</div>
                     <div style={{ fontSize: 18 }}>{latestMonth}</div>
                   </div>
-
-                  <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 10 }}>
-                    <div style={{ fontWeight: 800 }}>ХВС</div>
-                    <div style={{ fontSize: 18 }}>{fmt(latestMeters?.cold?.current)}</div>
+                  <div>
+                    <div style={{ fontWeight: 800 }}>Вода (₽)</div>
+                    <div style={{ fontSize: 18, fontWeight: 900 }}>
+                      {latestRowComputed.water == null ? "—" : `₽ ${fmtRub(latestRowComputed.water)}`}
+                    </div>
                   </div>
-
-                  <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 10 }}>
-                    <div style={{ fontWeight: 800 }}>ГВС</div>
-                    <div style={{ fontSize: 18 }}>{fmt(latestMeters?.hot?.current)}</div>
+                  <div>
+                    <div style={{ fontWeight: 800 }}>Электро (₽)</div>
+                    <div style={{ fontSize: 18, fontWeight: 900 }}>
+                      {latestRowComputed.electric == null ? "—" : `₽ ${fmtRub(latestRowComputed.electric)}`}
+                    </div>
                   </div>
-
-                  <div style={{ border: "1px solid #eee", borderRadius: 12, padding: 10 }}>
+                  <div>
                     <div style={{ fontWeight: 800 }}>Сумма (₽)</div>
-                    <div style={{ fontSize: 18, fontWeight: 900 }}>{latestRowComputed.sum == null ? "—" : `₽ ${fmtRub(latestRowComputed.sum)}`}</div>
-                    <div style={{ color: "#777", fontSize: 11 }}>Считаем: ХВС + ГВС + T1 + T2 + Водоотв</div>
+                    <div style={{ fontSize: 18, fontWeight: 900 }}>
+                      {latestRowComputed.sum == null ? "—" : `₽ ${fmtRub(latestRowComputed.sum)}`}
+                    </div>
                   </div>
                 </div>
 
                 <div style={{ marginTop: 12 }}>
-                  <MetersTable
-                    rows={last4}
-                    eN={eN}
-                    effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
-                    calcSewerDelta={calcSewerDelta}
-                    calcElectricT3Fallback={calcElectricT3Fallback}
-                    cellTriplet={cellTriplet}
-                    calcSumRub={calcSumRub}
-                    fmtRub={fmtRub}
-                    openEdit={openEdit}
-                    getReviewFlag={getReviewFlag}
-                    onResolveReviewFlag={resolveReviewFlag}
-                    notificationHighlight={notifHighlight}
-                  />
+                  {showGraph ? (
+                    <div>
+                      <div style={{ display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap", marginBottom: 12 }}>
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <button
+                            onClick={() => setGraphMode("rub")}
+                            style={{ padding: "6px 8px", borderRadius: 8, border: graphMode === "rub" ? "2px solid #111" : "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}
+                          >
+                            ₽
+                          </button>
+                          <button
+                            onClick={() => setGraphMode("reading")}
+                            style={{ padding: "6px 8px", borderRadius: 8, border: graphMode === "reading" ? "2px solid #111" : "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}
+                          >
+                            Показания
+                          </button>
+                          <button
+                            onClick={() => setGraphMode("tariff")}
+                            style={{ padding: "6px 8px", borderRadius: 8, border: graphMode === "tariff" ? "2px solid #111" : "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}
+                          >
+                            Тарифы
+                          </button>
+                        </div>
 
-                  <div style={{ marginTop: 8, color: "#666", fontSize: 12 }}>
-                    Пояснение: ₽ = Δ × тариф месяца. Водоотведение: если sewer.delta пустой — считаем как Δ(ХВС)+Δ(ГВС). Электро: тарифицируем только T1 и T2. T3 (итого) — без тарифа (инфо).
-                  </div>
+                        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <input type="checkbox" checked={graphSeries.cold} onChange={(e) => setGraphSeries((s) => ({ ...s, cold: e.target.checked }))} />
+                          ХВС
+                        </label>
+                        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <input type="checkbox" checked={graphSeries.hot} onChange={(e) => setGraphSeries((s) => ({ ...s, hot: e.target.checked }))} />
+                          ГВС
+                        </label>
+                        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <input type="checkbox" checked={graphSeries.t1} onChange={(e) => setGraphSeries((s) => ({ ...s, t1: e.target.checked }))} />
+                          T1
+                        </label>
+                        <label style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <input type="checkbox" checked={graphSeries.t2} onChange={(e) => setGraphSeries((s) => ({ ...s, t2: e.target.checked }))} />
+                          T2
+                        </label>
+
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <button onClick={() => setGraphRangeByCount(3)} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}>
+                            3м
+                          </button>
+                          <button onClick={() => setGraphRangeByCount(6)} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}>
+                            6м
+                          </button>
+                          <button onClick={() => setGraphRangeByCount(12)} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}>
+                            12м
+                          </button>
+                          <button onClick={() => setGraphRangeByCount(0)} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 700 }}>
+                            Все
+                          </button>
+                        </div>
+
+                        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+                          <span style={{ color: "#666" }}>c</span>
+                          <select value={graphFrom} onChange={(e) => setGraphFrom(e.target.value)} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd" }}>
+                            {allHistoryMonths.map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                          </select>
+                          <span style={{ color: "#666" }}>по</span>
+                          <select value={graphTo} onChange={(e) => setGraphTo(e.target.value)} style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd" }}>
+                            {allHistoryMonths.map((m) => (
+                              <option key={m} value={m}>{m}</option>
+                            ))}
+                          </select>
+                        </div>
+                      </div>
+
+                      {renderGraph()}
+                    </div>
+                  ) : (
+                    <MetersTable
+                      rows={last4}
+                      eN={eN}
+                      effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
+                      calcSewerDelta={calcSewerDelta}
+                      calcElectricT3Fallback={calcElectricT3Fallback}
+                      cellTriplet={cellTriplet}
+                      calcSumRub={calcSumRub}
+                      fmtRub={fmtRub}
+                      openEdit={openEdit}
+                      getReviewFlag={getReviewFlag}
+                      onResolveReviewFlag={resolveReviewFlag}
+                      notificationHighlight={notifHighlight}
+                      onCellPhoto={openMeterPhoto}
+                    />
+                  )}
                 </div>
               </>
             )}
@@ -1825,6 +2427,134 @@ export default function App() {
                   Сохранить
                 </button>
               </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {historyOpen && selected && (
+        <div
+          onClick={() => setHistoryOpen(false)}
+          style={{
+            position: "fixed",
+            inset: 0,
+            background: "rgba(0,0,0,0.35)",
+            display: "grid",
+            placeItems: "center",
+            padding: 16,
+            zIndex: 60,
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 1100,
+              maxWidth: "96vw",
+              maxHeight: "92vh",
+              overflow: "auto",
+              background: "white",
+              borderRadius: 16,
+              padding: 16,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 12 }}>
+              <div style={{ fontWeight: 900, fontSize: 18 }}>История показаний</div>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button
+                  onClick={() => exportHistoryXlsx()}
+                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}
+                >
+                  Выгрузить Excel
+                </button>
+                <button
+                  onClick={() => setHistoryOpen(false)}
+                  style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800 }}
+                >
+                  Закрыть
+                </button>
+              </div>
+            </div>
+
+            <MetersTable
+              rows={historyWithFuture.slice().reverse()}
+              eN={eN}
+              effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
+              calcSewerDelta={calcSewerDelta}
+              calcElectricT3Fallback={calcElectricT3Fallback}
+              cellTriplet={cellTriplet}
+              calcSumRub={calcSumRub}
+              fmtRub={fmtRub}
+              openEdit={openEdit}
+              getReviewFlag={getReviewFlag}
+              onResolveReviewFlag={resolveReviewFlag}
+              notificationHighlight={notifHighlight}
+              onCellPhoto={openMeterPhoto}
+            />
+          </div>
+        </div>
+      )}
+
+      {photoOpen && (
+        <div
+          onMouseMove={(e) => {
+            if (!photoDrag.active) return;
+            setPhotoPos({ x: e.clientX - photoDrag.dx, y: e.clientY - photoDrag.dy });
+          }}
+          onMouseUp={() => setPhotoDrag({ active: false, dx: 0, dy: 0 })}
+          style={{
+            position: "fixed",
+            inset: 0,
+            zIndex: 80,
+            pointerEvents: "auto",
+          }}
+        >
+          <div
+            style={{
+              position: "absolute",
+              left: photoPos.x,
+              top: photoPos.y,
+              width: 520,
+              maxWidth: "90vw",
+              background: "white",
+              borderRadius: 12,
+              boxShadow: "0 20px 50px rgba(0,0,0,0.25)",
+              border: "1px solid #e5e7eb",
+            }}
+          >
+            <div
+              onMouseDown={(e) => {
+                setPhotoDrag({ active: true, dx: e.clientX - photoPos.x, dy: e.clientY - photoPos.y });
+              }}
+              style={{
+                padding: "8px 10px",
+                borderBottom: "1px solid #e5e7eb",
+                cursor: "move",
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                fontWeight: 800,
+              }}
+            >
+              <div>{photoTitle || "Фото"}</div>
+              <button
+                onClick={() => {
+                  if (photoUrl) URL.revokeObjectURL(photoUrl);
+                  setPhotoUrl("");
+                  setPhotoOpen(false);
+                }}
+                style={{ border: "1px solid #e5e7eb", background: "white", borderRadius: 8, padding: "4px 8px", cursor: "pointer" }}
+              >
+                Закрыть
+              </button>
+            </div>
+            <div style={{ padding: 10, textAlign: "center" }}>
+              {photoLoading ? (
+                <div style={{ color: "#666" }}>Загрузка...</div>
+              ) : photoUrl ? (
+                <img src={photoUrl} alt="meter" style={{ maxWidth: "100%", borderRadius: 8 }} />
+              ) : (
+                <div style={{ color: "#666" }}>Фото не найдено</div>
+              )}
             </div>
           </div>
         </div>

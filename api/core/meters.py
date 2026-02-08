@@ -220,6 +220,60 @@ def _write_water_ocr_with_uncertainty(
     return str(kind)
 
 
+def _normalize_water_after_manual(conn, apartment_id: int, ym: str) -> None:
+    """After manual edits, normalize water readings:
+    - min -> hot, max -> cold
+    - preserve source/ocr_value per value
+    """
+    ym = (str(ym).strip() or month_now())
+    rows = conn.execute(
+        text(
+            """
+            SELECT meter_type, value, source, ocr_value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type IN ('cold','hot') AND meter_index=1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+
+    items = []
+    for mt, v, src, ocrv in (rows or []):
+        if v is None:
+            continue
+        items.append({"meter_type": str(mt), "value": float(v), "source": str(src or "manual"), "ocr_value": ocrv})
+
+    if len(items) < 2:
+        return
+
+    items_sorted = sorted(items, key=lambda x: x["value"])
+    hot_item = items_sorted[0]
+    cold_item = items_sorted[-1]
+
+    for target_mt, it in (("hot", hot_item), ("cold", cold_item)):
+        conn.execute(
+            text(
+                """
+                INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+                VALUES(:aid,:ym,:mt,1,:val,:src,:ocr)
+                ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET
+                  value=EXCLUDED.value,
+                  source=EXCLUDED.source,
+                  ocr_value=EXCLUDED.ocr_value,
+                  updated_at=now()
+                """
+            ),
+            {
+                "aid": int(apartment_id),
+                "ym": str(ym),
+                "mt": str(target_mt),
+                "val": float(it["value"]),
+                "src": str(it["source"] or "manual"),
+                "ocr": (float(it["ocr_value"]) if it["ocr_value"] is not None else None),
+            },
+        )
+
+
 # -----------------------
 # INTERNAL DB helper (manual/ocr write into meter_readings)
 # -----------------------
@@ -502,6 +556,84 @@ def _normalize_electric_expected3(conn, apartment_id: int, ym: str) -> None:
     )
 
 
+def _normalize_electric_expected2(conn, apartment_id: int, ym: str) -> None:
+    """Normalize electric readings for expected=2:
+    - if 2 values: idx2=min, idx1=max
+    - if 1 value: idx1=value, idx2 removed
+    - if 3 values: keep min/max as idx2/idx1, drop the middle
+    """
+    ym = (str(ym).strip() or month_now())
+    rows = conn.execute(
+        text(
+            "SELECT meter_index, value, source, ocr_value "
+            "FROM meter_readings "
+            "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)"
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+
+    items = []
+    for mi, v, src, ocrv in (rows or []):
+        if v is None:
+            continue
+        items.append({"value": float(v), "source": (src or "manual"), "ocr_value": ocrv})
+
+    if not items:
+        return
+
+    items_sorted = sorted(items, key=lambda x: x["value"])
+    if len(items_sorted) == 1:
+        it_min = items_sorted[0]
+        conn.execute(
+            text(
+                "DELETE FROM meter_readings "
+                "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)"
+            ),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        )
+        conn.execute(
+            text(
+                "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+                "VALUES(:aid,:ym,'electric',1,:val,:src,:ocr) "
+                "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+                " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+            ),
+            {"aid": int(apartment_id), "ym": str(ym), "val": float(it_min["value"]), "src": str(it_min["source"]), "ocr": it_min["ocr_value"]},
+        )
+        return
+
+    it_min = items_sorted[0]
+    it_max = items_sorted[-1]
+
+    conn.execute(
+        text(
+            "DELETE FROM meter_readings "
+            "WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)"
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    )
+
+    conn.execute(
+        text(
+            "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+            "VALUES(:aid,:ym,'electric',2,:val,:src,:ocr) "
+            "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+            " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "val": float(it_min["value"]), "src": str(it_min["source"]), "ocr": it_min["ocr_value"]},
+    )
+
+    conn.execute(
+        text(
+            "INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value) "
+            "VALUES(:aid,:ym,'electric',1,:val,:src,:ocr) "
+            "ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET "
+            " value=EXCLUDED.value, source=EXCLUDED.source, ocr_value=EXCLUDED.ocr_value, updated_at=now()"
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "val": float(it_max["value"]), "src": str(it_max["source"]), "ocr": it_max["ocr_value"]},
+    )
+
+
 def _write_electric_overwrite_then_sort(conn, apartment_id: int, ym: str, meter_index: int, new_value: float, *, source: str = "manual") -> int:
     """Overwrite the specified slot; for expected=3 auto-fill T3 from T1+T2 when T3 is not OCR."""
     try:
@@ -521,6 +653,12 @@ def _write_electric_overwrite_then_sort(conn, apartment_id: int, ym: str, meter_
         ),
         {"aid": int(apartment_id), "ym": str(ym), "idx": int(meter_index), "val": float(new_value), "src": str(source), "ocr": float(new_value)},
     )
+
+    if int(expected) == 2:
+        _normalize_electric_expected2(conn, int(apartment_id), str(ym))
+
+    if int(expected) == 3:
+        _normalize_electric_expected3(conn, int(apartment_id), str(ym))
 
     if int(expected) == 3 and int(meter_index) in (1, 2):
         _auto_fill_t3_from_t1_t2_if_needed(conn, int(apartment_id), str(ym))

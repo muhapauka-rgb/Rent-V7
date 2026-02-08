@@ -1,8 +1,10 @@
 from typing import Optional, Dict, Any, List
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import Response
 from sqlalchemy import text
 import threading
 import subprocess
+import mimetypes
 
 from core.config import engine
 from core.db import db_ready, ensure_tables
@@ -24,8 +26,8 @@ from core.billing import (
     _set_month_extra_state,
     is_ym,
 )
-from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort, _auto_fill_t3_from_t1_t2_if_needed
-from core.integrations import _tg_send_message
+from core.meters import _add_meter_reading_db, _write_electric_overwrite_then_sort, _auto_fill_t3_from_t1_t2_if_needed, _normalize_water_after_manual
+from core.integrations import _tg_send_message, ydisk_get
 from core.schemas import (
     UIContacts,
     UIStatuses,
@@ -208,7 +210,11 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
     if has_telegram:
         _set_contact(apartment_id, "telegram", body.telegram)
     if has_cold_serial:
-        params["cold_serial"] = _normalize_serial(body.cold_serial) or None
+        raw = body.cold_serial
+        norm = _normalize_serial(raw) or None
+        if raw is not None and str(raw).strip() != "" and not norm:
+            raise HTTPException(status_code=400, detail="invalid_cold_serial")
+        params["cold_serial"] = norm
         with engine.begin() as conn:
             conn.execute(
                 text("""
@@ -219,7 +225,11 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
                 {"id": int(apartment_id), "cold_serial": params["cold_serial"]},
             )
     if has_hot_serial:
-        params["hot_serial"] = _normalize_serial(body.hot_serial) or None
+        raw = body.hot_serial
+        norm = _normalize_serial(raw) or None
+        if raw is not None and str(raw).strip() != "" and not norm:
+            raise HTTPException(status_code=400, detail="invalid_hot_serial")
+        params["hot_serial"] = norm
         with engine.begin() as conn:
             conn.execute(
                 text("""
@@ -288,6 +298,74 @@ def ui_apartment_card(apartment_id: int):
         "contacts": {"phone": phone, "telegram": telegram},
         "chats": list(chats),
     }
+
+
+@router.get("/admin/ui/apartments/{apartment_id}/photo")
+def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index: int = 1):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    mt = str(meter_type or "").strip().lower()
+    if mt not in {"cold", "hot", "electric", "sewer"}:
+        raise HTTPException(status_code=400, detail="invalid_meter_type")
+    if not is_ym(ym):
+        raise HTTPException(status_code=400, detail="invalid_ym")
+    try:
+        mi = int(meter_index)
+    except Exception:
+        mi = 1
+    mi = max(1, min(3, mi))
+
+    with engine.begin() as conn:
+        val_row = conn.execute(
+            text(
+                "SELECT value FROM meter_readings "
+                "WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi "
+                "LIMIT 1"
+            ),
+            {"aid": int(apartment_id), "ym": str(ym), "mt": str(mt), "mi": int(mi)},
+        ).fetchone()
+        cur_val = float(val_row[0]) if val_row and val_row[0] is not None else None
+
+        ydisk_path = None
+        if cur_val is not None:
+            row = conn.execute(
+                text(
+                    "SELECT ydisk_path FROM photo_events "
+                    "WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi "
+                    "AND meter_written=true AND meter_value=:val "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "mk": str(mt), "mi": int(mi), "val": float(cur_val)},
+            ).fetchone()
+            if row and row[0]:
+                ydisk_path = row[0]
+
+        if not ydisk_path:
+            row = conn.execute(
+                text(
+                    "SELECT ydisk_path FROM photo_events "
+                    "WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi "
+                    "AND meter_written=true "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "mk": str(mt), "mi": int(mi)},
+            ).fetchone()
+            if row and row[0]:
+                ydisk_path = row[0]
+
+    if not ydisk_path:
+        raise HTTPException(status_code=404, detail="photo_not_found")
+
+    try:
+        content = ydisk_get(str(ydisk_path))
+    except Exception:
+        raise HTTPException(status_code=404, detail="ydisk_get_failed")
+
+    content_type, _ = mimetypes.guess_type(str(ydisk_path))
+    if not content_type:
+        content_type = "image/jpeg"
+    return Response(content=content, media_type=content_type)
 
 
 @router.patch("/admin/ui/apartments/{apartment_id}/statuses")
@@ -678,36 +756,35 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
         if not updates:
             raise HTTPException(status_code=400, detail="no values to update")
 
-        for kind, mi, v in updates:
-            _add_meter_reading_db(
-                apartment_id=apartment_id,
-                ym=ym,
-                meter_type=kind,
-                meter_index=int(mi),
-                value=v,
-                source="manual",
-            )
-            try:
-                with engine.begin() as conn:
-                    capture_training_sample(
-                        conn,
-                        apartment_id=int(apartment_id),
-                        ym=str(ym),
-                        meter_type=str(kind),
-                        meter_index=int(mi),
-                        correct_value=float(v),
-                        source="admin_ui_bulk",
-                    )
-            except Exception:
-                pass
-
-        # For expected=3: after manual T1/T2 edits set T3=T1+T2
         try:
-            if any(k == "electric" for (k, _, _) in updates):
-                with engine.begin() as conn:
-                    expected = _get_apartment_electric_expected(conn, int(apartment_id))
-                    if int(expected) == 3:
-                        _auto_fill_t3_from_t1_t2_if_needed(conn, int(apartment_id), str(ym))
+            with engine.begin() as conn:
+                for kind, mi, v in updates:
+                    if kind == "electric":
+                        _write_electric_overwrite_then_sort(conn, int(apartment_id), str(ym), int(mi), float(v), source="manual")
+                    else:
+                        _add_meter_reading_db(
+                            apartment_id=apartment_id,
+                            ym=ym,
+                            meter_type=kind,
+                            meter_index=int(mi),
+                            value=v,
+                            source="manual",
+                        )
+                        if kind in ("cold", "hot"):
+                            _normalize_water_after_manual(conn, int(apartment_id), str(ym))
+
+                    try:
+                        capture_training_sample(
+                            conn,
+                            apartment_id=int(apartment_id),
+                            ym=str(ym),
+                            meter_type=str(kind),
+                            meter_index=int(mi),
+                            correct_value=float(v),
+                            source="admin_ui_bulk",
+                        )
+                    except Exception:
+                        pass
         except Exception:
             pass
 
@@ -762,14 +839,17 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
         with engine.begin() as conn:
             _write_electric_overwrite_then_sort(conn, int(apartment_id), str(month), int(meter_index), float(value_f), source="manual")
     else:
-        _add_meter_reading_db(
-            apartment_id=apartment_id,
-            ym=month,
-            meter_type=kind,
-            meter_index=int(meter_index),
-            value=value_f,
-            source="manual",
-        )
+        with engine.begin() as conn:
+            _add_meter_reading_db(
+                apartment_id=apartment_id,
+                ym=month,
+                meter_type=kind,
+                meter_index=int(meter_index),
+                value=value_f,
+                source="manual",
+            )
+            if kind in ("cold", "hot"):
+                _normalize_water_after_manual(conn, int(apartment_id), str(month))
 
     try:
         with engine.begin() as conn:
