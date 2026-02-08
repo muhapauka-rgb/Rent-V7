@@ -276,9 +276,69 @@
       </div>
 
       <div class="page" style="padding:0; margin-top:32px;">
+        <div class="title">Инфо по квартире (окно)</div>
+        <div class="panel">
+          <div class="badge">Контакты, заметка, серийники, статусы</div>
+          <div style="display:grid; grid-template-columns: 1fr 1fr; gap:12px; margin-top:12px;">
+            <div class="panel" style="box-shadow:none;">
+              <div class="title" style="font-size:16px;">Контакты</div>
+              <div style="color:var(--muted)">Телефон, Telegram, чат</div>
+            </div>
+            <div class="panel" style="box-shadow:none;">
+              <div class="title" style="font-size:16px;">Серийники</div>
+              <div style="color:var(--muted)">ХВС / ГВС</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="page" style="padding:0; margin-top:32px;">
+        <div class="title">Тарифы (окно)</div>
+        <div class="panel">
+          <div class="badge">Список тарифов по месяцам</div>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Месяц</th>
+                <th>ХВС</th>
+                <th>ГВС</th>
+                <th>Водоотв</th>
+                <th>T1</th>
+                <th>T2</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>2026-02</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div class="page" style="padding:0; margin-top:32px;">
+        <div class="title">История (окно)</div>
+        <div class="panel">
+          <div class="badge">Прокрутка списка месяцев + Экспорт Excel</div>
+          <div style="height:180px; overflow:auto; border:1px solid #eee; border-radius:12px; padding:12px;">
+            <div style="height:360px; color:var(--muted)">Список месяцев...</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="page" style="padding:0; margin-top:32px;">
+        <div class="title">Графики (страница)</div>
+        <div class="panel">
+          <div class="badge">Фильтры: тип данных / период / серии</div>
+          <div class="graph" style="height:260px;"></div>
+        </div>
+      </div>
+
+      <div class="page" style="padding:0; margin-top:32px;">
         <div class="title">Операции (вторая страница)</div>
         <div class="panel">
-          <div style="color:var(--muted)">Здесь блоки операций/уведомлений/лога</div>
+          <div class="badge">Логи, уведомления, действия администратора</div>
+          <div style="height:120px;"></div>
         </div>
       </div>
     </div>
