@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Rent Web · Canvas Design</title>
+    <style>
+      :root {
+        --bg: #ffffff;
+        --panel: #ffffff;
+        --border: #e6e6e6;
+        --text: #111111;
+        --muted: #666666;
+        --shadow: 0 10px 30px rgba(0,0,0,0.06);
+        --yellow: #d9ff3f;
+        --pink: #ff2d8f;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+      .page {
+        max-width: 1200px;
+        margin: 24px auto;
+        padding: 0 16px 48px;
+      }
+      .title {
+        font-size: 22px;
+        font-weight: 900;
+        margin: 0 0 12px;
+      }
+      .topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      .actions {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .btn {
+        background: #fff;
+        border: 1px solid #ddd;
+        border-radius: 12px;
+        padding: 8px 12px;
+        font-weight: 800;
+        cursor: pointer;
+      }
+      .icon-btn {
+        width: 38px;
+        height: 38px;
+        border-radius: 12px;
+        border: 1px solid #ddd;
+        display: grid;
+        place-items: center;
+        background: #fff;
+      }
+      .layout {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        gap: 16px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 16px;
+        padding: 12px;
+        box-shadow: var(--shadow);
+      }
+      .apartments {
+        display: grid;
+        gap: 12px;
+      }
+      .apt-card {
+        border-radius: 16px;
+        background: #f5f5f5;
+        padding: 12px;
+      }
+      .apt-title {
+        font-weight: 900;
+        font-size: 18px;
+      }
+      .apt-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 10px;
+        color: #444;
+      }
+      .lamp {
+        width: 18px;
+        height: 18px;
+        border-radius: 50%;
+        border: 1px solid rgba(0,0,0,0.08);
+        box-shadow: 0 0 10px rgba(0,0,0,0.1);
+      }
+      .lamp.ok {
+        background: var(--yellow);
+        box-shadow: 0 0 12px rgba(217,255,63,0.6);
+      }
+      .lamp.bad {
+        background: var(--pink);
+        box-shadow: 0 0 12px rgba(255,45,143,0.6);
+      }
+      .summary {
+        display: grid;
+        grid-template-columns: 1.2fr 1fr 1fr 1fr;
+        gap: 16px;
+        align-items: center;
+      }
+      .summary h4 {
+        margin: 0 0 6px;
+        font-size: 14px;
+        color: var(--muted);
+      }
+      .summary .value {
+        font-size: 20px;
+        font-weight: 900;
+      }
+      .table {
+        width: 100%;
+        border-collapse: collapse;
+        margin-top: 12px;
+      }
+      .table th, .table td {
+        text-align: left;
+        padding: 10px 8px;
+        border-bottom: 1px solid #eee;
+        vertical-align: top;
+      }
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        justify-content: flex-end;
+        margin-bottom: 8px;
+      }
+      .modal {
+        border: 1px dashed #bbb;
+        border-radius: 16px;
+        padding: 12px;
+        margin-top: 16px;
+      }
+      .modal-title {
+        font-weight: 900;
+        margin-bottom: 8px;
+      }
+      .badge {
+        font-size: 12px;
+        padding: 4px 8px;
+        border-radius: 999px;
+        background: #f3f3f3;
+        border: 1px solid #ddd;
+      }
+      .graph {
+        height: 200px;
+        border-radius: 12px;
+        border: 1px solid #e5e5e5;
+        background: linear-gradient(180deg, #fff, #f7f7f7);
+      }
+    </style>
+  </head>
+  <body>
+    <div class="page">
+      <div class="topbar">
+        <div class="title">Rent Web</div>
+        <div class="actions">
+          <button class="icon-btn">🔔</button>
+          <button class="btn">Квартиры</button>
+          <button class="btn">Операции</button>
+          <button class="btn">+ Квартира</button>
+          <button class="btn">Удалить</button>
+        </div>
+      </div>
+
+      <div class="layout">
+        <div class="panel">
+          <div class="title">Квартиры</div>
+          <div class="apartments">
+            <div class="apt-card">
+              <div class="apt-title">420</div>
+              <div class="apt-row"><span>Фото счетчиков</span><span class="lamp ok"></span></div>
+              <div class="apt-row"><span>Оплата аренды</span><span class="lamp bad"></span></div>
+              <div class="apt-row"><span>Оплата счетчиков</span><span class="lamp ok"></span></div>
+            </div>
+            <div class="apt-card">
+              <div class="apt-title">111</div>
+              <div class="apt-row"><span>Фото счетчиков</span><span class="lamp ok"></span></div>
+              <div class="apt-row"><span>Оплата аренды</span><span class="lamp bad"></span></div>
+              <div class="apt-row"><span>Оплата счетчиков</span><span class="lamp bad"></span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel">
+          <div class="summary">
+            <div>
+              <h4>Месяц</h4>
+              <div class="value">Февраль 2026</div>
+            </div>
+            <div>
+              <h4>Вода (₽)</h4>
+              <div class="value">—</div>
+            </div>
+            <div>
+              <h4>Электро (₽)</h4>
+              <div class="value">—</div>
+            </div>
+            <div>
+              <h4>Сумма (₽)</h4>
+              <div class="value">—</div>
+            </div>
+          </div>
+
+          <div class="toolbar" style="margin-top:12px;">
+            <button class="btn">Тарифы</button>
+            <button class="btn">Инфо</button>
+            <button class="btn">История</button>
+            <button class="icon-btn">📈</button>
+          </div>
+
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Месяц</th>
+                <th>ХВС</th>
+                <th>ГВС</th>
+                <th>Водоотв</th>
+                <th>T1</th>
+                <th>T2</th>
+                <th>Сумма</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td>2026-04</td>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+                <td>—</td>
+                <td><button class="btn">Редактировать</button></td>
+              </tr>
+              <tr>
+                <td>2026-03</td>
+                <td>20</td>
+                <td>10</td>
+                <td>—</td>
+                <td>1 459</td>
+                <td>800</td>
+                <td>₽ 5 099,11</td>
+                <td><button class="btn">Редактировать</button></td>
+              </tr>
+            </tbody>
+          </table>
+
+          <div class="modal">
+            <div class="modal-title">История (модальное окно)</div>
+            <div class="badge">Скролл / Экспорт Excel</div>
+            <div style="height:120px;"></div>
+          </div>
+
+          <div class="modal">
+            <div class="modal-title">Графики (модальное окно)</div>
+            <div class="badge">Фильтры и временной диапазон</div>
+            <div class="graph"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="page" style="padding:0; margin-top:32px;">
+        <div class="title">Операции (вторая страница)</div>
+        <div class="panel">
+          <div style="color:var(--muted)">Здесь блоки операций/уведомлений/лога</div>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>
