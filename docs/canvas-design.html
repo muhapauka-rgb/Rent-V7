@@ -177,8 +177,19 @@
           <button class="btn">Удалить</button>
         </div>
       </div>
+      <div class="panel" style="margin-bottom:16px;">
+        <div class="badge" style="margin-bottom:8px;">Навигация по макету</div>
+        <div class="toolbar" style="justify-content:flex-start; flex-wrap:wrap;">
+          <a class="btn" href="#screen-main">Главная</a>
+          <a class="btn" href="#screen-info">Инфо по квартире</a>
+          <a class="btn" href="#screen-tariffs">Тарифы</a>
+          <a class="btn" href="#screen-history">История</a>
+          <a class="btn" href="#screen-graphs">Графики</a>
+          <a class="btn" href="#screen-ops">Операции</a>
+        </div>
+      </div>
 
-      <div class="layout">
+      <div id="screen-main" class="layout">
         <div class="panel">
           <div class="title">Квартиры</div>
           <div class="apartments">
@@ -275,7 +286,7 @@
         </div>
       </div>
 
-      <div class="page" style="padding:0; margin-top:32px;">
+      <div id="screen-info" class="page" style="padding:0; margin-top:32px;">
         <div class="title">Инфо по квартире (окно)</div>
         <div class="panel">
           <div class="badge">Контакты, заметка, серийники, статусы</div>
@@ -292,7 +303,7 @@
         </div>
       </div>
 
-      <div class="page" style="padding:0; margin-top:32px;">
+      <div id="screen-tariffs" class="page" style="padding:0; margin-top:32px;">
         <div class="title">Тарифы (окно)</div>
         <div class="panel">
           <div class="badge">Список тарифов по месяцам</div>
@@ -316,7 +327,7 @@
         </div>
       </div>
 
-      <div class="page" style="padding:0; margin-top:32px;">
+      <div id="screen-history" class="page" style="padding:0; margin-top:32px;">
         <div class="title">История (окно)</div>
         <div class="panel">
           <div class="badge">Прокрутка списка месяцев + Экспорт Excel</div>
@@ -326,7 +337,7 @@
         </div>
       </div>
 
-      <div class="page" style="padding:0; margin-top:32px;">
+      <div id="screen-graphs" class="page" style="padding:0; margin-top:32px;">
         <div class="title">Графики (страница)</div>
         <div class="panel">
           <div class="badge">Фильтры: тип данных / период / серии</div>
@@ -334,7 +345,7 @@
         </div>
       </div>
 
-      <div class="page" style="padding:0; margin-top:32px;">
+      <div id="screen-ops" class="page" style="padding:0; margin-top:32px;">
         <div class="title">Операции (вторая страница)</div>
         <div class="panel">
           <div class="badge">Логи, уведомления, действия администратора</div>
