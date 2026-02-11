@@ -4,7 +4,7 @@ from sqlalchemy import text
 
 from core.config import engine
 from core.db import db_ready, ensure_tables
-from core.admin_helpers import norm_phone, bind_chat
+from core.admin_helpers import norm_phone, bind_chat, current_ym
 
 router = APIRouter()
 
@@ -265,6 +265,13 @@ def unbind_chat_admin(chat_id: str):
     ensure_tables()
 
     with engine.begin() as conn:
+        apartment_ids = [
+            int(r[0])
+            for r in conn.execute(
+                text("SELECT apartment_id FROM chat_bindings WHERE chat_id=:chat_id AND is_active=true"),
+                {"chat_id": str(chat_id)},
+            ).fetchall()
+        ]
         conn.execute(
             text("""
                 UPDATE chat_bindings
@@ -273,6 +280,20 @@ def unbind_chat_admin(chat_id: str):
             """),
             {"chat_id": str(chat_id)},
         )
+        for aid in apartment_ids:
+            conn.execute(
+                text("UPDATE apartments SET rent_monthly=0 WHERE id=:id"),
+                {"id": int(aid)},
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO apartment_tariffs (apartment_id, month_from, rent, updated_at)
+                    VALUES (:aid, :ym, 0, now())
+                    ON CONFLICT (apartment_id, month_from)
+                    DO UPDATE SET rent=0, updated_at=now()
+                """),
+                {"aid": int(aid), "ym": current_ym()},
+            )
     return {"ok": True, "chat_id": str(chat_id)}
 
 

@@ -24,6 +24,9 @@ class UIApartmentItem(BaseModel):
     electric_expected: Optional[int] = None
     cold_serial: Optional[str] = None
     hot_serial: Optional[str] = None
+    tenant_since: Optional[str] = None
+    rent_monthly: Optional[float] = None
+    has_active_chat: Optional[bool] = None
     contacts: Optional[UIContacts] = None
     statuses: Optional[UIStatuses] = None
 
@@ -50,6 +53,8 @@ class UIApartmentPatch(BaseModel):
     electric_expected: Optional[int] = None
     cold_serial: Optional[str] = None
     hot_serial: Optional[str] = None
+    tenant_since: Optional[str] = None
+    rent_monthly: Optional[float] = None
 
 
 class UIStatusesPatch(BaseModel):

@@ -71,6 +71,8 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS hot_serial TEXT NULL;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS cold_serial_source TEXT NULL;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS hot_serial_source TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS tenant_since DATE NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS rent_monthly NUMERIC(14,2) NOT NULL DEFAULT 0;"))
 
                     # --- tariffs ---
                     conn.execute(text("""
@@ -88,6 +90,31 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t1 NUMERIC(14,3) NULL;"))
                     conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t2 NUMERIC(14,3) NULL;"))
                     conn.execute(text("ALTER TABLE tariffs ADD COLUMN IF NOT EXISTS electric_t3 NUMERIC(14,3) NULL;"))
+
+                    # --- apartment_tariffs (per-apartment overrides) ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS apartment_tariffs (
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            month_from TEXT NOT NULL,  -- YYYY-MM
+                            cold NUMERIC(14,3) NULL,
+                            hot NUMERIC(14,3) NULL,
+                            sewer NUMERIC(14,3) NULL,
+                            electric_t1 NUMERIC(14,3) NULL,
+                            electric_t2 NUMERIC(14,3) NULL,
+                            electric_t3 NUMERIC(14,3) NULL,
+                            rent NUMERIC(14,2) NULL,
+                            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                            PRIMARY KEY (apartment_id, month_from)
+                        );
+                    """))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS cold NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS hot NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS sewer NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS electric_t1 NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS electric_t2 NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS electric_t3 NUMERIC(14,3) NULL;"))
+                    conn.execute(text("ALTER TABLE apartment_tariffs ADD COLUMN IF NOT EXISTS rent NUMERIC(14,2) NULL;"))
 
                     # --- apartment_contacts ---
                     conn.execute(text("""
@@ -137,6 +164,7 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_approved_at TIMESTAMPTZ NULL"))
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_sent_at TIMESTAMPTZ NULL"))
                     conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS bill_sent_total NUMERIC(14,2) NULL"))
+                    conn.execute(text("ALTER TABLE apartment_month_statuses ADD COLUMN IF NOT EXISTS rent_reminder_sent_at TIMESTAMPTZ NULL"))
 
                     # --- meter_readings (единая схема) ---
                     conn.execute(text("""

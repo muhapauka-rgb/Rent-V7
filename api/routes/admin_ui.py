@@ -1,10 +1,13 @@
 from typing import Optional, Dict, Any, List
+from datetime import date, timedelta
+import calendar
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import Response
 from sqlalchemy import text
 import threading
 import subprocess
 import mimetypes
+import re
 
 from core.config import engine
 from core.db import db_ready, ensure_tables
@@ -44,6 +47,117 @@ router = APIRouter()
 StatusPatch = UIStatusesPatch
 
 
+def _normalize_ym_any(v: Any) -> Optional[str]:
+    s = str(v or "").strip()
+    if not s:
+        return None
+    s = s.replace("/", "-").replace(".", "-").replace("_", "-")
+
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})", s)
+    if m:
+        y = int(m.group(1))
+        mm = int(m.group(2))
+        if 1900 <= y <= 2100 and 1 <= mm <= 12:
+            return f"{y:04d}-{mm:02d}"
+
+    m = re.fullmatch(r"(\d{1,2})-(\d{4})", s)
+    if m:
+        mm = int(m.group(1))
+        y = int(m.group(2))
+        if 1900 <= y <= 2100 and 1 <= mm <= 12:
+            return f"{y:04d}-{mm:02d}"
+
+    m = re.fullmatch(r"(\d{4})(\d{2})", s)
+    if m:
+        y = int(m.group(1))
+        mm = int(m.group(2))
+        if 1900 <= y <= 2100 and 1 <= mm <= 12:
+            return f"{y:04d}-{mm:02d}"
+
+    nums = re.findall(r"\d+", s)
+    if len(nums) >= 2:
+        y = None
+        mm = None
+        for n in nums:
+            if len(n) == 4 and y is None:
+                y = int(n)
+                break
+        if y is None and len(nums[-1]) == 2:
+            y2 = int(nums[-1])
+            y = 2000 + y2
+        for n in nums:
+            iv = int(n)
+            if 1 <= iv <= 12:
+                mm = iv
+                break
+        if y is not None and mm is not None and 1900 <= y <= 2100:
+            return f"{y:04d}-{mm:02d}"
+
+    return None
+
+
+def _normalize_date_any(v: Any) -> Optional[str]:
+    s = str(v or "").strip()
+    if not s:
+        return None
+    s = s.replace("/", "-").replace(".", "-").replace("_", "-")
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", s)
+    if m:
+        y, mm, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mm, dd).isoformat()
+        except Exception:
+            return None
+    m = re.fullmatch(r"(\d{1,2})-(\d{1,2})-(\d{4})", s)
+    if m:
+        dd, mm, y = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        try:
+            return date(y, mm, dd).isoformat()
+        except Exception:
+            return None
+    return None
+
+
+def _due_day_from_tenant_since(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    if isinstance(v, date):
+        return int(v.day)
+    s = _normalize_date_any(v)
+    if not s:
+        return None
+    try:
+        return int(s.split("-")[2])
+    except Exception:
+        return None
+
+
+def _is_rent_overdue_for_month(ym: str, due_day: int, today: date) -> bool:
+    if not is_ym(ym):
+        return False
+    y = int(ym[:4])
+    m = int(ym[5:7])
+    last = calendar.monthrange(y, m)[1]
+    day = max(1, min(int(due_day), int(last)))
+    due_date = date(y, m, day)
+    # one-day grace after due date
+    return today > (due_date + timedelta(days=1))
+
+
+def _to_nullable_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    if isinstance(v, str):
+        t = v.strip().replace(",", ".")
+        if t == "":
+            return None
+        v = t
+    try:
+        return float(v)
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"invalid numeric value: {v!r}")
+
+
 def _start_ocr_dataset_job(force: bool = True) -> None:
     cmd = [
         "python",
@@ -79,7 +193,7 @@ def ui_list_apartments(ym: Optional[str] = None):
     with engine.begin() as conn:
         rows = conn.execute(
             text("""
-                SELECT id, title, address, tenant_name, note, ls_account, electric_expected, cold_serial, hot_serial
+                SELECT id, title, address, tenant_name, note, ls_account, electric_expected, cold_serial, hot_serial, tenant_since, rent_monthly
                 FROM apartments
                 ORDER BY id DESC
             """)
@@ -91,6 +205,12 @@ def ui_list_apartments(ym: Optional[str] = None):
         phone = _get_active_contact(aid, "phone")
         telegram = _get_active_contact(aid, "telegram")
         statuses = _get_month_statuses(aid, ym_)
+        has_active_chat = False
+        try:
+            with engine.begin() as conn:
+                has_active_chat = bool(_get_active_chat_id(conn, aid))
+        except Exception:
+            has_active_chat = False
         all_photos_received = False
         try:
             with engine.begin() as conn:
@@ -109,6 +229,9 @@ def ui_list_apartments(ym: Optional[str] = None):
                 electric_expected=int(r[6]) if r[6] is not None else 3,
                 cold_serial=r[7],
                 hot_serial=r[8],
+                tenant_since=str(r[9]) if len(r) > 9 and r[9] is not None else None,
+                rent_monthly=float(r[10]) if len(r) > 10 and r[10] is not None else 0.0,
+                has_active_chat=has_active_chat,
                 contacts=UIContacts(phone=phone, telegram=telegram),
                 statuses=UIStatuses(
                     rent_paid=bool(getattr(statuses, "rent_paid", False)),
@@ -120,6 +243,72 @@ def ui_list_apartments(ym: Optional[str] = None):
         )
 
     return {"ok": True, "ym": ym_, "items": items}
+
+
+@router.post("/admin/ui/rent-reminders/check")
+def ui_check_rent_reminders():
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    ym_ = current_ym().strip()
+    today = date.today()
+    sent: List[Dict[str, Any]] = []
+
+    with engine.begin() as conn:
+        rows = conn.execute(
+            text("SELECT id, title, tenant_since, rent_monthly FROM apartments ORDER BY id DESC")
+        ).mappings().all()
+
+        for r in rows:
+            aid = int(r["id"])
+            rent = float(r["rent_monthly"] or 0)
+            if rent <= 0:
+                continue
+
+            due_day = _due_day_from_tenant_since(r["tenant_since"])
+            if due_day is None:
+                continue
+            if not _is_rent_overdue_for_month(ym_, int(due_day), today):
+                continue
+
+            status_row = conn.execute(
+                text(
+                    """
+                    SELECT COALESCE(rent_paid, false) AS rent_paid, rent_reminder_sent_at
+                    FROM apartment_month_statuses
+                    WHERE apartment_id=:aid AND ym=:ym
+                    """
+                ),
+                {"aid": aid, "ym": ym_},
+            ).mappings().first()
+            if status_row and bool(status_row["rent_paid"]):
+                continue
+            if status_row and status_row["rent_reminder_sent_at"] is not None:
+                continue
+
+            chat_id = _get_active_chat_id(conn, aid)
+            if not chat_id:
+                continue
+
+            msg = f"Добрый день, необходимо провести оплату арендной платы в размере {rent:.2f} руб"
+            ok = _tg_send_message(str(chat_id), msg)
+            if not ok:
+                continue
+
+            conn.execute(
+                text(
+                    """
+                    INSERT INTO apartment_month_statuses (apartment_id, ym, rent_paid, meters_photo, meters_paid, rent_reminder_sent_at, updated_at, created_at)
+                    VALUES (:aid, :ym, false, false, false, now(), now(), now())
+                    ON CONFLICT (apartment_id, ym)
+                    DO UPDATE SET rent_reminder_sent_at=now(), updated_at=now()
+                    """
+                ),
+                {"aid": aid, "ym": ym_},
+            )
+            sent.append({"apartment_id": aid, "title": r["title"], "ym": ym_})
+
+    return {"ok": True, "ym": ym_, "sent_count": len(sent), "sent": sent}
 
 
 @router.post("/admin/ui/apartments")
@@ -180,6 +369,15 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
     if body.electric_expected is not None:
         sets.append("electric_expected=:electric_expected")
         params["electric_expected"] = int(body.electric_expected)
+    if body.rent_monthly is not None:
+        sets.append("rent_monthly=:rent_monthly")
+        params["rent_monthly"] = float(body.rent_monthly)
+    if body.tenant_since is not None:
+        norm_date = _normalize_date_any(body.tenant_since)
+        if body.tenant_since and not norm_date:
+            raise HTTPException(status_code=400, detail="invalid_tenant_since")
+        sets.append("tenant_since=:tenant_since")
+        params["tenant_since"] = norm_date
 
     body_data = body.model_dump(exclude_unset=True)
     has_phone = "phone" in body_data
@@ -270,7 +468,7 @@ def ui_apartment_card(apartment_id: int):
     with engine.begin() as conn:
         a = conn.execute(
             text("""
-                SELECT id, title, address, tenant_name, note, electric_expected, cold_serial, hot_serial
+                SELECT id, title, address, tenant_name, note, electric_expected, cold_serial, hot_serial, tenant_since, rent_monthly
                 FROM apartments WHERE id=:id
             """),
             {"id": int(apartment_id)},
@@ -488,6 +686,133 @@ def ui_apartment_history(apartment_id: int):
         history.append(entry)
 
     return {"apartment_id": apartment_id, "history": history}
+
+
+@router.get("/admin/ui/apartments/{apartment_id}/tariffs")
+def ui_get_apartment_tariffs(apartment_id: int):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM apartments WHERE id=:id LIMIT 1"),
+            {"id": int(apartment_id)},
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="apartment_not_found")
+
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                    month_from,
+                    cold,
+                    hot,
+                    sewer,
+                    electric_t1,
+                    electric_t2,
+                    electric_t3,
+                    rent,
+                    created_at,
+                    updated_at
+                FROM apartment_tariffs
+                WHERE apartment_id=:aid
+                ORDER BY month_from ASC
+                """
+            ),
+            {"aid": int(apartment_id)},
+        ).mappings().all()
+
+    items = []
+    for r in rows:
+        items.append(
+            {
+                "ym_from": r["month_from"],
+                "month_from": r["month_from"],
+                "cold": (float(r["cold"]) if r["cold"] is not None else None),
+                "hot": (float(r["hot"]) if r["hot"] is not None else None),
+                "sewer": (float(r["sewer"]) if r["sewer"] is not None else None),
+                "electric_t1": (float(r["electric_t1"]) if r["electric_t1"] is not None else None),
+                "electric_t2": (float(r["electric_t2"]) if r["electric_t2"] is not None else None),
+                "electric_t3": (float(r["electric_t3"]) if r["electric_t3"] is not None else None),
+                "rent": (float(r["rent"]) if r["rent"] is not None else None),
+                "created_at": (r["created_at"].isoformat() if r["created_at"] else None),
+                "updated_at": (r["updated_at"].isoformat() if r["updated_at"] else None),
+            }
+        )
+
+    return {"ok": True, "apartment_id": int(apartment_id), "items": items}
+
+
+@router.post("/admin/ui/apartments/{apartment_id}/tariffs")
+async def ui_upsert_apartment_tariff(apartment_id: int, request: Request):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    payload = await request.json()
+    ym = _normalize_ym_any(payload.get("month_from") or payload.get("ym_from"))
+    if not ym:
+        raise HTTPException(status_code=400, detail="month_from is required (any month format is allowed)")
+
+    cold = _to_nullable_float(payload.get("cold"))
+    hot = _to_nullable_float(payload.get("hot"))
+    sewer = _to_nullable_float(payload.get("sewer"))
+    e1 = _to_nullable_float(payload.get("electric_t1"))
+    e2 = _to_nullable_float(payload.get("electric_t2"))
+    e3 = _to_nullable_float(payload.get("electric_t3"))
+    rent = _to_nullable_float(payload.get("rent"))
+
+    # back-compat: if old "electric" was sent, use it as fallback for T1/T2
+    e_legacy = _to_nullable_float(payload.get("electric"))
+    if e_legacy is not None:
+        if e1 is None:
+            e1 = e_legacy
+        if e2 is None:
+            e2 = e_legacy
+
+    with engine.begin() as conn:
+        exists = conn.execute(
+            text("SELECT 1 FROM apartments WHERE id=:id LIMIT 1"),
+            {"id": int(apartment_id)},
+        ).fetchone()
+        if not exists:
+            raise HTTPException(status_code=404, detail="apartment_not_found")
+
+        conn.execute(
+            text(
+                """
+                INSERT INTO apartment_tariffs
+                    (apartment_id, month_from, cold, hot, sewer, electric_t1, electric_t2, electric_t3, rent, updated_at)
+                VALUES
+                    (:aid, :month_from, :cold, :hot, :sewer, :e1, :e2, :e3, :rent, now())
+                ON CONFLICT (apartment_id, month_from)
+                DO UPDATE SET
+                    cold=EXCLUDED.cold,
+                    hot=EXCLUDED.hot,
+                    sewer=EXCLUDED.sewer,
+                    electric_t1=EXCLUDED.electric_t1,
+                    electric_t2=EXCLUDED.electric_t2,
+                    electric_t3=EXCLUDED.electric_t3,
+                    rent=EXCLUDED.rent,
+                    updated_at=now()
+                """
+            ),
+            {
+                "aid": int(apartment_id),
+                "month_from": ym,
+                "cold": cold,
+                "hot": hot,
+                "sewer": sewer,
+                "e1": e1,
+                "e2": e2,
+                "e3": e3,
+                "rent": rent,
+            },
+        )
+
+    return {"ok": True, "apartment_id": int(apartment_id), "month_from": ym}
 
 
 @router.get("/admin/ui/apartments/{apartment_id}/review-flags")
