@@ -1522,6 +1522,7 @@ export default function App() {
       const re2 = de2 == null ? null : de2 * (tariff.e2 || 0);
       const rs = ds == null ? null : ds * (tariff.sewer || 0);
       const sum = calcSumRub(rc, rh, re1, re2, rs);
+      const rent = effectiveRentForMonth(h.month);
 
       data.push({
         "Месяц": h.month,
@@ -1542,6 +1543,7 @@ export default function App() {
         "Водоотведение (показание)": sewer,
         "Водоотведение Δ": ds,
         "Водоотведение ₽": rs,
+        "Аренда ₽": rent > 0 ? rent : null,
         "Сумма ₽": sum,
       });
     }
@@ -1566,6 +1568,7 @@ export default function App() {
         "Водоотведение (показание)",
         "Водоотведение Δ",
         "Водоотведение ₽",
+        "Аренда ₽",
         "Сумма ₽",
       ],
     });
@@ -1626,6 +1629,7 @@ export default function App() {
       { wch: 18 },
       { wch: 12 },
       { wch: 14 },
+      { wch: 12 },
       { wch: 12 },
     ];
     const wb = XLSX.utils.book_new();
@@ -1763,6 +1767,8 @@ export default function App() {
     if (!latestMonth) return 0;
     return effectiveRentForMonth(latestMonth);
   }, [latestMonth, selectedId, apartments]);
+  const isRentUnpaid = Boolean(selected) && !Boolean((selected as any)?.statuses?.rent_paid);
+  const rentAlertColor = indicatorStyle === "triangles" ? "var(--warn-bright)" : "var(--warn-active)";
 
   function renderStatusSwitch(
     checked: boolean,
@@ -2143,14 +2149,14 @@ export default function App() {
                   </div>
                   <div className="summary-cell summary-cell-rent" style={{ gridColumn: `${summaryRentCol} / span 1`, textAlign: "center" }}>
                     <div className="summary-label">Аренда</div>
+                    <div className="summary-label" style={{ marginTop: 2 }}>{latestRentDue.text}</div>
                     <div
                       className="summary-value"
-                      style={{ color: latestRentDue.overdue ? "var(--warn-active)" : undefined }}
-                      title={latestRentDue.overdue ? "Просрочка оплаты аренды" : undefined}
+                      style={{ marginTop: 4, color: isRentUnpaid ? rentAlertColor : undefined }}
+                      title={isRentUnpaid ? "Аренда не оплачена" : undefined}
                     >
                       {latestRentAmount > 0 ? fmtRub(latestRentAmount) : "—"}
                     </div>
-                    <div className="summary-label" style={{ marginTop: 4 }}>{latestRentDue.text}</div>
                   </div>
                   <div className="summary-cell summary-cell-counters" style={{ gridColumn: `${summaryCountersCol} / span 1`, textAlign: "center" }}>
                     <div className="summary-label">Счетчики</div>
@@ -2250,6 +2256,7 @@ export default function App() {
                       rows={last4}
                       eN={eN}
                       currentYm={serverYm}
+                      showRentColumn={false}
                       effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
                       calcSewerDelta={calcSewerDelta}
                       calcElectricT3Fallback={calcElectricT3Fallback}
@@ -2572,6 +2579,8 @@ export default function App() {
             <MetersTable
               rows={historyWithFuture.slice().reverse()}
               eN={eN}
+              showRentColumn={true}
+              rentForMonth={(m) => effectiveRentForMonth(m)}
               effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
               calcSewerDelta={calcSewerDelta}
               calcElectricT3Fallback={calcElectricT3Fallback}
