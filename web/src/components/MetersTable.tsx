@@ -23,6 +23,8 @@ type Props = {
   currentYm?: string;
   showRentColumn?: boolean;
   rentForMonth?: (ym: string) => number;
+  showPolicyColumns?: boolean;
+  utilitiesForMonth?: (ym: string) => { actual: number | null; planned: number | null; carry: number | null } | null;
 
   effectiveTariffForMonth: (ym: string) => any;
 
@@ -54,6 +56,8 @@ export default function MetersTable(props: Props) {
     currentYm,
     showRentColumn = false,
     rentForMonth,
+    showPolicyColumns = false,
+    utilitiesForMonth,
     effectiveTariffForMonth,
     calcElectricT3Fallback,
     calcSewerDelta,
@@ -68,7 +72,7 @@ export default function MetersTable(props: Props) {
   } = props;
 
   const n = Math.max(1, Math.min(3, Number.isFinite(eN) ? eN : 3));
-  const equalColWidth = `calc((100% - 56px) / ${n + 5 + (showRentColumn ? 1 : 0)})`;
+  const equalColWidth = `calc((100% - 56px) / ${n + 5 + (showRentColumn ? 1 : 0) + (showPolicyColumns ? 3 : 0)})`;
 
   function ymRuLabel(ym: string): string {
     if (!/^\d{4}-\d{2}$/.test(ym || "")) return ym;
@@ -91,6 +95,9 @@ export default function MetersTable(props: Props) {
           {n >= 2 && <col style={{ width: equalColWidth }} />}
           {n >= 3 && <col style={{ width: equalColWidth }} />}
           {showRentColumn && <col style={{ width: equalColWidth }} />}
+          {showPolicyColumns && <col style={{ width: equalColWidth }} />}
+          {showPolicyColumns && <col style={{ width: equalColWidth }} />}
+          {showPolicyColumns && <col style={{ width: equalColWidth }} />}
           <col style={{ width: equalColWidth }} />
           <col style={{ width: 56 }} />
         </colgroup>
@@ -105,6 +112,9 @@ export default function MetersTable(props: Props) {
             {n >= 2 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T2</th>}
             {n >= 3 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T3</th>}
             {showRentColumn && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Аренда</th>}
+            {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Начислено факт</th>}
+            {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>К оплате</th>}
+            {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Баланс</th>}
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Сумма</th>
             <th style={{ textAlign: "right", padding: "8px 0", borderBottom: "1px solid #eee", width: 56 }}></th>
           </tr>
@@ -173,6 +183,7 @@ export default function MetersTable(props: Props) {
             const sum = isComplete ? calcSumRub(rc, rh, n >= 1 ? re1 : null, n >= 2 ? re2 : null, rs) : null;
             const isCurrent = (currentYm || "").trim() !== "" && h.month === currentYm;
             const rent = showRentColumn && rentForMonth ? rentForMonth(h.month) : 0;
+            const utilities = showPolicyColumns && utilitiesForMonth ? utilitiesForMonth(h.month) : null;
 
 
             return (
@@ -279,6 +290,21 @@ export default function MetersTable(props: Props) {
                 {showRentColumn && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
                     {rent > 0 ? fmtRub(rent) : "—"}
+                  </td>
+                )}
+                {showPolicyColumns && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {utilities?.actual == null ? "—" : `${fmtRub(utilities.actual)}`}
+                  </td>
+                )}
+                {showPolicyColumns && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {utilities?.planned == null ? "—" : `${fmtRub(utilities.planned)}`}
+                  </td>
+                )}
+                {showPolicyColumns && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {utilities?.carry == null ? "—" : `${fmtRub(utilities.carry)}`}
                   </td>
                 )}
 

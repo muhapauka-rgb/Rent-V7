@@ -26,6 +26,12 @@ class UIApartmentItem(BaseModel):
     hot_serial: Optional[str] = None
     tenant_since: Optional[str] = None
     rent_monthly: Optional[float] = None
+    utilities_mode: Optional[Literal["by_actual_monthly", "fixed_monthly", "quarterly_advance"]] = None
+    utilities_fixed_monthly: Optional[float] = None
+    utilities_advance_amount: Optional[float] = None
+    utilities_advance_cycle_months: Optional[int] = None
+    utilities_advance_anchor_ym: Optional[str] = None
+    utilities_show_actual_to_tenant: Optional[bool] = None
     has_active_chat: Optional[bool] = None
     contacts: Optional[UIContacts] = None
     statuses: Optional[UIStatuses] = None
@@ -55,6 +61,12 @@ class UIApartmentPatch(BaseModel):
     hot_serial: Optional[str] = None
     tenant_since: Optional[str] = None
     rent_monthly: Optional[float] = None
+    utilities_mode: Optional[Literal["by_actual_monthly", "fixed_monthly", "quarterly_advance"]] = None
+    utilities_fixed_monthly: Optional[float] = None
+    utilities_advance_amount: Optional[float] = None
+    utilities_advance_cycle_months: Optional[int] = None
+    utilities_advance_anchor_ym: Optional[str] = None
+    utilities_show_actual_to_tenant: Optional[bool] = None
 
 
 class UIStatusesPatch(BaseModel):

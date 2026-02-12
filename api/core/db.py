@@ -73,6 +73,12 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS hot_serial_source TEXT NULL;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS tenant_since DATE NULL;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS rent_monthly NUMERIC(14,2) NOT NULL DEFAULT 0;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_mode TEXT NOT NULL DEFAULT 'by_actual_monthly';"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_fixed_monthly NUMERIC(14,2) NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_advance_amount NUMERIC(14,2) NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_advance_cycle_months INTEGER NOT NULL DEFAULT 3;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_advance_anchor_ym TEXT NULL;"))
+                    conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_show_actual_to_tenant BOOLEAN NOT NULL DEFAULT FALSE;"))
 
                     # --- tariffs ---
                     conn.execute(text("""

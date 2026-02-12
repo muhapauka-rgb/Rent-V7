@@ -9,6 +9,12 @@ type ApartmentItem = {
   electric_expected?: number | null;
   tenant_since?: string | null;
   rent_monthly?: number | null;
+  utilities_mode?: "by_actual_monthly" | "fixed_monthly" | "quarterly_advance" | null;
+  utilities_fixed_monthly?: number | null;
+  utilities_advance_amount?: number | null;
+  utilities_advance_cycle_months?: number | null;
+  utilities_advance_anchor_ym?: string | null;
+  utilities_show_actual_to_tenant?: boolean | null;
   has_active_chat?: boolean;
   statuses?: {
     all_photos_received: boolean;
@@ -24,6 +30,12 @@ type HistoryResp = {
   apartment_id: number;
   history: Array<{
     month: string;
+    utilities?: {
+      mode?: string;
+      actual_accrual?: number | null;
+      planned_due?: number | null;
+      carry_balance?: number | null;
+    };
     meters: {
       cold: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
       hot: { title: string; current: number | null; previous: number | null; delta: number | null; source?: string | null };
@@ -144,6 +156,12 @@ type ApartmentCardResp = {
     hot_serial?: string | null;
     tenant_since?: string | null;
     rent_monthly?: number | null;
+    utilities_mode?: "by_actual_monthly" | "fixed_monthly" | "quarterly_advance" | null;
+    utilities_fixed_monthly?: number | null;
+    utilities_advance_amount?: number | null;
+    utilities_advance_cycle_months?: number | null;
+    utilities_advance_anchor_ym?: string | null;
+    utilities_show_actual_to_tenant?: boolean | null;
   };
   contacts: { phone: string | null; telegram: string | null };
   chats: Array<{ chat_id: string; is_active: boolean; updated_at: string; created_at: string }>;
@@ -295,6 +313,11 @@ function ymDisplay(v: string): string {
   return ymRuLabel(ym);
 }
 
+function ymToIndex(ym: string): number | null {
+  if (!isYm(ym)) return null;
+  return Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7)) - 1;
+}
+
 export default function App() {
   const [tab, setTab] = useState<"apartments" | "ops">("apartments");
   const [err, setErr] = useState<string | null>(null);
@@ -337,6 +360,12 @@ export default function App() {
   const [infoHotSerial, setInfoHotSerial] = useState("");
   const [infoTenantSince, setInfoTenantSince] = useState("");
   const [infoRentMonthly, setInfoRentMonthly] = useState("");
+  const [infoUtilitiesMode, setInfoUtilitiesMode] = useState<"by_actual_monthly" | "fixed_monthly" | "quarterly_advance">("by_actual_monthly");
+  const [infoUtilitiesFixedMonthly, setInfoUtilitiesFixedMonthly] = useState("");
+  const [infoUtilitiesAdvanceAmount, setInfoUtilitiesAdvanceAmount] = useState("");
+  const [infoUtilitiesAdvanceCycleMonths, setInfoUtilitiesAdvanceCycleMonths] = useState("3");
+  const [infoUtilitiesAdvanceAnchorYm, setInfoUtilitiesAdvanceAnchorYm] = useState("");
+  const [infoUtilitiesShowActualToTenant, setInfoUtilitiesShowActualToTenant] = useState(false);
   const [infoPos, setInfoPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [infoDrag, setInfoDrag] = useState<{ active: boolean; dx: number; dy: number }>({ active: false, dx: 0, dy: 0 });
   const [historyOpen, setHistoryOpen] = useState(false);
@@ -427,6 +456,12 @@ export default function App() {
       setInfoRentMonthly(
         (data.apartment as any)?.rent_monthly == null ? "" : String((data.apartment as any)?.rent_monthly)
       );
+      setInfoUtilitiesMode((((data.apartment as any)?.utilities_mode ?? "by_actual_monthly") as any));
+      setInfoUtilitiesFixedMonthly((data.apartment as any)?.utilities_fixed_monthly == null ? "" : String((data.apartment as any)?.utilities_fixed_monthly));
+      setInfoUtilitiesAdvanceAmount((data.apartment as any)?.utilities_advance_amount == null ? "" : String((data.apartment as any)?.utilities_advance_amount));
+      setInfoUtilitiesAdvanceCycleMonths((data.apartment as any)?.utilities_advance_cycle_months == null ? "3" : String((data.apartment as any)?.utilities_advance_cycle_months));
+      setInfoUtilitiesAdvanceAnchorYm((data.apartment as any)?.utilities_advance_anchor_ym ?? "");
+      setInfoUtilitiesShowActualToTenant(Boolean((data.apartment as any)?.utilities_show_actual_to_tenant));
       setInfoChats(data.chats ?? []);
       setBindChatInput("");
       setInfoPos({ x: 0, y: 0 });
@@ -472,6 +507,12 @@ export default function App() {
           hot_serial: infoHotSerial.trim() || null,
           tenant_since: infoTenantSince.trim() || null,
           rent_monthly: numOrNull(infoRentMonthly) ?? 0,
+          utilities_mode: infoUtilitiesMode,
+          utilities_fixed_monthly: numOrNull(infoUtilitiesFixedMonthly),
+          utilities_advance_amount: numOrNull(infoUtilitiesAdvanceAmount),
+          utilities_advance_cycle_months: Math.max(2, Math.min(24, Number(infoUtilitiesAdvanceCycleMonths || "3") || 3)),
+          utilities_advance_anchor_ym: (infoUtilitiesAdvanceAnchorYm || "").trim() || null,
+          utilities_show_actual_to_tenant: Boolean(infoUtilitiesShowActualToTenant),
           electric_expected: ee, // <-- добавили
         }),
       }).then(async (r) => {
@@ -783,6 +824,12 @@ export default function App() {
       electric_expected: x.electric_expected ?? null,
       tenant_since: (x as any).tenant_since ?? null,
       rent_monthly: (x as any).rent_monthly ?? 0,
+      utilities_mode: (x as any).utilities_mode ?? "by_actual_monthly",
+      utilities_fixed_monthly: (x as any).utilities_fixed_monthly ?? null,
+      utilities_advance_amount: (x as any).utilities_advance_amount ?? null,
+      utilities_advance_cycle_months: (x as any).utilities_advance_cycle_months ?? 3,
+      utilities_advance_anchor_ym: (x as any).utilities_advance_anchor_ym ?? null,
+      utilities_show_actual_to_tenant: Boolean((x as any).utilities_show_actual_to_tenant),
       has_active_chat: Boolean((x as any).has_active_chat),
       statuses: {
         all_photos_received: Boolean((x as any)?.statuses?.all_photos_received),
@@ -1302,6 +1349,20 @@ export default function App() {
     return items;
   }, [graphMonths, history, graphMode]);
 
+  const utilitiesByMonth = useMemo(() => {
+    const m = new Map<string, { actual: number | null; planned: number | null; carry: number | null }>();
+    for (const h of history || []) {
+      const ym = String((h as any)?.month || "");
+      const u = (h as any)?.utilities || {};
+      m.set(ym, {
+        actual: u?.actual_accrual == null ? null : Number(u.actual_accrual),
+        planned: u?.planned_due == null ? null : Number(u.planned_due),
+        carry: u?.carry_balance == null ? null : Number(u.carry_balance),
+      });
+    }
+    return m;
+  }, [history]);
+
   async function openMeterPhoto(month: string, meterType: string, meterIndex: number) {
     if (!selectedId) return;
     try {
@@ -1501,6 +1562,7 @@ export default function App() {
   function exportHistoryXlsx() {
     const rows = (history ?? []).slice().sort((a, b) => String(a.month).localeCompare(String(b.month)));
     const data: Array<Record<string, any>> = [];
+    let carryCalc = 0;
     for (const h of rows) {
       const cold = h?.meters?.cold?.current ?? null;
       const hot = h?.meters?.hot?.current ?? null;
@@ -1523,6 +1585,14 @@ export default function App() {
       const rs = ds == null ? null : ds * (tariff.sewer || 0);
       const sum = calcSumRub(rc, rh, re1, re2, rs);
       const rent = effectiveRentForMonth(h.month);
+      const actualAccrual = (h as any)?.utilities?.actual_accrual ?? sum;
+      const plannedDue = (h as any)?.utilities?.planned_due ?? plannedUtilitiesForMonth(h.month, actualAccrual);
+      const carryBalance = (h as any)?.utilities?.carry_balance;
+      if (carryBalance == null) {
+        carryCalc = carryCalc + Number(plannedDue || 0) - Number(actualAccrual || 0);
+      } else {
+        carryCalc = Number(carryBalance || 0);
+      }
 
       data.push({
         "Месяц": h.month,
@@ -1543,6 +1613,9 @@ export default function App() {
         "Водоотведение (показание)": sewer,
         "Водоотведение Δ": ds,
         "Водоотведение ₽": rs,
+        "Начислено факт ₽": actualAccrual,
+        "К оплате ₽": plannedDue,
+        "Баланс переноса ₽": carryCalc,
         "Аренда ₽": rent > 0 ? rent : null,
         "Сумма ₽": sum,
       });
@@ -1568,6 +1641,9 @@ export default function App() {
         "Водоотведение (показание)",
         "Водоотведение Δ",
         "Водоотведение ₽",
+        "Начислено факт ₽",
+        "К оплате ₽",
+        "Баланс переноса ₽",
         "Аренда ₽",
         "Сумма ₽",
       ],
@@ -1629,6 +1705,9 @@ export default function App() {
       { wch: 18 },
       { wch: 12 },
       { wch: 14 },
+      { wch: 16 },
+      { wch: 14 },
+      { wch: 18 },
       { wch: 12 },
       { wch: 12 },
     ];
@@ -1710,6 +1789,29 @@ export default function App() {
     return rent;
   }
 
+  function plannedUtilitiesForMonth(ym: string, actual: number | null): number | null {
+    if (!selected) return actual;
+    if (!isYm(ym)) return actual;
+    const mode = String((selected as any)?.utilities_mode ?? "by_actual_monthly");
+    const tenantSinceYm = normalizeYmAny(String((selected as any)?.tenant_since ?? ""));
+    if (tenantSinceYm && ym < tenantSinceYm) return 0;
+
+    if (mode === "fixed_monthly") {
+      const fixed = Number((selected as any)?.utilities_fixed_monthly ?? 0);
+      return Number.isFinite(fixed) && fixed > 0 ? fixed : 0;
+    }
+    if (mode === "quarterly_advance") {
+      const amount = Number((selected as any)?.utilities_advance_amount ?? 0);
+      const cycle = Math.max(2, Number((selected as any)?.utilities_advance_cycle_months ?? 3) || 3);
+      const anchor = normalizeYmAny(String((selected as any)?.utilities_advance_anchor_ym ?? "")) || tenantSinceYm || ym;
+      const yi = ymToIndex(ym);
+      const ai = ymToIndex(anchor);
+      const isStart = yi != null && ai != null ? ((yi - ai) % cycle === 0) : true;
+      return isStart && Number.isFinite(amount) && amount > 0 ? amount : 0;
+    }
+    return actual;
+  }
+
   function rentDueInfoForMonth(ym: string): { day: number | null; text: string; overdue: boolean } {
     if (!selected) return { day: null, text: "—", overdue: false };
     const tenantSince = String((selected as any)?.tenant_since ?? "").trim();
@@ -1767,6 +1869,18 @@ export default function App() {
     if (!latestMonth) return 0;
     return effectiveRentForMonth(latestMonth);
   }, [latestMonth, selectedId, apartments]);
+  const latestUtilitiesPlanned = useMemo(() => {
+    if (!latestMonth) return latestRowComputed.counters;
+    const fromHistory = history.find((h) => h.month === latestMonth) as any;
+    const plannedHist = fromHistory?.utilities?.planned_due;
+    if (plannedHist != null && Number.isFinite(Number(plannedHist))) return Number(plannedHist);
+    return plannedUtilitiesForMonth(latestMonth, latestRowComputed.counters);
+  }, [latestMonth, history, latestRowComputed.counters, selectedId, apartments]);
+  const latestTotalPlanned = useMemo(() => {
+    const p = latestUtilitiesPlanned;
+    if (p == null) return null;
+    return Number(p) + Number(latestRentAmount || 0);
+  }, [latestUtilitiesPlanned, latestRentAmount]);
   const isRentUnpaid = Boolean(selected) && !Boolean((selected as any)?.statuses?.rent_paid);
   const rentAlertColor = indicatorStyle === "triangles" ? "var(--warn-bright)" : "var(--warn-active)";
 
@@ -2161,7 +2275,7 @@ export default function App() {
                   <div className="summary-cell summary-cell-counters" style={{ gridColumn: `${summaryCountersCol} / span 1`, textAlign: "center" }}>
                     <div className="summary-label">Счетчики</div>
                     <div className="summary-value">
-                      {latestRowComputed.counters == null ? "—" : `${fmtRub(latestRowComputed.counters)}`}
+                      {latestUtilitiesPlanned == null ? "—" : `${fmtRub(latestUtilitiesPlanned)}`}
                     </div>
                   </div>
                   <div
@@ -2170,7 +2284,7 @@ export default function App() {
                   >
                     <div className="summary-label">Сумма</div>
                     <div className="summary-value">
-                      {latestRowComputed.sum == null ? "—" : `${fmtRub(latestRowComputed.sum)}`}
+                      {latestTotalPlanned == null ? "—" : `${fmtRub(latestTotalPlanned)}`}
                     </div>
                   </div>
                   <div className="summary-cell summary-cell-actions-spacer" style={{ gridColumn: `${summarySumCol + 1} / span 1` }} />
@@ -2257,6 +2371,7 @@ export default function App() {
                       eN={eN}
                       currentYm={serverYm}
                       showRentColumn={false}
+                      showPolicyColumns={false}
                       effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
                       calcSewerDelta={calcSewerDelta}
                       calcElectricT3Fallback={calcElectricT3Fallback}
@@ -2581,6 +2696,8 @@ export default function App() {
               eN={eN}
               showRentColumn={true}
               rentForMonth={(m) => effectiveRentForMonth(m)}
+              showPolicyColumns={true}
+              utilitiesForMonth={(m) => utilitiesByMonth.get(m) || null}
               effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
               calcSewerDelta={calcSewerDelta}
               calcElectricT3Fallback={calcElectricT3Fallback}
@@ -2755,6 +2872,81 @@ export default function App() {
                       style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
                     />
                   </label>
+                </div>
+
+                <div className="info-section" style={{ paddingTop: 8 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Оплата счетчиков (режим)</div>
+                  <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                    <label style={{ display: "grid", gap: 4 }}>
+                      <div style={{ fontWeight: 800 }}>Режим оплаты счетчиков</div>
+                      <select
+                        value={infoUtilitiesMode}
+                        onChange={(e) => setInfoUtilitiesMode(e.target.value as any)}
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                      >
+                        <option value="by_actual_monthly">По факту ежемесячно</option>
+                        <option value="fixed_monthly">Фикс ежемесячно</option>
+                        <option value="quarterly_advance">Аванс за N месяцев</option>
+                      </select>
+                    </label>
+                    <label style={{ display: "grid", gap: 4 }}>
+                      <div style={{ fontWeight: 800 }}>Показывать факт клиенту</div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, height: 38 }}>
+                        <input
+                          type="checkbox"
+                          checked={infoUtilitiesShowActualToTenant}
+                          onChange={(e) => setInfoUtilitiesShowActualToTenant(e.target.checked)}
+                        />
+                        <span style={{ color: "#666", fontSize: 12 }}>Включено = клиент видит расчет по факту</span>
+                      </div>
+                    </label>
+                  </div>
+
+                  {infoUtilitiesMode === "fixed_monthly" ? (
+                    <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr", marginTop: 8 }}>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <div style={{ fontWeight: 800 }}>Фикс в месяц (₽)</div>
+                        <input
+                          value={infoUtilitiesFixedMonthly}
+                          onChange={(e) => setInfoUtilitiesFixedMonthly(e.target.value)}
+                          placeholder="3000"
+                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
+                        />
+                      </label>
+                    </div>
+                  ) : null}
+
+                  {infoUtilitiesMode === "quarterly_advance" ? (
+                    <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr 1fr", marginTop: 8 }}>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <div style={{ fontWeight: 800 }}>Сумма аванса (₽)</div>
+                        <input
+                          value={infoUtilitiesAdvanceAmount}
+                          onChange={(e) => setInfoUtilitiesAdvanceAmount(e.target.value)}
+                          placeholder="9000"
+                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                        />
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <div style={{ fontWeight: 800 }}>Длина цикла (мес)</div>
+                        <input
+                          value={infoUtilitiesAdvanceCycleMonths}
+                          onChange={(e) => setInfoUtilitiesAdvanceCycleMonths(e.target.value)}
+                          placeholder="3"
+                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                        />
+                      </label>
+                      <label style={{ display: "grid", gap: 4 }}>
+                        <div style={{ fontWeight: 800 }}>Старт цикла (YYYY-MM)</div>
+                        <input
+                          value={infoUtilitiesAdvanceAnchorYm}
+                          onChange={(e) => setInfoUtilitiesAdvanceAnchorYm(e.target.value)}
+                          placeholder="2026-02"
+                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                        />
+                      </label>
+                    </div>
+                  ) : null}
                 </div>
 
                 <div className="info-section" style={{ paddingTop: 8 }}>
