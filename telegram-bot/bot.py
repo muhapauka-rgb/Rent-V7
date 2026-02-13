@@ -246,6 +246,15 @@ def _has_anomaly_warning(js: dict) -> bool:
     return False
 
 
+def _extract_anomaly_warning(js: dict) -> Optional[dict]:
+    diag = js.get("diag") or {}
+    warnings = diag.get("warnings") or []
+    for w in warnings:
+        if isinstance(w, dict) and "anomaly_jump" in w and isinstance(w.get("anomaly_jump"), dict):
+            return w.get("anomaly_jump")
+    return None
+
+
 def _parse_float(text: str) -> Optional[float]:
     if text is None:
         return None
@@ -851,13 +860,7 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     meter_written = js.get("meter_written")
     ocr_failed = bool(js.get("ocr_failed"))
 
-    if _has_anomaly_warning(js):
-        await message.reply(
-            "Фото получено, но значение сильно отличается от прошлого месяца.\n"
-            "Мы передали это администратору для проверки.",
-            reply_markup=_kb_main(),
-        )
-        return
+    anomaly_info = _extract_anomaly_warning(js)
 
     if (meter_written is False) or ocr_failed:
         await message.reply(
@@ -870,9 +873,15 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         logging.info(f"MANUAL_CTX set for chat_id={message.chat.id} ym={ym!r} step='idle'")
         return
 
+    shown_reading = ocr_reading
+    if shown_reading is None and isinstance(anomaly_info, dict):
+        shown_reading = anomaly_info.get("curr")
+
     msg = f"Принято. (meter_index={assigned})"
-    if ocr_type or ocr_reading:
-        msg += f"\nРаспознано: {ocr_type or '—'} / {ocr_reading or '—'}"
+    if ocr_type or shown_reading is not None:
+        msg += f"\nРаспознано: {ocr_type or '—'} / {shown_reading if shown_reading is not None else '—'}"
+    if anomaly_info:
+        msg += "\nЗначение выглядит подозрительным, но мы сохранили его и отметили «Проверить значение» для администратора."
     await message.reply(msg, reply_markup=_kb_main())
 
 

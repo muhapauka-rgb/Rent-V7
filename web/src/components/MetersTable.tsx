@@ -21,6 +21,7 @@ type Props = {
   rows: HistoryRow[];
   eN: number;
   currentYm?: string;
+  showDualSummary?: boolean;
   showRentColumn?: boolean;
   rentForMonth?: (ym: string) => number;
   showPolicyColumns?: boolean;
@@ -46,7 +47,8 @@ type Props = {
   getReviewFlag: (month: string, meterType: string, meterIndex: number) => { id: number } | null;
   onResolveReviewFlag: (flagId: number) => void;
   notificationHighlight?: { ym: string; meter_type: string; meter_index: number } | null;
-  onCellPhoto?: (month: string, meterType: string, meterIndex: number) => void;
+  onCellPhoto?: (month: string, meterType: string, meterIndex: number, flagId?: number) => void;
+  onInlineSave?: (month: string, meterType: string, meterIndex: number, value: number) => Promise<void>;
 };
 
 export default function MetersTable(props: Props) {
@@ -54,6 +56,7 @@ export default function MetersTable(props: Props) {
     rows,
     eN,
     currentYm,
+    showDualSummary = false,
     showRentColumn = false,
     rentForMonth,
     showPolicyColumns = false,
@@ -69,10 +72,14 @@ export default function MetersTable(props: Props) {
     onResolveReviewFlag,
     notificationHighlight,
     onCellPhoto,
+    onInlineSave,
   } = props;
 
   const n = Math.max(1, Math.min(3, Number.isFinite(eN) ? eN : 3));
-  const equalColWidth = `calc((100% - 56px) / ${n + 5 + (showRentColumn ? 1 : 0) + (showPolicyColumns ? 3 : 0)})`;
+  const summaryCols = showDualSummary ? 2 : 1;
+  const baseCols = n + 4; // month + cold + hot + sewer + electric(Tn)
+  const totalCols = baseCols + (showRentColumn ? 1 : 0) + (showPolicyColumns ? 3 : 0) + summaryCols;
+  const equalColWidth = `calc((100% - 56px) / ${totalCols})`;
 
   function ymRuLabel(ym: string): string {
     if (!/^\d{4}-\d{2}$/.test(ym || "")) return ym;
@@ -81,6 +88,42 @@ export default function MetersTable(props: Props) {
     const m = Number(ym.slice(5, 7)) - 1;
     if (!Number.isFinite(y) || m < 0 || m > 11) return ym;
     return `${months[m]} ${y}`;
+  }
+
+  const [inlineKey, setInlineKey] = React.useState<string | null>(null);
+  const [inlineValue, setInlineValue] = React.useState<string>("");
+  const [inlineSaving, setInlineSaving] = React.useState(false);
+
+  function keyOf(month: string, meterType: string, meterIndex: number) {
+    return `${month}|${meterType}|${meterIndex}`;
+  }
+
+  function startInlineEdit(month: string, meterType: string, meterIndex: number, current: number | null) {
+    if (!onInlineSave) return;
+    setInlineKey(keyOf(month, meterType, meterIndex));
+    setInlineValue(current == null ? "" : String(current));
+  }
+
+  function parseInlineNumber(s: string): number | null {
+    const t = String(s ?? "").trim();
+    if (!t) return 0; // empty => zero
+    const v = Number(t.replace(",", "."));
+    if (!Number.isFinite(v)) return null;
+    return v;
+  }
+
+  async function commitInline(month: string, meterType: string, meterIndex: number) {
+    if (!onInlineSave) return;
+    const val = parseInlineNumber(inlineValue);
+    if (val == null) return;
+    setInlineSaving(true);
+    try {
+      await onInlineSave(month, meterType, meterIndex, val);
+      setInlineKey(null);
+      setInlineValue("");
+    } finally {
+      setInlineSaving(false);
+    }
   }
 
   return (
@@ -98,7 +141,14 @@ export default function MetersTable(props: Props) {
           {showPolicyColumns && <col style={{ width: equalColWidth }} />}
           {showPolicyColumns && <col style={{ width: equalColWidth }} />}
           {showPolicyColumns && <col style={{ width: equalColWidth }} />}
-          <col style={{ width: equalColWidth }} />
+          {showDualSummary ? (
+            <>
+              <col style={{ width: equalColWidth }} />
+              <col style={{ width: equalColWidth }} />
+            </>
+          ) : (
+            <col style={{ width: equalColWidth }} />
+          )}
           <col style={{ width: 56 }} />
         </colgroup>
         <thead>
@@ -115,7 +165,14 @@ export default function MetersTable(props: Props) {
             {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Начислено факт</th>}
             {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>К оплате</th>}
             {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Баланс</th>}
-            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Сумма</th>
+            {showDualSummary ? (
+              <>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Факт</th>
+                <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>К оплате</th>
+              </>
+            ) : (
+              <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Сумма</th>
+            )}
             <th style={{ textAlign: "right", padding: "8px 0", borderBottom: "1px solid #eee", width: 56 }}></th>
           </tr>
         </thead>
@@ -170,6 +227,26 @@ export default function MetersTable(props: Props) {
             const nE2 = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "electric" && Number(notificationHighlight.meter_index || 1) === 2;
             const nE3 = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "electric" && Number(notificationHighlight.meter_index || 1) === 3;
             const nSewer = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "sewer" && Number(notificationHighlight.meter_index || 1) === 1;
+            const reviewBtnStyle: React.CSSProperties = {
+              background: "#fee2e2",
+              color: "#991b1b",
+              border: "1px solid #fca5a5",
+              borderRadius: 999,
+              padding: "2px 8px",
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: "pointer",
+            };
+            const resolveBtnStyle: React.CSSProperties = {
+              background: "transparent",
+              color: "var(--text)",
+              border: "1px solid var(--hair)",
+              borderRadius: 999,
+              padding: "2px 8px",
+              fontSize: 11,
+              fontWeight: 700,
+              cursor: "pointer",
+            };
 
             // Если в квартире ожидается 3 электро-индекса — сумму НЕ показываем, пока не пришёл T3
             const isComplete =
@@ -180,10 +257,11 @@ export default function MetersTable(props: Props) {
               !missingE3;
 
             // Сумма = ХВС + ГВС + (T1 если показываем) + (T2 если показываем) + водоотведение
-            const sum = isComplete ? calcSumRub(rc, rh, n >= 1 ? re1 : null, n >= 2 ? re2 : null, rs) : null;
+            const sumFact = isComplete ? calcSumRub(rc, rh, n >= 1 ? re1 : null, n >= 2 ? re2 : null, rs) : null;
             const isCurrent = (currentYm || "").trim() !== "" && h.month === currentYm;
             const rent = showRentColumn && rentForMonth ? rentForMonth(h.month) : 0;
             const utilities = showPolicyColumns && utilitiesForMonth ? utilitiesForMonth(h.month) : null;
+            const sumPlanned = (utilitiesForMonth ? (utilitiesForMonth(h.month)?.planned ?? null) : null) ?? sumFact;
 
 
             return (
@@ -191,32 +269,78 @@ export default function MetersTable(props: Props) {
                 <td style={{ padding: "8px 8px 8px 12px", borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap" }}>{ymRuLabel(h.month)}</td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  <div
-                    onClick={() => onCellPhoto && onCellPhoto(h.month, "cold", 1)}
-                    style={{ cursor: onCellPhoto ? "pointer" : "default" }}
-                  >
-                    {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, nCold ? "review" : (fCold ? "review" : (missingCold ? "missing" : "none")))}
-                  </div>
+                  {inlineKey === keyOf(h.month, "cold", 1) ? (
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <input
+                        autoFocus
+                        value={inlineValue}
+                        onChange={(e) => setInlineValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitInline(h.month, "cold", 1);
+                          if (e.key === "Escape") setInlineKey(null);
+                        }}
+                        style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid var(--hair)" }}
+                      />
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => commitInline(h.month, "cold", 1)} style={resolveBtnStyle} disabled={inlineSaving}>Сохранить</button>
+                        <button onClick={() => setInlineKey(null)} style={resolveBtnStyle} disabled={inlineSaving}>Отмена</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      onClick={() => onCellPhoto && onCellPhoto(h.month, "cold", 1)}
+                      onDoubleClick={() => startInlineEdit(h.month, "cold", 1, h.meters?.cold?.current ?? null)}
+                      style={{ cursor: onCellPhoto ? "pointer" : "default", position: "relative" }}
+                    >
+                      {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, nCold ? "review" : (fCold ? "review" : (missingCold ? "missing" : "none")))}
+                    </div>
+                  )}
                   {fCold ? (
-                    <div style={{ marginTop: 6 }}>
-                      <button onClick={() => onResolveReviewFlag(fCold.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                    <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      <button onClick={() => onCellPhoto && onCellPhoto(h.month, "cold", 1, fCold.id)} style={reviewBtnStyle}>
                         Проверить значение
+                      </button>
+                      <button onClick={() => onResolveReviewFlag(fCold.id)} style={resolveBtnStyle}>
+                        Подтвердить
                       </button>
                     </div>
                   ) : null}
                 </td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                  <div
-                    onClick={() => onCellPhoto && onCellPhoto(h.month, "hot", 1)}
-                    style={{ cursor: onCellPhoto ? "pointer" : "default" }}
-                  >
-                    {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, nHot ? "review" : (fHot ? "review" : (missingHot ? "missing" : "none")))}
-                  </div>
+                  {inlineKey === keyOf(h.month, "hot", 1) ? (
+                    <div style={{ display: "grid", gap: 6 }}>
+                      <input
+                        autoFocus
+                        value={inlineValue}
+                        onChange={(e) => setInlineValue(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") commitInline(h.month, "hot", 1);
+                          if (e.key === "Escape") setInlineKey(null);
+                        }}
+                        style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid var(--hair)" }}
+                      />
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <button onClick={() => commitInline(h.month, "hot", 1)} style={resolveBtnStyle} disabled={inlineSaving}>Сохранить</button>
+                        <button onClick={() => setInlineKey(null)} style={resolveBtnStyle} disabled={inlineSaving}>Отмена</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      onClick={() => onCellPhoto && onCellPhoto(h.month, "hot", 1)}
+                      onDoubleClick={() => startInlineEdit(h.month, "hot", 1, h.meters?.hot?.current ?? null)}
+                      style={{ cursor: onCellPhoto ? "pointer" : "default" }}
+                    >
+                      {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, nHot ? "review" : (fHot ? "review" : (missingHot ? "missing" : "none")))}
+                    </div>
+                  )}
                   {fHot ? (
-                    <div style={{ marginTop: 6 }}>
-                      <button onClick={() => onResolveReviewFlag(fHot.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                    <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      <button onClick={() => onCellPhoto && onCellPhoto(h.month, "hot", 1, fHot.id)} style={reviewBtnStyle}>
                         Проверить значение
+                      </button>
+                      <button onClick={() => onResolveReviewFlag(fHot.id)} style={resolveBtnStyle}>
+                        Подтвердить
                       </button>
                     </div>
                   ) : null}
@@ -225,9 +349,12 @@ export default function MetersTable(props: Props) {
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
                   {cellTriplet(h.meters?.sewer?.current ?? null, ds, rs, t.sewer, true, nSewer ? "review" : (fSewer ? "review" : "none"))}
                   {fSewer ? (
-                    <div style={{ marginTop: 6 }}>
-                      <button onClick={() => onResolveReviewFlag(fSewer.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                    <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                      <button onClick={() => onCellPhoto && onCellPhoto(h.month, "sewer", 1, fSewer.id)} style={reviewBtnStyle}>
                         Проверить значение
+                      </button>
+                      <button onClick={() => onResolveReviewFlag(fSewer.id)} style={resolveBtnStyle}>
+                        Подтвердить
                       </button>
                     </div>
                   ) : null}
@@ -235,16 +362,39 @@ export default function MetersTable(props: Props) {
 
                 {n >= 1 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    <div
-                      onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 1)}
-                      style={{ cursor: onCellPhoto ? "pointer" : "default" }}
-                    >
-                      {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, nE1 ? "review" : (fE1 ? "review" : (missingE1 ? "missing" : "none")))}
-                    </div>
+                    {inlineKey === keyOf(h.month, "electric", 1) ? (
+                      <div style={{ display: "grid", gap: 6 }}>
+                        <input
+                          autoFocus
+                          value={inlineValue}
+                          onChange={(e) => setInlineValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitInline(h.month, "electric", 1);
+                            if (e.key === "Escape") setInlineKey(null);
+                          }}
+                          style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid var(--hair)" }}
+                        />
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button onClick={() => commitInline(h.month, "electric", 1)} style={resolveBtnStyle} disabled={inlineSaving}>Сохранить</button>
+                          <button onClick={() => setInlineKey(null)} style={resolveBtnStyle} disabled={inlineSaving}>Отмена</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 1)}
+                        onDoubleClick={() => startInlineEdit(h.month, "electric", 1, h.meters?.electric?.t1?.current ?? null)}
+                        style={{ cursor: onCellPhoto ? "pointer" : "default" }}
+                      >
+                        {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, nE1 ? "review" : (fE1 ? "review" : (missingE1 ? "missing" : "none")))}
+                      </div>
+                    )}
                     {fE1 ? (
-                      <div style={{ marginTop: 6 }}>
-                        <button onClick={() => onResolveReviewFlag(fE1.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                      <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <button onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 1, fE1.id)} style={reviewBtnStyle}>
                           Проверить значение
+                        </button>
+                        <button onClick={() => onResolveReviewFlag(fE1.id)} style={resolveBtnStyle}>
+                          Подтвердить
                         </button>
                       </div>
                     ) : null}
@@ -253,16 +403,39 @@ export default function MetersTable(props: Props) {
 
                 {n >= 2 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    <div
-                      onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 2)}
-                      style={{ cursor: onCellPhoto ? "pointer" : "default" }}
-                    >
-                      {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, nE2 ? "review" : (fE2 ? "review" : (missingE2 ? "missing" : "none")))}
-                    </div>
+                    {inlineKey === keyOf(h.month, "electric", 2) ? (
+                      <div style={{ display: "grid", gap: 6 }}>
+                        <input
+                          autoFocus
+                          value={inlineValue}
+                          onChange={(e) => setInlineValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitInline(h.month, "electric", 2);
+                            if (e.key === "Escape") setInlineKey(null);
+                          }}
+                          style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid var(--hair)" }}
+                        />
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button onClick={() => commitInline(h.month, "electric", 2)} style={resolveBtnStyle} disabled={inlineSaving}>Сохранить</button>
+                          <button onClick={() => setInlineKey(null)} style={resolveBtnStyle} disabled={inlineSaving}>Отмена</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 2)}
+                        onDoubleClick={() => startInlineEdit(h.month, "electric", 2, h.meters?.electric?.t2?.current ?? null)}
+                        style={{ cursor: onCellPhoto ? "pointer" : "default" }}
+                      >
+                        {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, nE2 ? "review" : (fE2 ? "review" : (missingE2 ? "missing" : "none")))}
+                      </div>
+                    )}
                     {fE2 ? (
-                      <div style={{ marginTop: 6 }}>
-                        <button onClick={() => onResolveReviewFlag(fE2.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                      <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <button onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 2, fE2.id)} style={reviewBtnStyle}>
                           Проверить значение
+                        </button>
+                        <button onClick={() => onResolveReviewFlag(fE2.id)} style={resolveBtnStyle}>
+                          Подтвердить
                         </button>
                       </div>
                     ) : null}
@@ -271,16 +444,39 @@ export default function MetersTable(props: Props) {
 
                 {n >= 3 && (
                   <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
-                    <div
-                      onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 3)}
-                      style={{ cursor: onCellPhoto ? "pointer" : "default" }}
-                    >
-                      {cellTriplet(t3fb.current, de3, null, null, false, nE3 ? "review" : (fE3 ? "review" : (missingE3 ? "missing" : "none")))}
-                    </div>
+                    {inlineKey === keyOf(h.month, "electric", 3) ? (
+                      <div style={{ display: "grid", gap: 6 }}>
+                        <input
+                          autoFocus
+                          value={inlineValue}
+                          onChange={(e) => setInlineValue(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitInline(h.month, "electric", 3);
+                            if (e.key === "Escape") setInlineKey(null);
+                          }}
+                          style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid var(--hair)" }}
+                        />
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <button onClick={() => commitInline(h.month, "electric", 3)} style={resolveBtnStyle} disabled={inlineSaving}>Сохранить</button>
+                          <button onClick={() => setInlineKey(null)} style={resolveBtnStyle} disabled={inlineSaving}>Отмена</button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div
+                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 3)}
+                        onDoubleClick={() => startInlineEdit(h.month, "electric", 3, t3fb.current)}
+                        style={{ cursor: onCellPhoto ? "pointer" : "default" }}
+                      >
+                        {cellTriplet(t3fb.current, de3, null, null, false, nE3 ? "review" : (fE3 ? "review" : (missingE3 ? "missing" : "none")))}
+                      </div>
+                    )}
                     {fE3 ? (
-                      <div style={{ marginTop: 6 }}>
-                        <button onClick={() => onResolveReviewFlag(fE3.id)} style={{ background: "#fee2e2", color: "#991b1b", border: "1px solid #fca5a5", borderRadius: 999, padding: "2px 8px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>
+                      <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                        <button onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 3, fE3.id)} style={reviewBtnStyle}>
                           Проверить значение
+                        </button>
+                        <button onClick={() => onResolveReviewFlag(fE3.id)} style={resolveBtnStyle}>
+                          Подтвердить
                         </button>
                       </div>
                     ) : null}
@@ -308,14 +504,27 @@ export default function MetersTable(props: Props) {
                   </td>
                 )}
 
-                <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
-                  {sum == null ? "—" : `${fmtRub(sum)}`}
-                </td>
+                {showDualSummary ? (
+                  <>
+                    <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                      {sumFact == null ? "—" : `${fmtRub(sumFact)}`}
+                    </td>
+                    <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                      {sumPlanned == null ? "—" : `${fmtRub(sumPlanned)}`}
+                    </td>
+                  </>
+                ) : (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {sumFact == null ? "—" : `${fmtRub(sumFact)}`}
+                  </td>
+                )}
 
                 <td style={{ padding: "8px 0", borderBottom: "1px solid #f2f2f2", width: 56, textAlign: "right" }}>
                   <button
                     onClick={() => openEdit(h.month)}
-                    className="btn secondary table-edit-btn"
+                    className="btn secondary table-edit-btn has-delayed-tooltip"
+                    data-tooltip="Редактировать"
+                    aria-label="Редактировать"
                     style={{
                       width: "100%",
                       padding: "10px 12px",
