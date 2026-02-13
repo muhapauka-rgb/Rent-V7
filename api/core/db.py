@@ -80,6 +80,20 @@ def ensure_tables() -> None:
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_advance_anchor_ym TEXT NULL;"))
                     conn.execute(text("ALTER TABLE apartments ADD COLUMN IF NOT EXISTS utilities_show_actual_to_tenant BOOLEAN NOT NULL DEFAULT FALSE;"))
 
+                    # --- apartment_rent_history ---
+                    conn.execute(text("""
+                        CREATE TABLE IF NOT EXISTS apartment_rent_history (
+                            id BIGSERIAL PRIMARY KEY,
+                            apartment_id BIGINT NOT NULL REFERENCES apartments(id) ON DELETE CASCADE,
+                            ym_from TEXT NOT NULL,               -- YYYY-MM (effective month)
+                            rent_monthly NUMERIC(14,2) NOT NULL,
+                            tenant_name_snapshot TEXT NULL,
+                            changed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                        );
+                    """))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_rent_history_apartment_changed ON apartment_rent_history(apartment_id, changed_at DESC);"))
+                    conn.execute(text("CREATE INDEX IF NOT EXISTS idx_apartment_rent_history_apartment_ym ON apartment_rent_history(apartment_id, ym_from DESC);"))
+
                     # --- tariffs ---
                     conn.execute(text("""
                         CREATE TABLE IF NOT EXISTS tariffs (

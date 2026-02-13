@@ -281,10 +281,23 @@ def unbind_chat_admin(chat_id: str):
             {"chat_id": str(chat_id)},
         )
         for aid in apartment_ids:
+            row = conn.execute(
+                text("SELECT tenant_name, rent_monthly FROM apartments WHERE id=:id"),
+                {"id": int(aid)},
+            ).mappings().first()
             conn.execute(
                 text("UPDATE apartments SET rent_monthly=0 WHERE id=:id"),
                 {"id": int(aid)},
             )
+            prev_rent = float((row or {}).get("rent_monthly") or 0.0)
+            if abs(prev_rent - 0.0) > 1e-9:
+                conn.execute(
+                    text("""
+                        INSERT INTO apartment_rent_history (apartment_id, ym_from, rent_monthly, tenant_name_snapshot)
+                        VALUES (:aid, :ym, 0, :tenant_name)
+                    """),
+                    {"aid": int(aid), "ym": current_ym(), "tenant_name": (row or {}).get("tenant_name")},
+                )
             conn.execute(
                 text("""
                     INSERT INTO apartment_tariffs (apartment_id, month_from, rent, updated_at)

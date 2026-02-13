@@ -644,6 +644,42 @@ body[data-theme="ultra"] .tool-btn[aria-pressed="true"] {
   cursor: not-allowed;
 }
 
+.has-delayed-tooltip {
+  position: relative;
+}
+
+.has-delayed-tooltip::after {
+  content: attr(data-tooltip);
+  position: absolute;
+  left: 50%;
+  bottom: calc(100% + 8px);
+  transform: translate(-50%, 4px);
+  opacity: 0;
+  pointer-events: none;
+  white-space: nowrap;
+  padding: 6px 8px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  color: var(--text);
+  background: var(--surface);
+  border: 1px solid var(--hair);
+  box-shadow: var(--shadow);
+  z-index: 120;
+  transition: opacity 0.16s ease 1s, transform 0.16s ease 1s;
+}
+
+.has-delayed-tooltip:hover::after,
+.has-delayed-tooltip:focus-visible::after {
+  opacity: 1;
+  transform: translate(-50%, 0);
+}
+
+.has-delayed-tooltip:disabled::after {
+  display: none;
+}
+
 .summary-strip {
   display: grid;
   grid-template-columns: repeat(7, minmax(0, 1fr)) 56px;

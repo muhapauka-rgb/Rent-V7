@@ -8,6 +8,7 @@ import threading
 import subprocess
 import mimetypes
 import re
+import json
 
 from core.config import engine
 from core.db import db_ready, ensure_tables
@@ -447,9 +448,23 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
         return {"ok": True, "updated": []}
 
     with engine.begin() as conn:
-        a = conn.execute(text("SELECT id FROM apartments WHERE id=:id"), {"id": apartment_id}).fetchone()
+        a = conn.execute(
+            text("SELECT id, tenant_name, rent_monthly FROM apartments WHERE id=:id"),
+            {"id": apartment_id},
+        ).mappings().first()
         if not a:
             raise HTTPException(status_code=404, detail="apartment_not_found")
+
+        old_rent = float(a["rent_monthly"] or 0.0)
+        old_tenant_name = (a["tenant_name"] or None)
+        rent_changed = False
+        new_rent = old_rent
+        new_tenant_name = old_tenant_name
+        if "rent_monthly" in params:
+            new_rent = float(params["rent_monthly"])
+            rent_changed = abs(new_rent - old_rent) > 1e-9
+        if "tenant_name" in params:
+            new_tenant_name = params["tenant_name"] or None
 
         if sets:
             conn.execute(
@@ -460,6 +475,21 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
                 """),
                 params,
             )
+            if rent_changed:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO apartment_rent_history (apartment_id, ym_from, rent_monthly, tenant_name_snapshot)
+                        VALUES (:aid, :ym, :rent, :tenant_name)
+                        """
+                    ),
+                    {
+                        "aid": int(apartment_id),
+                        "ym": current_ym(),
+                        "rent": float(new_rent),
+                        "tenant_name": new_tenant_name,
+                    },
+                )
 
     if has_phone:
         _set_contact(apartment_id, "phone", body.phone)
@@ -497,6 +527,72 @@ def ui_patch_apartment(apartment_id: int, body: UIApartmentPatch):
             )
 
     return {"ok": True, "updated": list(params.keys())}
+
+
+@router.get("/admin/ui/apartments/{apartment_id}/rent-history")
+def ui_apartment_rent_history(apartment_id: int, limit: int = 50):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    lim = max(1, min(int(limit or 50), 200))
+
+    with engine.begin() as conn:
+        apt = conn.execute(
+            text("SELECT id, tenant_name, rent_monthly FROM apartments WHERE id=:id"),
+            {"id": int(apartment_id)},
+        ).mappings().first()
+        exists = apt
+        if not exists:
+            raise HTTPException(status_code=404, detail="apartment_not_found")
+        rows = conn.execute(
+            text(
+                """
+                SELECT id, apartment_id, ym_from, rent_monthly, tenant_name_snapshot, changed_at
+                FROM apartment_rent_history
+                WHERE apartment_id=:aid
+                ORDER BY changed_at DESC, id DESC
+                LIMIT :lim
+                """
+            ),
+            {"aid": int(apartment_id), "lim": lim},
+        ).mappings().all()
+        items = list(rows)
+        if not items:
+            fallback_rows = conn.execute(
+                text(
+                    """
+                    SELECT month_from, rent, updated_at, created_at
+                    FROM apartment_tariffs
+                    WHERE apartment_id=:aid AND rent IS NOT NULL
+                    ORDER BY month_from DESC
+                    LIMIT :lim
+                    """
+                ),
+                {"aid": int(apartment_id), "lim": lim},
+            ).mappings().all()
+            for i, r in enumerate(fallback_rows):
+                items.append(
+                    {
+                        "id": -(i + 1),
+                        "apartment_id": int(apartment_id),
+                        "ym_from": r["month_from"],
+                        "rent_monthly": float(r["rent"] or 0),
+                        "tenant_name_snapshot": apt.get("tenant_name"),
+                        "changed_at": r.get("updated_at") or r.get("created_at"),
+                    }
+                )
+            if not items and apt.get("rent_monthly") is not None:
+                items.append(
+                    {
+                        "id": -999999,
+                        "apartment_id": int(apartment_id),
+                        "ym_from": current_ym(),
+                        "rent_monthly": float(apt.get("rent_monthly") or 0),
+                        "tenant_name_snapshot": apt.get("tenant_name"),
+                        "changed_at": None,
+                    }
+                )
+    return {"ok": True, "apartment_id": int(apartment_id), "items": items}
 
 
 @router.delete("/admin/ui/apartments/{apartment_id}")
@@ -559,7 +655,7 @@ def ui_apartment_card(apartment_id: int):
 
 
 @router.get("/admin/ui/apartments/{apartment_id}/photo")
-def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index: int = 1):
+def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index: int = 1, flag_id: Optional[int] = None):
     if not db_ready():
         raise HTTPException(status_code=503, detail="db_disabled")
     ensure_tables()
@@ -575,6 +671,49 @@ def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index:
     mi = max(1, min(3, mi))
 
     with engine.begin() as conn:
+        ydisk_path = None
+        # 1) If "Проверить значение" is pressed for a specific flag, prioritize the photo
+        # that caused that flag (new incoming photo), not the last written historical one.
+        if flag_id:
+            try:
+                fr = conn.execute(
+                    text(
+                        """
+                        SELECT comment
+                        FROM meter_review_flags
+                        WHERE id=:fid AND apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                        LIMIT 1
+                        """
+                    ),
+                    {"fid": int(flag_id), "aid": int(apartment_id), "ym": str(ym), "mt": str(mt), "mi": int(mi)},
+                ).mappings().first()
+                if fr and fr.get("comment"):
+                    c = fr.get("comment")
+                    try:
+                        parsed = c if isinstance(c, dict) else json.loads(str(c))
+                    except Exception:
+                        parsed = None
+                    if isinstance(parsed, dict):
+                        p = parsed.get("ydisk_path")
+                        if isinstance(p, str) and p.strip():
+                            ydisk_path = p.strip()
+            except Exception:
+                ydisk_path = None
+
+        # 2) Then prefer newest "review" photo (incoming replacement that did not overwrite yet).
+        if not ydisk_path:
+            row = conn.execute(
+                text(
+                    "SELECT ydisk_path FROM photo_events "
+                    "WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi "
+                    "AND (meter_written=false OR stage='needs_review') "
+                    "ORDER BY created_at DESC LIMIT 1"
+                ),
+                {"aid": int(apartment_id), "ym": str(ym), "mk": str(mt), "mi": int(mi)},
+            ).fetchone()
+            if row and row[0]:
+                ydisk_path = row[0]
+
         val_row = conn.execute(
             text(
                 "SELECT value FROM meter_readings "
@@ -585,7 +724,6 @@ def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index:
         ).fetchone()
         cur_val = float(val_row[0]) if val_row and val_row[0] is not None else None
 
-        ydisk_path = None
         if cur_val is not None:
             row = conn.execute(
                 text(

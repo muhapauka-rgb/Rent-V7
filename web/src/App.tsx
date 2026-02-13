@@ -167,6 +167,21 @@ type ApartmentCardResp = {
   chats: Array<{ chat_id: string; is_active: boolean; updated_at: string; created_at: string }>;
 };
 
+type RentHistoryItem = {
+  id: number;
+  apartment_id: number;
+  ym_from: string;
+  rent_monthly: number;
+  tenant_name_snapshot?: string | null;
+  changed_at: string;
+};
+
+type RentHistoryResp = {
+  ok: boolean;
+  apartment_id: number;
+  items: RentHistoryItem[];
+};
+
 async function apiGet<T>(path: string): Promise<T> {
   const r = await fetch(`/api${path}`);
   if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
@@ -347,6 +362,7 @@ export default function App() {
 
   // Apartment info modal
   const [infoOpen, setInfoOpen] = useState(false);
+  const [info2Open, setInfo2Open] = useState(false);
   const [infoLoading, setInfoLoading] = useState(false);
   const [infoTitle, setInfoTitle] = useState("");
   const [infoAddress, setInfoAddress] = useState("");
@@ -366,8 +382,11 @@ export default function App() {
   const [infoUtilitiesAdvanceCycleMonths, setInfoUtilitiesAdvanceCycleMonths] = useState("3");
   const [infoUtilitiesAdvanceAnchorYm, setInfoUtilitiesAdvanceAnchorYm] = useState("");
   const [infoUtilitiesShowActualToTenant, setInfoUtilitiesShowActualToTenant] = useState(false);
+  const [infoRentHistory, setInfoRentHistory] = useState<RentHistoryItem[]>([]);
   const [infoPos, setInfoPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
   const [infoDrag, setInfoDrag] = useState<{ active: boolean; dx: number; dy: number }>({ active: false, dx: 0, dy: 0 });
+  const [info2Pos, setInfo2Pos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
+  const [info2Drag, setInfo2Drag] = useState<{ active: boolean; dx: number; dy: number }>({ active: false, dx: 0, dy: 0 });
   const [historyOpen, setHistoryOpen] = useState(false);
   const [showGraph, setShowGraph] = useState(false);
   const [graphFrom, setGraphFrom] = useState<string>("");
@@ -437,6 +456,9 @@ export default function App() {
 
   async function openInfo(apartmentId: number) {
     setInfoOpen(true);
+    setInfo2Open(false);
+    setInfoPos({ x: 0, y: 0 });
+    setInfoDrag({ active: false, dx: 0, dy: 0 });
     setInfoLoading(true);
     try {
       setErr(null);
@@ -463,9 +485,9 @@ export default function App() {
       setInfoUtilitiesAdvanceAnchorYm((data.apartment as any)?.utilities_advance_anchor_ym ?? "");
       setInfoUtilitiesShowActualToTenant(Boolean((data.apartment as any)?.utilities_show_actual_to_tenant));
       setInfoChats(data.chats ?? []);
+      const rentHistory = await apiGet<RentHistoryResp>(`/admin/ui/apartments/${apartmentId}/rent-history?limit=12`);
+      setInfoRentHistory(rentHistory.items ?? []);
       setBindChatInput("");
-      setInfoPos({ x: 0, y: 0 });
-      setInfoDrag({ active: false, dx: 0, dy: 0 });
 
       const ee =
         (data.apartment as any)?.electric_expected ??
@@ -475,6 +497,54 @@ export default function App() {
     } catch (e: any) {
       setErr(String(e?.message ?? e));
       setInfoOpen(false);
+    } finally {
+      setInfoLoading(false);
+    }
+  }
+
+  async function openInfo2(apartmentId: number) {
+    setInfo2Open(true);
+    setInfoOpen(false);
+    setInfo2Pos({ x: 0, y: 0 });
+    setInfo2Drag({ active: false, dx: 0, dy: 0 });
+    setInfoLoading(true);
+    try {
+      setErr(null);
+
+      const aLocal = apartments.find((a) => a.id === apartmentId) ?? null;
+
+      const data = await apiGet<ApartmentCardResp>(`/admin/ui/apartments/${apartmentId}/card`);
+      setInfoTitle(data.apartment?.title ?? "");
+      setInfoAddress((data.apartment?.address ?? "") as any);
+      setInfoTenantName((data.apartment?.tenant_name ?? "") as any);
+      setInfoNote((data.apartment?.note ?? "") as any);
+      setInfoPhone(data.contacts?.phone ?? "");
+      setInfoTelegram(data.contacts?.telegram ?? "");
+      setInfoColdSerial((data.apartment as any)?.cold_serial ?? "");
+      setInfoHotSerial((data.apartment as any)?.hot_serial ?? "");
+      setInfoTenantSince((data.apartment as any)?.tenant_since ?? "");
+      setInfoRentMonthly(
+        (data.apartment as any)?.rent_monthly == null ? "" : String((data.apartment as any)?.rent_monthly)
+      );
+      setInfoUtilitiesMode((((data.apartment as any)?.utilities_mode ?? "by_actual_monthly") as any));
+      setInfoUtilitiesFixedMonthly((data.apartment as any)?.utilities_fixed_monthly == null ? "" : String((data.apartment as any)?.utilities_fixed_monthly));
+      setInfoUtilitiesAdvanceAmount((data.apartment as any)?.utilities_advance_amount == null ? "" : String((data.apartment as any)?.utilities_advance_amount));
+      setInfoUtilitiesAdvanceCycleMonths((data.apartment as any)?.utilities_advance_cycle_months == null ? "3" : String((data.apartment as any)?.utilities_advance_cycle_months));
+      setInfoUtilitiesAdvanceAnchorYm((data.apartment as any)?.utilities_advance_anchor_ym ?? "");
+      setInfoUtilitiesShowActualToTenant(Boolean((data.apartment as any)?.utilities_show_actual_to_tenant));
+      setInfoChats(data.chats ?? []);
+      const rentHistory = await apiGet<RentHistoryResp>(`/admin/ui/apartments/${apartmentId}/rent-history?limit=12`);
+      setInfoRentHistory(rentHistory.items ?? []);
+      setBindChatInput("");
+
+      const ee =
+        (data.apartment as any)?.electric_expected ??
+        (aLocal as any)?.electric_expected ??
+        1;
+      setInfoElectricExpected(String(ee ?? 1));
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+      setInfo2Open(false);
     } finally {
       setInfoLoading(false);
     }
@@ -522,6 +592,8 @@ export default function App() {
 
       await loadApartments(false);
       await loadHistory(apartmentId);
+      const rentHistory = await apiGet<RentHistoryResp>(`/admin/ui/apartments/${apartmentId}/rent-history?limit=12`);
+      setInfoRentHistory(rentHistory.items ?? []);
 
       setInfoOpen(false);
     } catch (e: any) {
@@ -618,6 +690,8 @@ export default function App() {
       const data = await apiGet<ApartmentCardResp>(`/admin/ui/apartments/${apartmentId}/card`);
       setInfoChats(data.chats ?? []);
       setInfoRentMonthly((data.apartment as any)?.rent_monthly == null ? "" : String((data.apartment as any)?.rent_monthly));
+      const rentHistory = await apiGet<RentHistoryResp>(`/admin/ui/apartments/${apartmentId}/rent-history?limit=12`);
+      setInfoRentHistory(rentHistory.items ?? []);
       await loadApartments(false);
       await loadHistory(apartmentId);
       setBindChatInput("");
@@ -633,6 +707,8 @@ export default function App() {
       const data = await apiGet<ApartmentCardResp>(`/admin/ui/apartments/${apartmentId}/card`);
       setInfoChats(data.chats ?? []);
       setInfoRentMonthly((data.apartment as any)?.rent_monthly == null ? "" : String((data.apartment as any)?.rent_monthly));
+      const rentHistory = await apiGet<RentHistoryResp>(`/admin/ui/apartments/${apartmentId}/rent-history?limit=12`);
+      setInfoRentHistory(rentHistory.items ?? []);
       await loadApartments(false);
       await loadHistory(apartmentId);
     } catch (e: any) {
@@ -1153,11 +1229,12 @@ export default function App() {
   async function saveEdit() {
     if (!selectedId) return;
 
-    const cold = numOrNull(editCold);
-    const hot = numOrNull(editHot);
-    const e1 = numOrNull(editE1);
-    const e2 = numOrNull(editE2);
-    const e3 = numOrNull(editE3);
+    // Пустое поле трактуем как 0: можно быстро "обнулить" месяц.
+    const cold = numOrZero(editCold);
+    const hot = numOrZero(editHot);
+    const e1 = numOrZero(editE1);
+    const e2 = numOrZero(editE2);
+    const e3 = numOrZero(editE3);
 
     // пустое поле = "не менять"
     const row = historyWithFuture.find((h) => h.month === editMonth);
@@ -1172,11 +1249,11 @@ export default function App() {
       setErr(null);
 
       const payload: any = { ym: editMonth };
-      if (cold !== null && !nearlyEq(cold, cur?.cold?.current ?? null)) payload.cold = cold;
-      if (hot !== null && !nearlyEq(hot, cur?.hot?.current ?? null)) payload.hot = hot;
-      if (e1 !== null && !nearlyEq(e1, cur?.electric?.t1?.current ?? null)) payload.electric_t1 = e1;
-      if (e2 !== null && !nearlyEq(e2, cur?.electric?.t2?.current ?? null)) payload.electric_t2 = e2;
-      if (e3 !== null && !nearlyEq(e3, cur?.electric?.t3?.current ?? null)) payload.electric_t3 = e3; // t3 — только если реально изменен
+      if (!nearlyEq(cold, cur?.cold?.current ?? null)) payload.cold = cold;
+      if (!nearlyEq(hot, cur?.hot?.current ?? null)) payload.hot = hot;
+      if (!nearlyEq(e1, cur?.electric?.t1?.current ?? null)) payload.electric_t1 = e1;
+      if (!nearlyEq(e2, cur?.electric?.t2?.current ?? null)) payload.electric_t2 = e2;
+      if (!nearlyEq(e3, cur?.electric?.t3?.current ?? null)) payload.electric_t3 = e3; // t3 — только если реально изменен
 
       if (Object.keys(payload).length <= 1) {
         setErr("Нечего сохранять: все поля пустые.");
@@ -1189,6 +1266,25 @@ export default function App() {
       setEditOpen(false);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
+    }
+  }
+
+  async function saveInlineCell(month: string, meterType: string, meterIndex: number, value: number) {
+    if (!selectedId) return;
+    const payload: any = { ym: month };
+    if (meterType === "cold") payload.cold = value;
+    else if (meterType === "hot") payload.hot = value;
+    else if (meterType === "electric" && meterIndex === 1) payload.electric_t1 = value;
+    else if (meterType === "electric" && meterIndex === 2) payload.electric_t2 = value;
+    else if (meterType === "electric" && meterIndex === 3) payload.electric_t3 = value;
+    else return;
+    try {
+      setErr(null);
+      await apiPost(`/admin/ui/apartments/${selectedId}/meters`, payload);
+      await loadHistory(selectedId);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+      throw e;
     }
   }
 
@@ -1363,14 +1459,15 @@ export default function App() {
     return m;
   }, [history]);
 
-  async function openMeterPhoto(month: string, meterType: string, meterIndex: number) {
+  async function openMeterPhoto(month: string, meterType: string, meterIndex: number, flagId?: number) {
     if (!selectedId) return;
     try {
       setErr(null);
       setPhotoLoading(true);
       setPhotoTitle(`${month} · ${meterType.toUpperCase()}${meterType === "electric" ? ` ${meterIndex}` : ""}`);
+      const qFlag = flagId ? `&flag_id=${encodeURIComponent(String(flagId))}` : "";
       const res = await fetch(
-        `/api/admin/ui/apartments/${selectedId}/photo?ym=${encodeURIComponent(month)}&meter_type=${encodeURIComponent(meterType)}&meter_index=${encodeURIComponent(String(meterIndex))}`
+        `/api/admin/ui/apartments/${selectedId}/photo?ym=${encodeURIComponent(month)}&meter_type=${encodeURIComponent(meterType)}&meter_index=${encodeURIComponent(String(meterIndex))}${qFlag}`
       );
       if (!res.ok) throw new Error(`Фото не найдено`);
       const blob = await res.blob();
@@ -1720,8 +1817,9 @@ export default function App() {
   const tableColsNoAction = eN + 5; // month + cold + hot + sewer + Tn + sum
   const summaryGridTemplate = `repeat(${tableColsNoAction}, minmax(0, 1fr)) 56px`;
   const summarySumCol = eN + 5; // same as table sum col index
-  const summaryRentCol = Math.max(2, Math.floor((summarySumCol + 1) / 3));
-  const summaryCountersCol = Math.max(summaryRentCol + 1, Math.min(summarySumCol - 1, Math.floor((2 * summarySumCol) / 3)));
+  const summaryRentCol = 2;
+  const summaryUtilitiesPlannedCol = Math.max(3, summarySumCol - 2);
+  const summaryUtilitiesActualCol = Math.max(summaryUtilitiesPlannedCol + 1, summarySumCol - 1);
 
   function getReviewFlag(month: string, meterType: string, meterIndex: number): ReviewFlagItem | null {
     const mt = String(meterType || "").toLowerCase();
@@ -1869,20 +1967,68 @@ export default function App() {
     if (!latestMonth) return 0;
     return effectiveRentForMonth(latestMonth);
   }, [latestMonth, selectedId, apartments]);
-  const latestUtilitiesPlanned = useMemo(() => {
+  const latestUtilitiesActual = useMemo(() => {
     if (!latestMonth) return latestRowComputed.counters;
+    const fromHistory = history.find((h) => h.month === latestMonth) as any;
+    const actualHist = fromHistory?.utilities?.actual_accrual;
+    if (actualHist != null && Number.isFinite(Number(actualHist))) return Number(actualHist);
+    return latestRowComputed.counters;
+  }, [latestMonth, history, latestRowComputed.counters, selectedId, apartments]);
+  const latestUtilitiesPlanned = useMemo(() => {
+    if (!latestMonth) return null;
     const fromHistory = history.find((h) => h.month === latestMonth) as any;
     const plannedHist = fromHistory?.utilities?.planned_due;
     if (plannedHist != null && Number.isFinite(Number(plannedHist))) return Number(plannedHist);
-    return plannedUtilitiesForMonth(latestMonth, latestRowComputed.counters);
-  }, [latestMonth, history, latestRowComputed.counters, selectedId, apartments]);
-  const latestTotalPlanned = useMemo(() => {
+    return plannedUtilitiesForMonth(latestMonth, latestUtilitiesActual);
+  }, [latestMonth, history, latestUtilitiesActual, selectedId, apartments]);
+  const latestTotalDisplay = useMemo(() => {
     const p = latestUtilitiesPlanned;
     if (p == null) return null;
     return Number(p) + Number(latestRentAmount || 0);
   }, [latestUtilitiesPlanned, latestRentAmount]);
+  const calcBlockingIssues = useMemo(() => {
+    if (!selected) return [] as string[];
+    const issues: string[] = [];
+    const mode = String((selected as any)?.utilities_mode ?? "by_actual_monthly");
+    const fixed = Number((selected as any)?.utilities_fixed_monthly ?? 0);
+    const adv = Number((selected as any)?.utilities_advance_amount ?? 0);
+    const cycle = Number((selected as any)?.utilities_advance_cycle_months ?? 3);
+    const anchor = normalizeYmAny(String((selected as any)?.utilities_advance_anchor_ym ?? ""));
+    const tenantSinceYm = normalizeYmAny(String((selected as any)?.tenant_since ?? ""));
+
+    if (mode === "fixed_monthly" && !(Number.isFinite(fixed) && fixed > 0)) {
+      issues.push("Не заполнено: «Фикс в месяц (₽)» в Информации по арендатору.");
+    }
+    if (mode === "quarterly_advance") {
+      if (!(Number.isFinite(adv) && adv > 0)) {
+        issues.push("Не заполнено: «Сумма аванса (₽)» в Информации по арендатору.");
+      }
+      if (!(Number.isFinite(cycle) && cycle >= 2)) {
+        issues.push("Некорректно: «Длина цикла (мес)» должна быть 2 или больше.");
+      }
+      if (!anchor && !tenantSinceYm) {
+        issues.push("Не заполнено: «Старт цикла (YYYY-MM)» или «Дата заселения».");
+      }
+    }
+    const rent = Number((selected as any)?.rent_monthly ?? 0);
+    if (rent > 0 && !tenantSinceYm) {
+      issues.push("Не заполнено: «Дата заселения» (нужна для дня оплаты аренды).");
+    }
+    return issues;
+  }, [selectedId, apartments]);
   const isRentUnpaid = Boolean(selected) && !Boolean((selected as any)?.statuses?.rent_paid);
   const rentAlertColor = indicatorStyle === "triangles" ? "var(--warn-bright)" : "var(--warn-active)";
+  const infoTenantSinceMissing = !String(infoTenantSince || "").trim();
+  const infoFixedMissing = infoUtilitiesMode === "fixed_monthly" && !(Number(infoUtilitiesFixedMonthly || 0) > 0);
+  const infoAdvanceAmountMissing = infoUtilitiesMode === "quarterly_advance" && !(Number(infoUtilitiesAdvanceAmount || 0) > 0);
+  const infoAdvanceCycleMissing = infoUtilitiesMode === "quarterly_advance" && !(Number(infoUtilitiesAdvanceCycleMonths || 0) >= 2);
+  const infoAdvanceAnchorMissing = infoUtilitiesMode === "quarterly_advance" && !normalizeYmAny(infoUtilitiesAdvanceAnchorYm || "") && !normalizeYmAny(infoTenantSince || "");
+  const reqInputStyle = (missing: boolean): React.CSSProperties => ({
+    padding: 8,
+    borderRadius: 10,
+    border: missing ? "1px solid #ef4444" : "1px solid #ddd",
+    background: missing ? "rgba(239,68,68,0.08)" : undefined,
+  });
 
   function renderStatusSwitch(
     checked: boolean,
@@ -1896,10 +2042,10 @@ export default function App() {
           e.stopPropagation();
           if (!readOnly && onToggle) onToggle();
         }}
-        className="lamp-btn"
+        className="lamp-btn has-delayed-tooltip"
+        data-tooltip={checked ? "Ок" : "Проблема"}
         style={{ cursor: readOnly ? "default" : "pointer", opacity: readOnly ? 0.9 : 1 }}
         aria-label={checked ? "Ок" : "Проблема"}
-        title={checked ? "Ок" : "Проблема"}
       >
         <span className={`lamp ${checked ? "ok" : "bad"}`} />
       </button>
@@ -1915,9 +2061,9 @@ export default function App() {
         <div className="top-actions">
           <button
             onClick={() => setTab("apartments")}
-            className={`action-btn icon-static-btn${tab === "apartments" ? " is-active" : ""}`}
+            className={`action-btn icon-static-btn has-delayed-tooltip${tab === "apartments" ? " is-active" : ""}`}
             style={{ borderRadius: 14, width: 38, height: 38, padding: 0 }}
-            title="Объекты"
+            data-tooltip="Объекты"
             aria-label="Объекты"
           >
             <svg viewBox="0 0 24 24" width="17" height="17" style={{ display: "block", margin: "0 auto" }}>
@@ -1929,9 +2075,9 @@ export default function App() {
 
           <button
             onClick={() => setAddOpen(true)}
-            className="action-btn"
+            className="action-btn has-delayed-tooltip"
             style={{ borderRadius: 14, width: 36, height: 36, padding: 0 }}
-            title="Добавить квартиру"
+            data-tooltip="Добавить квартиру"
             aria-label="Добавить квартиру"
           >
             <svg viewBox="0 0 24 24" width="16" height="16" style={{ display: "block", margin: "0 auto" }}>
@@ -1942,9 +2088,9 @@ export default function App() {
 
           <button
             onClick={() => deleteSelectedApartment()}
-            className="action-btn icon-static-btn"
+            className="action-btn icon-static-btn has-delayed-tooltip"
             style={{ borderRadius: 14, width: 36, height: 36, padding: 0 }}
-            title="Удалить"
+            data-tooltip="Удалить"
             aria-label="Удалить"
           >
             <svg viewBox="0 0 24 24" width="17" height="17" style={{ display: "block", margin: "0 auto" }}>
@@ -1957,9 +2103,10 @@ export default function App() {
 
           <button
             onClick={() => setSettingsOpen(true)}
-            className={`action-btn icon-static-btn${settingsOpen ? " is-active" : ""}`}
+            className={`action-btn icon-static-btn has-delayed-tooltip${settingsOpen ? " is-active" : ""}`}
             style={{ width: 38, height: 38, padding: 0 }}
-            title="Тема и индикаторы"
+            data-tooltip="Тема и индикаторы"
+            aria-label="Тема и индикаторы"
           >
             <svg viewBox="0 0 24 24" width="17" height="17" style={{ display: "block", margin: "0 auto", color: "currentColor" }}>
               <path
@@ -1983,9 +2130,10 @@ export default function App() {
               setNotifOpen(next);
               if (next) loadNotifications(true);
             }}
-            className="action-btn icon-static-btn"
+            className="action-btn icon-static-btn has-delayed-tooltip"
             style={{ position: "relative", width: 38, height: 38, padding: 0 }}
-            title="Уведомления"
+            data-tooltip="Уведомления"
+            aria-label="Уведомления"
           >
             <svg viewBox="0 0 24 24" width="17" height="17" style={{ display: "block", margin: "0 auto", color: "currentColor" }}>
               <path d="M7.2 16.2h9.6" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" />
@@ -2153,12 +2301,18 @@ export default function App() {
         <div className="section-head" style={{ marginTop: 8 }}>
           <div className="panel-title">Квартиры</div>
           <div className="toolbar">
-            <button disabled={!selected} className={`tool-btn tool-icon-btn${infoOpen ? " is-active" : ""}`} onClick={() => selected && openInfo(selected.id)} title="Инфо" aria-pressed={infoOpen}>
+            <button disabled={!selected} className={`tool-btn tool-icon-btn has-delayed-tooltip${infoOpen ? " is-active" : ""}`} onClick={() => selected && openInfo(selected.id)} data-tooltip="Инфо" aria-label="Инфо" aria-pressed={infoOpen}>
+              <svg viewBox="0 0 24 24" width="16" height="16">
+                <circle cx="12" cy="8" r="3" fill="none" stroke="currentColor" strokeWidth="2" />
+                <path d="M5 20c0-3.6 3.1-6 7-6s7 2.4 7 6" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+              </svg>
+            </button>
+            <button disabled={!selected} className={`tool-btn tool-icon-btn has-delayed-tooltip${info2Open ? " is-active" : ""}`} onClick={() => selected && openInfo2(selected.id)} data-tooltip="Информация 2" aria-label="Информация 2" aria-pressed={info2Open}>
               <svg viewBox="0 0 24 24" width="16" height="16"><path d="M12 16v-4" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><path d="M12 8h.01" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/><path d="M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z" fill="none" stroke="currentColor" strokeWidth="2"/></svg>
             </button>
             <button
               disabled={!selected}
-              className={`tool-btn tool-icon-btn${apTariffsOpen ? " is-active" : ""}`}
+              className={`tool-btn tool-icon-btn has-delayed-tooltip${apTariffsOpen ? " is-active" : ""}`}
               onClick={() => {
                 if (!selected) return;
                 if (!normalizeYmAny(apTariffYmFrom) && normalizeYmAny(serverYm)) {
@@ -2167,15 +2321,16 @@ export default function App() {
                 setApTariffsOpen(true);
                 loadApartmentTariffs(selected.id).catch(() => {});
               }}
-              title="Тарифы"
+              data-tooltip="Тарифы"
+              aria-label="Тарифы"
               aria-pressed={apTariffsOpen}
             >
               <svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 20V4" stroke="currentColor" strokeWidth="2"/><path d="M4 20h16" stroke="currentColor" strokeWidth="2"/><path d="M8 20v-7" stroke="currentColor" strokeWidth="2"/><path d="M12 20v-11" stroke="currentColor" strokeWidth="2"/><path d="M16 20v-5" stroke="currentColor" strokeWidth="2"/><path d="M20 20v-14" stroke="currentColor" strokeWidth="2"/></svg>
             </button>
-            <button disabled={!selected} className={`tool-btn tool-icon-btn${historyOpen ? " is-active" : ""}`} onClick={() => selected && setHistoryOpen(true)} title="История" aria-pressed={historyOpen}>
+            <button disabled={!selected} className={`tool-btn tool-icon-btn has-delayed-tooltip${historyOpen ? " is-active" : ""}`} onClick={() => selected && setHistoryOpen(true)} data-tooltip="История" aria-label="История" aria-pressed={historyOpen}>
               <svg viewBox="0 0 24 24" width="16" height="16"><path d="M3 12a9 9 0 1 0 3-6.7" fill="none" stroke="currentColor" strokeWidth="2"/><path d="M3 4v4h4" stroke="currentColor" strokeWidth="2"/><path d="M12 7v5l3 2" stroke="currentColor" strokeWidth="2"/></svg>
             </button>
-            <button disabled={!selected} className={`tool-btn tool-icon-btn${showGraph ? " is-active" : ""}`} onClick={() => setShowGraph((v) => !v)} title="Графики" aria-pressed={showGraph}>
+            <button disabled={!selected} className={`tool-btn tool-icon-btn has-delayed-tooltip${showGraph ? " is-active" : ""}`} onClick={() => setShowGraph((v) => !v)} data-tooltip="Графики" aria-label="Графики" aria-pressed={showGraph}>
               <svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 16l5-5 4 4 7-7" fill="none" stroke="currentColor" strokeWidth="2"/><path d="M20 7v5h-5" fill="none" stroke="currentColor" strokeWidth="2"/></svg>
             </button>
           </div>
@@ -2245,12 +2400,34 @@ export default function App() {
 
             {!selected ? (
               <div style={{ color: "#666" }}>Выбери квартиру слева или создай новую.</div>
-            ) : loadingHistory ? (
+            ) : loadingHistory && !historyWithFuture.length ? (
               <div style={{ color: "#666" }}>Загрузка...</div>
             ) : !historyWithFuture.length ? (
               <div style={{ color: "#666" }}>Пока нет показаний по этой квартире.</div>
             ) : (
               <>
+                {loadingHistory ? (
+                  <div style={{ marginBottom: 8, color: "var(--muted)", fontSize: 12 }}>Обновляем данные…</div>
+                ) : null}
+                {calcBlockingIssues.length ? (
+                  <div
+                    style={{
+                      marginBottom: 10,
+                      padding: "10px 12px",
+                      borderRadius: 12,
+                      border: "1px solid rgba(239,68,68,0.45)",
+                      background: "rgba(239,68,68,0.08)",
+                      color: "var(--text)",
+                      display: "grid",
+                      gap: 4,
+                    }}
+                  >
+                    <div style={{ fontWeight: 800 }}>Не заполнены обязательные поля для расчета:</div>
+                    {calcBlockingIssues.map((x, i) => (
+                      <div key={`${i}-${x}`} style={{ fontSize: 13 }}>• {x}</div>
+                    ))}
+                  </div>
+                ) : null}
                 <div
                   className="summary-strip"
                   style={{
@@ -2272,10 +2449,16 @@ export default function App() {
                       {latestRentAmount > 0 ? fmtRub(latestRentAmount) : "—"}
                     </div>
                   </div>
-                  <div className="summary-cell summary-cell-counters" style={{ gridColumn: `${summaryCountersCol} / span 1`, textAlign: "center" }}>
-                    <div className="summary-label">Счетчики</div>
+                  <div className="summary-cell summary-cell-counters" style={{ gridColumn: `${summaryUtilitiesPlannedCol} / span 1`, textAlign: "center" }}>
+                    <div className="summary-label">К оплате (счетчики)</div>
                     <div className="summary-value">
                       {latestUtilitiesPlanned == null ? "—" : `${fmtRub(latestUtilitiesPlanned)}`}
+                    </div>
+                  </div>
+                  <div className="summary-cell summary-cell-counters-fact" style={{ gridColumn: `${summaryUtilitiesActualCol} / span 1`, textAlign: "center" }}>
+                    <div className="summary-label">Факт (счетчики)</div>
+                    <div className="summary-value">
+                      {latestUtilitiesActual == null ? "—" : `${fmtRub(latestUtilitiesActual)}`}
                     </div>
                   </div>
                   <div
@@ -2284,7 +2467,7 @@ export default function App() {
                   >
                     <div className="summary-label">Сумма</div>
                     <div className="summary-value">
-                      {latestTotalPlanned == null ? "—" : `${fmtRub(latestTotalPlanned)}`}
+                      {latestTotalDisplay == null ? "—" : `${fmtRub(latestTotalDisplay)}`}
                     </div>
                   </div>
                   <div className="summary-cell summary-cell-actions-spacer" style={{ gridColumn: `${summarySumCol + 1} / span 1` }} />
@@ -2370,8 +2553,10 @@ export default function App() {
                       rows={last4}
                       eN={eN}
                       currentYm={serverYm}
+                      showDualSummary={true}
                       showRentColumn={false}
                       showPolicyColumns={false}
+                      utilitiesForMonth={(m) => utilitiesByMonth.get(m) || null}
                       effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
                       calcSewerDelta={calcSewerDelta}
                       calcElectricT3Fallback={calcElectricT3Fallback}
@@ -2383,6 +2568,7 @@ export default function App() {
                       onResolveReviewFlag={resolveReviewFlag}
                       notificationHighlight={notifHighlight}
                       onCellPhoto={openMeterPhoto}
+                      onInlineSave={saveInlineCell}
                     />
                   )}
                 </div>
@@ -2558,7 +2744,7 @@ export default function App() {
                 </label>
               </div>
 
-              <div style={{ color: "#666", fontSize: 12 }}>Если поле оставить пустым — оно не изменится. Можно вводить с точкой или запятой.</div>
+              <div style={{ color: "#666", fontSize: 12 }}>Если поле оставить пустым — сохранится 0. Можно вводить с точкой или запятой.</div>
 
               <div style={{ borderTop: "1px solid #eee", paddingTop: 12, marginTop: 4 }}>
                 <div style={{ fontWeight: 900, marginBottom: 6 }}>Согласование суммы</div>
@@ -2709,6 +2895,7 @@ export default function App() {
               onResolveReviewFlag={resolveReviewFlag}
               notificationHighlight={notifHighlight}
               onCellPhoto={openMeterPhoto}
+              onInlineSave={saveInlineCell}
             />
           </div>
         </div>
@@ -2804,7 +2991,7 @@ export default function App() {
             }}
           >
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-              <div className="info-modal-title" style={{ fontWeight: 900, fontSize: 18 }}>Карточка квартиры</div>
+              <div className="info-modal-title" style={{ fontWeight: 900, fontSize: 18 }}>Информация по арендатору</div>
               <button className="action-btn" onClick={() => setInfoOpen(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                 Закрыть
               </button>
@@ -2816,33 +3003,7 @@ export default function App() {
               <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
                 <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
                   <label style={{ display: "grid", gap: 4 }}>
-                    <div style={{ fontWeight: 800 }}>Название квартиры *</div>
-                    <input value={infoTitle} onChange={(e) => setInfoTitle(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
-                  </label>
-
-                  <label style={{ display: "grid", gap: 4 }}>
-                    <div style={{ fontWeight: 800 }}>Адрес (необязательно)</div>
-                    <input value={infoAddress} onChange={(e) => setInfoAddress(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
-                  </label>
-                </div>
-
-                {/* <-- добавили: выбор количества фото электро */}
-                <label style={{ display: "grid", gap: 4 }}>
-                  <div style={{ fontWeight: 800 }}>Электро: сколько фото ждём (сколько столбцов показывать)</div>
-                  <select
-                    value={infoElectricExpected}
-                    onChange={(e) => setInfoElectricExpected(e.target.value)}
-                    style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
-                  >
-                    <option value="1">1 (T1)</option>
-                    <option value="2">2 (T1, T2)</option>
-                    <option value="3">3 (T1, T2, T3)</option>
-                  </select>
-                </label>
-
-                <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
-                  <label style={{ display: "grid", gap: 4 }}>
-                    <div style={{ fontWeight: 800 }}>Жилец: имя (для отображения)</div>
+                    <div style={{ fontWeight: 800 }}>Арендатор: имя (для отображения)</div>
                     <input value={infoTenantName} onChange={(e) => setInfoTenantName(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
 
@@ -2859,7 +3020,7 @@ export default function App() {
                       type="date"
                       value={infoTenantSince}
                       onChange={(e) => setInfoTenantSince(e.target.value)}
-                      style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                      style={reqInputStyle(infoTenantSinceMissing)}
                     />
                   </label>
 
@@ -2875,7 +3036,57 @@ export default function App() {
                 </div>
 
                 <div className="info-section" style={{ paddingTop: 8 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Последние изменения аренды</div>
+                  {!infoRentHistory.length ? (
+                    <div style={{ color: "#666" }}>История пока пустая.</div>
+                  ) : (
+                    <div style={{ overflowX: "auto" }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                        <thead>
+                          <tr>
+                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>С месяца</th>
+                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>Сумма (₽)</th>
+                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>Арендатор</th>
+                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>Когда</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {infoRentHistory.map((row) => (
+                            <tr key={row.id}>
+                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{ymDisplay(row.ym_from)}</td>
+                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{fmtRub(Number(row.rent_monthly || 0))}</td>
+                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{(row.tenant_name_snapshot || "—")}</td>
+                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{fmtDateTime(row.changed_at)}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                <div className="info-section" style={{ paddingTop: 8 }}>
                   <div style={{ fontWeight: 900, marginBottom: 8 }}>Оплата счетчиков (режим)</div>
+                  {(infoFixedMissing || infoAdvanceAmountMissing || infoAdvanceCycleMissing || infoAdvanceAnchorMissing) ? (
+                    <div
+                      style={{
+                        marginBottom: 8,
+                        padding: "8px 10px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(239,68,68,0.45)",
+                        background: "rgba(239,68,68,0.08)",
+                        fontSize: 12,
+                        display: "grid",
+                        gap: 2,
+                      }}
+                    >
+                      <div style={{ fontWeight: 800 }}>Заполни обязательные поля для расчета:</div>
+                      {infoFixedMissing ? <div>• Фикс в месяц (₽)</div> : null}
+                      {infoAdvanceAmountMissing ? <div>• Сумма аванса (₽)</div> : null}
+                      {infoAdvanceCycleMissing ? <div>• Длина цикла (мес) — от 2</div> : null}
+                      {infoAdvanceAnchorMissing ? <div>• Старт цикла (YYYY-MM) или Дата заселения</div> : null}
+                    </div>
+                  ) : null}
                   <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
                     <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>Режим оплаты счетчиков</div>
@@ -2910,7 +3121,7 @@ export default function App() {
                           value={infoUtilitiesFixedMonthly}
                           onChange={(e) => setInfoUtilitiesFixedMonthly(e.target.value)}
                           placeholder="3000"
-                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
+                          style={{ ...reqInputStyle(infoFixedMissing), maxWidth: 220 }}
                         />
                       </label>
                     </div>
@@ -2924,7 +3135,7 @@ export default function App() {
                           value={infoUtilitiesAdvanceAmount}
                           onChange={(e) => setInfoUtilitiesAdvanceAmount(e.target.value)}
                           placeholder="9000"
-                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                          style={reqInputStyle(infoAdvanceAmountMissing)}
                         />
                       </label>
                       <label style={{ display: "grid", gap: 4 }}>
@@ -2933,7 +3144,7 @@ export default function App() {
                           value={infoUtilitiesAdvanceCycleMonths}
                           onChange={(e) => setInfoUtilitiesAdvanceCycleMonths(e.target.value)}
                           placeholder="3"
-                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                          style={reqInputStyle(infoAdvanceCycleMissing)}
                         />
                       </label>
                       <label style={{ display: "grid", gap: 4 }}>
@@ -2942,37 +3153,11 @@ export default function App() {
                           value={infoUtilitiesAdvanceAnchorYm}
                           onChange={(e) => setInfoUtilitiesAdvanceAnchorYm(e.target.value)}
                           placeholder="2026-02"
-                          style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                          style={reqInputStyle(infoAdvanceAnchorMissing)}
                         />
                       </label>
                     </div>
                   ) : null}
-                </div>
-
-                <div className="info-section" style={{ paddingTop: 8 }}>
-                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Серийные номера счётчиков</div>
-
-                  <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
-                    <label style={{ display: "grid", gap: 4 }}>
-                      <div style={{ fontWeight: 800 }}>ХВС серийный номер</div>
-                      <input
-                        value={infoColdSerial}
-                        onChange={(e) => setInfoColdSerial(e.target.value)}
-                        placeholder="Только цифры и тире"
-                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
-                      />
-                    </label>
-
-                    <label style={{ display: "grid", gap: 4 }}>
-                      <div style={{ fontWeight: 800 }}>ГВС серийный номер</div>
-                      <input
-                        value={infoHotSerial}
-                        onChange={(e) => setInfoHotSerial(e.target.value)}
-                        placeholder="Только цифры и тире"
-                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
-                      />
-                    </label>
-                  </div>
                 </div>
 
                 <div className="info-section" style={{ paddingTop: 8 }}>
@@ -3050,6 +3235,117 @@ export default function App() {
 
                 <div className="info-footer" style={{ display: "flex", gap: 10, justifyContent: "flex-end", paddingTop: 8, marginTop: 8 }}>
                   <button className="action-btn" onClick={() => setInfoOpen(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
+                    Отмена
+                  </button>
+                  <button className="action-btn is-primary" onClick={() => saveInfo(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
+                    Сохранить
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {info2Open && selected && (
+        <div
+          onClick={() => setInfo2Open(false)}
+          className="modal-overlay"
+          onMouseMove={(e) => {
+            if (!info2Drag.active) return;
+            setInfo2Pos({ x: e.clientX - info2Drag.dx, y: e.clientY - info2Drag.dy });
+          }}
+          onMouseUp={() => setInfo2Drag({ active: false, dx: 0, dy: 0 })}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="modal-shell info-modal"
+            onMouseDown={(e) => {
+              const t = e.target as HTMLElement;
+              if (t.closest("input,select,textarea,button,label,a,[role='button']")) return;
+              setInfo2Drag({ active: true, dx: e.clientX - info2Pos.x, dy: e.clientY - info2Pos.y });
+            }}
+            onKeyDownCapture={(e) => {
+              if (e.key !== "Enter" || e.shiftKey) return;
+              const t = e.target as HTMLElement;
+              if (t.closest("textarea,button")) return;
+              e.preventDefault();
+              saveInfo(selected.id);
+            }}
+            style={{
+              width: 600,
+              maxWidth: "96vw",
+              maxHeight: "92vh",
+              overflow: "auto",
+              fontSize: 13,
+              transform: `translate(${info2Pos.x}px, ${info2Pos.y}px)`,
+              cursor: info2Drag.active ? "grabbing" : "grab",
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
+              <div className="info-modal-title" style={{ fontWeight: 900, fontSize: 18 }}>Информация по объекту</div>
+              <button className="action-btn" onClick={() => setInfo2Open(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
+                Закрыть
+              </button>
+            </div>
+
+            {infoLoading ? (
+              <div style={{ marginTop: 12, color: "#666" }}>Загрузка...</div>
+            ) : (
+              <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+                <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                  <label style={{ display: "grid", gap: 4 }}>
+                    <div style={{ fontWeight: 800 }}>Название квартиры *</div>
+                    <input value={infoTitle} onChange={(e) => setInfoTitle(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
+                  </label>
+
+                  <label style={{ display: "grid", gap: 4 }}>
+                    <div style={{ fontWeight: 800 }}>Адрес (необязательно)</div>
+                    <input value={infoAddress} onChange={(e) => setInfoAddress(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
+                  </label>
+                </div>
+
+                <label style={{ display: "grid", gap: 4 }}>
+                  <div style={{ fontWeight: 800 }}>Электро: сколько фото ждём (сколько столбцов показывать)</div>
+                  <select
+                    value={infoElectricExpected}
+                    onChange={(e) => setInfoElectricExpected(e.target.value)}
+                    style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", maxWidth: 220 }}
+                  >
+                    <option value="1">1 (T1)</option>
+                    <option value="2">2 (T1, T2)</option>
+                    <option value="3">3 (T1, T2, T3)</option>
+                  </select>
+                </label>
+
+                <div className="info-section" style={{ paddingTop: 8 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Серийные номера счётчиков</div>
+
+                  <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                    <label style={{ display: "grid", gap: 4 }}>
+                      <div style={{ fontWeight: 800 }}>ХВС серийный номер</div>
+                      <input
+                        value={infoColdSerial}
+                        onChange={(e) => setInfoColdSerial(e.target.value)}
+                        placeholder="Только цифры и тире"
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                      />
+                    </label>
+
+                    <label style={{ display: "grid", gap: 4 }}>
+                      <div style={{ fontWeight: 800 }}>ГВС серийный номер</div>
+                      <input
+                        value={infoHotSerial}
+                        onChange={(e) => setInfoHotSerial(e.target.value)}
+                        placeholder="Только цифры и тире"
+                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                      />
+                    </label>
+                  </div>
+                </div>
+
+                <div className="info-footer" style={{ display: "flex", gap: 10, justifyContent: "flex-end", paddingTop: 8, marginTop: 8 }}>
+                  <button className="action-btn" onClick={() => setInfo2Open(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                     Отмена
                   </button>
                   <button className="action-btn is-primary" onClick={() => saveInfo(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>

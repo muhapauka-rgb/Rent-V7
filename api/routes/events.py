@@ -724,27 +724,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 except Exception:
                     pass
 
+                # even with anomaly we continue and write value to web,
+                # keeping review flag/notification for admin verification
                 if anomaly:
-                    return JSONResponse(
-                        status_code=200,
-                        content={
-                            "status": "ok",
-                            "chat_id": str(chat_id),
-                            "telegram_username": telegram_username,
-                            "phone": phone,
-                            "photo_event_id": photo_event_id,
-                            "ydisk_path": ydisk_path,
-                            "apartment_id": apartment_id,
-                            "event_status": status,
-                            "ocr": ocr_data,
-                            "meter_written": False,
-                            "ocr_failed": False,
-                            "diag": diag,
-                            "assigned_meter_index": assigned_meter_index,
-                            "ym": ym,
-                            "bill": None,
-                        },
-                    )
+                    diag["warnings"].append({"anomaly_saved_with_review": True})
 
             # 6.1) write meter_readings and get assigned_meter_index
             if kind == "electric":
