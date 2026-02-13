@@ -20,6 +20,11 @@ type HistoryRow = {
 type Props = {
   rows: HistoryRow[];
   eN: number;
+  currentYm?: string;
+  showRentColumn?: boolean;
+  rentForMonth?: (ym: string) => number;
+  showPolicyColumns?: boolean;
+  utilitiesForMonth?: (ym: string) => { actual: number | null; planned: number | null; carry: number | null } | null;
 
   effectiveTariffForMonth: (ym: string) => any;
 
@@ -48,6 +53,11 @@ export default function MetersTable(props: Props) {
   const {
     rows,
     eN,
+    currentYm,
+    showRentColumn = false,
+    rentForMonth,
+    showPolicyColumns = false,
+    utilitiesForMonth,
     effectiveTariffForMonth,
     calcElectricT3Fallback,
     calcSewerDelta,
@@ -62,13 +72,38 @@ export default function MetersTable(props: Props) {
   } = props;
 
   const n = Math.max(1, Math.min(3, Number.isFinite(eN) ? eN : 3));
+  const equalColWidth = `calc((100% - 56px) / ${n + 5 + (showRentColumn ? 1 : 0) + (showPolicyColumns ? 3 : 0)})`;
+
+  function ymRuLabel(ym: string): string {
+    if (!/^\d{4}-\d{2}$/.test(ym || "")) return ym;
+    const months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"];
+    const y = Number(ym.slice(0, 4));
+    const m = Number(ym.slice(5, 7)) - 1;
+    if (!Number.isFinite(y) || m < 0 || m > 11) return ym;
+    return `${months[m]} ${y}`;
+  }
 
   return (
-    <div style={{ marginTop: 12 }}>
-      <table style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+    <div className="table-wrap-react">
+      <table className="table canvas-table" style={{ width: "100%", borderCollapse: "collapse", tableLayout: "fixed" }}>
+        <colgroup>
+          <col style={{ width: equalColWidth }} />
+          <col style={{ width: equalColWidth }} />
+          <col style={{ width: equalColWidth }} />
+          <col style={{ width: equalColWidth }} />
+          {n >= 1 && <col style={{ width: equalColWidth }} />}
+          {n >= 2 && <col style={{ width: equalColWidth }} />}
+          {n >= 3 && <col style={{ width: equalColWidth }} />}
+          {showRentColumn && <col style={{ width: equalColWidth }} />}
+          {showPolicyColumns && <col style={{ width: equalColWidth }} />}
+          {showPolicyColumns && <col style={{ width: equalColWidth }} />}
+          {showPolicyColumns && <col style={{ width: equalColWidth }} />}
+          <col style={{ width: equalColWidth }} />
+          <col style={{ width: 56 }} />
+        </colgroup>
         <thead>
           <tr>
-            <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Месяц</th>
+            <th style={{ textAlign: "left", padding: "8px 8px 8px 12px", borderBottom: "1px solid #eee" }}>Месяц</th>
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ХВС</th>
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>ГВС</th>
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Водоотв</th>
@@ -76,9 +111,12 @@ export default function MetersTable(props: Props) {
             {n >= 1 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T1</th>}
             {n >= 2 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T2</th>}
             {n >= 3 && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>T3</th>}
-
+            {showRentColumn && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Аренда</th>}
+            {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Начислено факт</th>}
+            {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>К оплате</th>}
+            {showPolicyColumns && <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Баланс</th>}
             <th style={{ textAlign: "left", padding: 8, borderBottom: "1px solid #eee" }}>Сумма</th>
-            <th style={{ textAlign: "left", padding: "8px 0", borderBottom: "1px solid #eee", width: 240 }}></th>
+            <th style={{ textAlign: "right", padding: "8px 0", borderBottom: "1px solid #eee", width: 56 }}></th>
           </tr>
         </thead>
 
@@ -143,11 +181,14 @@ export default function MetersTable(props: Props) {
 
             // Сумма = ХВС + ГВС + (T1 если показываем) + (T2 если показываем) + водоотведение
             const sum = isComplete ? calcSumRub(rc, rh, n >= 1 ? re1 : null, n >= 2 ? re2 : null, rs) : null;
+            const isCurrent = (currentYm || "").trim() !== "" && h.month === currentYm;
+            const rent = showRentColumn && rentForMonth ? rentForMonth(h.month) : 0;
+            const utilities = showPolicyColumns && utilitiesForMonth ? utilitiesForMonth(h.month) : null;
 
 
             return (
-              <tr key={h.month}>
-                <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap" }}>{h.month}</td>
+              <tr key={h.month} className={isCurrent ? "is-current" : ""}>
+                <td style={{ padding: "8px 8px 8px 12px", borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap" }}>{ymRuLabel(h.month)}</td>
 
                 <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2" }}>
                   <div
@@ -246,25 +287,50 @@ export default function MetersTable(props: Props) {
                   </td>
                 )}
 
-                <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 900 }}>
-                  {sum == null ? "—" : `₽ ${fmtRub(sum)}`}
+                {showRentColumn && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {rent > 0 ? fmtRub(rent) : "—"}
+                  </td>
+                )}
+                {showPolicyColumns && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {utilities?.actual == null ? "—" : `${fmtRub(utilities.actual)}`}
+                  </td>
+                )}
+                {showPolicyColumns && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {utilities?.planned == null ? "—" : `${fmtRub(utilities.planned)}`}
+                  </td>
+                )}
+                {showPolicyColumns && (
+                  <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                    {utilities?.carry == null ? "—" : `${fmtRub(utilities.carry)}`}
+                  </td>
+                )}
+
+                <td style={{ padding: 8, borderBottom: "1px solid #f2f2f2", whiteSpace: "nowrap", fontWeight: 500 }}>
+                  {sum == null ? "—" : `${fmtRub(sum)}`}
                 </td>
 
-                <td style={{ padding: "8px 0", borderBottom: "1px solid #f2f2f2", width: 240 }}>
+                <td style={{ padding: "8px 0", borderBottom: "1px solid #f2f2f2", width: 56, textAlign: "right" }}>
                   <button
                     onClick={() => openEdit(h.month)}
+                    className="btn secondary table-edit-btn"
                     style={{
                       width: "100%",
                       padding: "10px 12px",
                       borderRadius: 14,
-                      border: "1px solid #e5e7eb",
-                      background: "white",
-                      color: "#111",
+                      border: "1px solid transparent",
+                      background: "transparent",
+                      color: "var(--text)",
                       cursor: "pointer",
-                      fontWeight: 900,
+                      fontWeight: 500,
                     }}
                   >
-                    Редактировать
+                    <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                      <path d="M12 20h9" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+                      <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
                   </button>
                 </td>
               </tr>
