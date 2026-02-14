@@ -412,6 +412,70 @@ def _make_water_digit_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     return out[:6]
 
 
+def _pick_best_candidate(candidates: list[dict]) -> tuple[dict, float]:
+    best = None
+    best_score = -1e9
+    for c in candidates:
+        t = str(c.get("type") or "unknown")
+        reading = c.get("reading")
+        conf = float(c.get("confidence") or 0.0)
+        provider = str(c.get("provider") or "")
+        serial = c.get("serial")
+        black_digits = c.get("black_digits")
+        red_digits = c.get("red_digits")
+
+        score = conf
+        if reading is not None:
+            score += 0.20
+        if t != "unknown":
+            score += 0.04
+        if provider == "water_digit":
+            score += 0.20
+            if black_digits and len(str(black_digits)) >= 3:
+                score += 0.12
+            if red_digits and len(str(red_digits)) in (2, 3):
+                score += 0.10
+            if _digits_overlap_serial(black_digits, serial):
+                score -= 0.70
+        if reading is not None and reading <= 0:
+            score -= 0.40
+
+        if score > best_score:
+            best = c
+            best_score = score
+
+    if best is None:
+        raise HTTPException(status_code=500, detail="openai_empty_response")
+
+    # heuristic: if winner is "too small with leading zeros", but there is a comparable
+    # high-confidence candidate with much larger reading, prefer the larger one.
+    if str(best.get("provider") or "") == "water_digit" and best.get("reading") is not None:
+        bdigits = _normalize_digits(best.get("black_digits"))
+        best_reading = float(best.get("reading"))
+        best_conf = float(best.get("confidence") or 0.0)
+        if bdigits and bdigits.startswith("00") and best_reading < 300.0:
+            larger = []
+            for c in candidates:
+                if str(c.get("provider") or "") != "water_digit":
+                    continue
+                rv = c.get("reading")
+                if rv is None:
+                    continue
+                try:
+                    r = float(rv)
+                except Exception:
+                    continue
+                cf = float(c.get("confidence") or 0.0)
+                if cf >= max(0.80, best_conf - 0.08) and r >= best_reading * 3.0 and r <= 5000.0:
+                    larger.append((cf, r, c))
+            if larger:
+                larger.sort(key=lambda x: (x[0], x[1]), reverse=True)
+                best = larger[0][2]
+                best_score = larger[0][0]
+
+    return best, best_score
+
+
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
     img = await file.read()
@@ -490,41 +554,8 @@ async def recognize(file: UploadFile = File(...)):
     if not candidates:
         raise HTTPException(status_code=500, detail="openai_empty_response")
 
-    best = None
-    best_score = -1e9
-    chosen_label = "orig"
-    for c in candidates:
-        t = str(c.get("type") or "unknown")
-        reading = c.get("reading")
-        conf = float(c.get("confidence") or 0.0)
-        provider = str(c.get("provider") or "")
-        serial = c.get("serial")
-        black_digits = c.get("black_digits")
-        red_digits = c.get("red_digits")
-
-        score = conf
-        if reading is not None:
-            score += 0.20
-        if t != "unknown":
-            score += 0.04
-        if provider == "water_digit":
-            score += 0.20
-            if black_digits and len(str(black_digits)) >= 3:
-                score += 0.12
-            if red_digits and len(str(red_digits)) in (2, 3):
-                score += 0.10
-            if _digits_overlap_serial(black_digits, serial):
-                score -= 0.70
-        if reading is not None and reading <= 0:
-            score -= 0.40
-
-        if score > best_score:
-            best = c
-            best_score = score
-            chosen_label = str(c.get("variant") or "orig")
-
-    if best is None:
-        raise HTTPException(status_code=500, detail="openai_empty_response")
+    best, _ = _pick_best_candidate(candidates)
+    chosen_label = str(best.get("variant") or "orig")
 
     t = best["type"]
     reading = best["reading"]
