@@ -66,6 +66,26 @@ SYSTEM_PROMPT = """Ты — OCR-ассистент для коммунальны
 Только JSON. Никакого текста вокруг JSON.
 """
 
+WATER_ODOMETER_PROMPT = """Ты — OCR только для окна цифр водяного счётчика.
+Верни строго JSON:
+{
+  "type": "ХВС|ГВС|unknown",
+  "black_digits": "<только цифры или null>",
+  "red_digits": "<только цифры или null>",
+  "reading": <number|null>,
+  "serial": <string|null>,
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Чёрные цифры = целая часть.
+- Красные цифры = дробная часть (обычно 2-3 знака).
+- Если есть black_digits и red_digits, reading = black_digits.red_digits.
+- Не используй серийный номер как показание.
+- Если не уверен, лучше null.
+- Только JSON.
+"""
+
 
 def _guess_mime(filename: Optional[str], content_type: Optional[str]) -> str:
     """
@@ -203,7 +223,7 @@ def _plausibility_filter(t: str, reading: Optional[float], conf: float) -> Tuple
     return reading, conf, ""
 
 
-def _call_openai_vision(image_bytes: bytes, mime: str) -> dict:
+def _call_openai_vision(image_bytes: bytes, mime: str, *, system_prompt: Optional[str] = None, user_text: Optional[str] = None) -> dict:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
@@ -214,11 +234,14 @@ def _call_openai_vision(image_bytes: bytes, mime: str) -> dict:
         "model": OCR_MODEL,
         "temperature": 0,
         "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt or SYSTEM_PROMPT},
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": "Определи тип счётчика и показание. Верни JSON строго по схеме."},
+                    {
+                        "type": "text",
+                        "text": user_text or "Определи тип счётчика и показание. Верни JSON строго по схеме.",
+                    },
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             },
@@ -329,6 +352,66 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     return variants[:3]
 
 
+def _normalize_digits(value) -> Optional[str]:
+    if value is None:
+        return None
+    d = "".join(ch for ch in str(value) if ch.isdigit())
+    return d or None
+
+
+def _reading_from_digits(black_digits: Optional[str], red_digits: Optional[str]) -> Optional[float]:
+    if not black_digits:
+        return None
+    try:
+        if red_digits:
+            return float(f"{int(black_digits)}.{red_digits}")
+        return float(int(black_digits))
+    except Exception:
+        return None
+
+
+def _digits_overlap_serial(black_digits: Optional[str], serial: Optional[str]) -> bool:
+    b = _normalize_digits(black_digits)
+    s = _normalize_digits(serial)
+    if not b or not s:
+        return False
+    b_nz = b.lstrip("0")
+    s_nz = s.lstrip("0")
+    if not b_nz or not s_nz:
+        return False
+    return b_nz in s_nz or s_nz.endswith(b_nz)
+
+
+def _make_water_digit_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return out
+
+    w, h = img.size
+    # Кропы верхней средней части, где чаще всего окно с цифрами у воды.
+    boxes = [
+        (int(w * 0.22), int(h * 0.28), int(w * 0.86), int(h * 0.52)),
+        (int(w * 0.18), int(h * 0.24), int(w * 0.90), int(h * 0.50)),
+        (int(w * 0.26), int(h * 0.30), int(w * 0.84), int(h * 0.56)),
+    ]
+    for idx, (x1, y1, x2, y2) in enumerate(boxes, start=1):
+        x1 = max(0, min(x1, w - 1))
+        y1 = max(0, min(y1, h - 1))
+        x2 = max(x1 + 1, min(x2, w))
+        y2 = max(y1 + 1, min(y2, h))
+        crop = img.crop((x1, y1, x2, y2))
+        crop = crop.resize((max(1, crop.width * 4), max(1, crop.height * 4)))
+        sharp = ImageEnhance.Contrast(crop).enhance(1.8).filter(
+            ImageFilter.UnsharpMask(radius=1, percent=240, threshold=2)
+        )
+        bw = ImageOps.autocontrast(sharp.convert("L")).point(lambda p: 255 if p > 150 else 0, "L").convert("RGB")
+        out.append((f"odo_strip_{idx}", _encode_jpeg(sharp, quality=95)))
+        out.append((f"odo_strip_bw_{idx}", _encode_jpeg(bw, quality=95)))
+    return out[:6]
+
+
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
     img = await file.read()
@@ -338,9 +421,7 @@ async def recognize(file: UploadFile = File(...)):
     mime = _guess_mime(file.filename, file.content_type)
     variants = _make_variants(img)
 
-    best = None
-    best_score = -1.0
-    chosen_label = "orig"
+    candidates = []
     for label, b in variants:
         resp = _call_openai_vision(b, mime=mime)
 
@@ -354,27 +435,93 @@ async def recognize(file: UploadFile = File(...)):
         # plausibility
         reading, conf, note2 = _plausibility_filter(t, reading, conf)
 
-        score = float(conf)
-        if reading is not None:
-            score += 0.15
-        if t != "unknown":
-            score += 0.05
-
-        if score > best_score:
-            best_score = score
-            best = {
+        candidates.append(
+            {
                 "type": t,
                 "reading": reading,
                 "serial": serial,
                 "confidence": conf,
                 "notes": str(resp.get("notes", "") or ""),
                 "note2": note2,
+                "variant": label,
+                "provider": "base",
+                "black_digits": None,
+                "red_digits": None,
             }
-            chosen_label = label
+        )
 
-        # early exit if strong
-        if conf >= 0.85 and reading is not None:
-            break
+    # Water digit-first pass (independent candidates)
+    for label, wb in _make_water_digit_variants(img):
+        try:
+            wr = _call_openai_vision(
+                wb,
+                mime="image/jpeg",
+                system_prompt=WATER_ODOMETER_PROMPT,
+                user_text="Считай только окно цифр воды: black_digits, red_digits, reading.",
+            )
+        except Exception:
+            continue
+        t = _sanitize_type(wr.get("type", "unknown"))
+        serial = wr.get("serial", None)
+        if isinstance(serial, str):
+            serial = serial.strip() or None
+        conf = _clamp_confidence(wr.get("confidence", 0.0))
+        black_digits = _normalize_digits(wr.get("black_digits"))
+        red_digits = _normalize_digits(wr.get("red_digits"))
+        reading = _reading_from_digits(black_digits, red_digits)
+        if reading is None:
+            reading = _normalize_reading(wr.get("reading", None))
+        reading, conf, note2 = _plausibility_filter(t, reading, conf)
+        candidates.append(
+            {
+                "type": t,
+                "reading": reading,
+                "serial": serial,
+                "confidence": conf,
+                "notes": str(wr.get("notes", "") or ""),
+                "note2": note2,
+                "variant": label,
+                "provider": "water_digit",
+                "black_digits": black_digits,
+                "red_digits": red_digits,
+            }
+        )
+
+    if not candidates:
+        raise HTTPException(status_code=500, detail="openai_empty_response")
+
+    best = None
+    best_score = -1e9
+    chosen_label = "orig"
+    for c in candidates:
+        t = str(c.get("type") or "unknown")
+        reading = c.get("reading")
+        conf = float(c.get("confidence") or 0.0)
+        provider = str(c.get("provider") or "")
+        serial = c.get("serial")
+        black_digits = c.get("black_digits")
+        red_digits = c.get("red_digits")
+
+        score = conf
+        if reading is not None:
+            score += 0.20
+        if t != "unknown":
+            score += 0.04
+        if provider == "water_digit":
+            score += 0.20
+            if black_digits and len(str(black_digits)) >= 3:
+                score += 0.12
+            if red_digits and len(str(red_digits)) in (2, 3):
+                score += 0.10
+            if _digits_overlap_serial(black_digits, serial):
+                score -= 0.70
+        if reading is not None and reading <= 0:
+            score -= 0.40
+
+        if score > best_score:
+            best = c
+            best_score = score
+            chosen_label = str(c.get("variant") or "orig")
 
     if best is None:
         raise HTTPException(status_code=500, detail="openai_empty_response")
@@ -393,6 +540,10 @@ async def recognize(file: UploadFile = File(...)):
         else:
             notes = note2
     notes = (notes.strip() or "")
+    if best.get("provider") == "water_digit":
+        bd = best.get("black_digits")
+        rd = best.get("red_digits")
+        notes = (notes + f"; digits={bd or 'null'}/{rd or 'null'}").strip()
     notes = (notes + (f"; variant={chosen_label}" if chosen_label else "")).strip()[:200]
 
     return {
