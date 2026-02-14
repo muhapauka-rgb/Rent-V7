@@ -86,6 +86,20 @@ WATER_ODOMETER_PROMPT = """Ты — OCR только для окна цифр в
 - Только JSON.
 """
 
+WATER_RED_DIGITS_PROMPT = """Ты видишь ТОЛЬКО красную дробную часть (правые цифры) водяного счётчика.
+Верни строго JSON:
+{
+  "red_digits": "<ровно 3 цифры или null>",
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Возвращай только красные цифры справа.
+- Если уверен только в 2 цифрах, всё равно попробуй определить 3-ю; если не получается — null.
+- Никаких букв, только цифры.
+- Только JSON.
+"""
+
 
 def _guess_mime(filename: Optional[str], content_type: Optional[str]) -> str:
     """
@@ -412,6 +426,27 @@ def _make_water_digit_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     return out[:6]
 
 
+def _make_red_zone_variants(strip_jpeg: bytes) -> list[bytes]:
+    out: list[bytes] = []
+    try:
+        img = Image.open(BytesIO(strip_jpeg)).convert("RGB")
+    except Exception:
+        return out
+    w, h = img.size
+    boxes = [
+        (int(w * 0.66), int(h * 0.08), int(w * 0.99), int(h * 0.92)),
+        (int(w * 0.62), int(h * 0.02), int(w * 0.98), int(h * 0.88)),
+    ]
+    for (x1, y1, x2, y2) in boxes:
+        crop = img.crop((max(0, x1), max(0, y1), min(w, x2), min(h, y2)))
+        crop = crop.resize((max(1, crop.width * 4), max(1, crop.height * 4)))
+        c = ImageEnhance.Contrast(crop).enhance(2.0).filter(
+            ImageFilter.UnsharpMask(radius=1, percent=260, threshold=2)
+        )
+        out.append(_encode_jpeg(c, quality=95))
+    return out[:2]
+
+
 def _pick_best_candidate(candidates: list[dict]) -> tuple[dict, float]:
     best = None
     best_score = -1e9
@@ -532,6 +567,23 @@ async def recognize(file: UploadFile = File(...)):
         conf = _clamp_confidence(wr.get("confidence", 0.0))
         black_digits = _normalize_digits(wr.get("black_digits"))
         red_digits = _normalize_digits(wr.get("red_digits"))
+        # If fractional red part is weak, run dedicated red-zone OCR.
+        if (not red_digits) or (len(red_digits) < 3):
+            for rz in _make_red_zone_variants(wb):
+                try:
+                    rr = _call_openai_vision(
+                        rz,
+                        mime="image/jpeg",
+                        system_prompt=WATER_RED_DIGITS_PROMPT,
+                        user_text="Верни только red_digits.",
+                    )
+                except Exception:
+                    continue
+                rz_digits = _normalize_digits(rr.get("red_digits"))
+                rz_conf = _clamp_confidence(rr.get("confidence", 0.0))
+                if rz_digits and len(rz_digits) >= 3 and rz_conf >= 0.55:
+                    red_digits = rz_digits[:3]
+                    break
         reading = _reading_from_digits(black_digits, red_digits)
         if reading is None:
             reading = _normalize_reading(wr.get("reading", None))
