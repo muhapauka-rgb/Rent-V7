@@ -855,7 +855,9 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
     ocr = js.get("ocr") or {}
     ocr_type = ocr.get("type")
-    ocr_reading = ocr.get("reading")
+    ocr_reading = ocr.get("effective_reading")
+    if ocr_reading is None:
+        ocr_reading = ocr.get("reading")
 
     meter_written = js.get("meter_written")
     ocr_failed = bool(js.get("ocr_failed"))

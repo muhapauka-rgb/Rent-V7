@@ -242,6 +242,203 @@ def _get_same_month_electric_values(conn, apartment_id: int, ym: str) -> list[fl
     return out
 
 
+def _whole_part(value: float | None) -> int | None:
+    if value is None:
+        return None
+    try:
+        v = float(value)
+        if v < 0:
+            return None
+        return int(v)
+    except Exception:
+        return None
+
+
+def _recover_water_fraction_value(
+    conn,
+    *,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    whole_part: int,
+) -> float | None:
+    mt = str(meter_type or "").strip().lower()
+    if mt not in ("cold", "hot"):
+        return None
+
+    def _match_whole(v) -> float | None:
+        try:
+            fv = float(v)
+        except Exception:
+            return None
+        if fv < 0:
+            return None
+        if int(fv) != int(whole_part):
+            return None
+        return float(fv)
+
+    # 1) Последние исправленные админом значения (таблица обучения OCR) — приоритетно.
+    rows = conn.execute(
+        text(
+            """
+            SELECT correct_value
+            FROM ocr_training_samples
+            WHERE apartment_id=:aid AND meter_type=:mt AND correct_value IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 30
+            """
+        ),
+        {"aid": int(apartment_id), "mt": mt},
+    ).fetchall()
+    for (v,) in (rows or []):
+        mv = _match_whole(v)
+        if mv is not None:
+            return mv
+
+    # 2) Текущий месяц — только ручная фиксация (OCR-значения здесь могут быть шумными).
+    rows = conn.execute(
+        text(
+            """
+            SELECT value, source
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=1
+              AND value IS NOT NULL
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 5
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": mt},
+    ).fetchall()
+    for v, src in (rows or []):
+        if str(src or "") != "manual":
+            continue
+        mv = _match_whole(v)
+        if mv is not None:
+            return mv
+
+    # 3) История показаний по этому типу
+    rows = conn.execute(
+        text(
+            """
+            SELECT value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym<:ym AND meter_type=:mt AND meter_index=1
+              AND value IS NOT NULL
+            ORDER BY ym DESC
+            LIMIT 24
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": mt},
+    ).fetchall()
+    for (v,) in (rows or []):
+        mv = _match_whole(v)
+        if mv is not None:
+            return mv
+
+    return None
+
+
+def _recover_water_nearby_value(
+    conn,
+    *,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    current_value: float,
+    max_delta: float = 20.0,
+) -> float | None:
+    mt = str(meter_type or "").strip().lower()
+    if mt not in ("cold", "hot"):
+        return None
+    try:
+        cur = float(current_value)
+    except Exception:
+        return None
+
+    pool: list[tuple[int, float]] = []
+
+    # 1) Исправленные админом значения (наиболее надежные).
+    rows = conn.execute(
+        text(
+            """
+            SELECT correct_value
+            FROM ocr_training_samples
+            WHERE apartment_id=:aid AND meter_type=:mt AND correct_value IS NOT NULL
+            ORDER BY created_at DESC
+            LIMIT 60
+            """
+        ),
+        {"aid": int(apartment_id), "mt": mt},
+    ).fetchall()
+    for (v,) in (rows or []):
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if fv < 0:
+            continue
+        pool.append((0, fv))
+
+    # 2) Текущий месяц ручные значения (если уже подтверждали).
+    rows = conn.execute(
+        text(
+            """
+            SELECT value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=1
+              AND source='manual' AND value IS NOT NULL
+            ORDER BY updated_at DESC NULLS LAST
+            LIMIT 10
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": mt},
+    ).fetchall()
+    for (v,) in (rows or []):
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if fv < 0:
+            continue
+        pool.append((1, fv))
+
+    # 3) История показаний.
+    rows = conn.execute(
+        text(
+            """
+            SELECT value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym<:ym AND meter_type=:mt AND meter_index=1
+              AND value IS NOT NULL
+            ORDER BY ym DESC
+            LIMIT 36
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": mt},
+    ).fetchall()
+    for (v,) in (rows or []):
+        try:
+            fv = float(v)
+        except Exception:
+            continue
+        if fv < 0:
+            continue
+        pool.append((2, fv))
+
+    if not pool:
+        return None
+
+    candidates = []
+    for priority, fv in pool:
+        d = abs(float(fv) - cur)
+        if d <= float(max_delta):
+            candidates.append((d, priority, fv))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x[0], x[1]))
+    return float(candidates[0][2])
+
+
 def _flag_manual_overwrite(
     conn,
     *,
@@ -400,12 +597,22 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         ocr_conf = 0.0
     is_water_unknown = str(ocr_type or "").strip().lower() == "unknown"
     water_like_ocr = (ocr_provider in ("water_digit", "paddle_seq")) or bool(ocr_black_digits)
+    water_fraction_missing = False
 
-    # Water safety gate: don't auto-accept reading without full 3-digit fractional part.
+    # Water safety gate:
+    # если дробная часть неполная, не обнуляем распознавание, а сохраняем целую часть
+    # и помечаем как uncertain (дальше попробуем восстановить дробь по истории).
     if water_like_ocr and (value_float is not None):
         if (not ocr_red_digits) or (len(ocr_red_digits) != 3):
+            water_fraction_missing = True
             diag["warnings"].append({"water_fraction_missing": {"black_digits": ocr_black_digits, "red_digits": ocr_red_digits}})
-            value_float = None
+            try:
+                if ocr_black_digits:
+                    value_float = float(int(ocr_black_digits))
+                else:
+                    value_float = float(int(float(value_float)))
+            except Exception:
+                pass
 
     if kind != "electric":
         meter_index = 1
@@ -888,6 +1095,66 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 prev_map[str(mt)] = (float(v), str(src))
                         except Exception:
                             prev_map = {}
+                        # Внутримесячный hard-guard: новые OCR-значения воды не должны
+                        # заметно падать относительно уже записанных в этом же месяце.
+                        # Иначе переводим событие в проверку и не перезаписываем данные.
+                        try:
+                            cur_vals = [float(vs[0]) for vs in prev_map.values() if vs and (vs[0] is not None)]
+                            if cur_vals and (value_float is not None):
+                                cur_value = float(value_float)
+                                cur_whole = int(cur_value) if cur_value >= 0 else 0
+                                ref_val = min(
+                                    cur_vals,
+                                    key=lambda v: (abs(int(float(v)) - cur_whole), abs(float(v) - cur_value)),
+                                )
+                                if cur_value + WATER_RETAKE_THRESHOLD < float(ref_val):
+                                    diag["warnings"].append(
+                                        {
+                                            "water_same_month_drop_block": {
+                                                "value": float(cur_value),
+                                                "current_ref": float(ref_val),
+                                                "threshold": float(WATER_RETAKE_THRESHOLD),
+                                            }
+                                        }
+                                    )
+                                    if photo_event_id:
+                                        diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+                                        conn.execute(
+                                            text(
+                                                """
+                                                UPDATE photo_events
+                                                SET
+                                                    meter_written = false,
+                                                    stage = 'needs_review',
+                                                    stage_updated_at = now(),
+                                                    diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                                                WHERE id = :id
+                                                """
+                                            ),
+                                            {"id": int(photo_event_id), "diag_json": diag_json_str},
+                                        )
+                                    return JSONResponse(
+                                        status_code=200,
+                                        content={
+                                            "status": "ok",
+                                            "chat_id": str(chat_id),
+                                            "telegram_username": telegram_username,
+                                            "phone": phone,
+                                            "photo_event_id": photo_event_id,
+                                            "ydisk_path": ydisk_path,
+                                            "apartment_id": apartment_id,
+                                            "event_status": status,
+                                            "ocr": ocr_data,
+                                            "meter_written": False,
+                                            "ocr_failed": False,
+                                            "diag": diag,
+                                            "assigned_meter_index": assigned_meter_index,
+                                            "ym": ym,
+                                            "bill": None,
+                                        },
+                                    )
+                        except Exception:
+                            pass
                         # --- serial-based routing: if serial matches apartment, force meter_type ---
                         force_kind = None
                         force_no_sort = False
@@ -1021,8 +1288,128 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             force_kind = None
                             force_no_sort = False
 
+                        # Для воды пытаемся восстановить дробную часть по подтвержденной истории:
+                        # 1) если дробь не распознана (основной кейс),
+                        # 2) если дробь распознана, но значение "откатывается" вниз в пределах той же целой части.
+                        #    Это типично для неверного чтения красных барабанов.
+                        if value_float is not None:
+                            target_kind = None
+                            if force_kind in ("cold", "hot"):
+                                target_kind = str(force_kind)
+                            elif kind in ("cold", "hot"):
+                                target_kind = str(kind)
+
+                            whole = _whole_part(value_float)
+                            recovered = None
+                            if target_kind and (whole is not None):
+                                recovered = _recover_water_fraction_value(
+                                    conn,
+                                    apartment_id=int(apartment_id),
+                                    ym=str(ym),
+                                    meter_type=str(target_kind),
+                                    whole_part=int(whole),
+                                )
+                            elif whole is not None:
+                                # fallback: если тип пока неизвестен, пробуем оба; применяем только однозначный матч.
+                                rec_cold = _recover_water_fraction_value(
+                                    conn,
+                                    apartment_id=int(apartment_id),
+                                    ym=str(ym),
+                                    meter_type="cold",
+                                    whole_part=int(whole),
+                                )
+                                rec_hot = _recover_water_fraction_value(
+                                    conn,
+                                    apartment_id=int(apartment_id),
+                                    ym=str(ym),
+                                    meter_type="hot",
+                                    whole_part=int(whole),
+                                )
+                                if (rec_cold is not None) and (rec_hot is None):
+                                    recovered = rec_cold
+                                    force_kind = "cold"
+                                    force_no_sort = True
+                                elif (rec_hot is not None) and (rec_cold is None):
+                                    recovered = rec_hot
+                                    force_kind = "hot"
+                                    force_no_sort = True
+
+                            # Если точного совпадения по целой части нет, пробуем "ближайшее"
+                            # подтвержденное значение (обычно это исправленные админом данные).
+                            if (recovered is None) and water_fraction_missing and (value_float is not None):
+                                if target_kind in ("cold", "hot"):
+                                    recovered = _recover_water_nearby_value(
+                                        conn,
+                                        apartment_id=int(apartment_id),
+                                        ym=str(ym),
+                                        meter_type=str(target_kind),
+                                        current_value=float(value_float),
+                                        max_delta=20.0,
+                                    )
+                                elif force_kind in ("cold", "hot"):
+                                    recovered = _recover_water_nearby_value(
+                                        conn,
+                                        apartment_id=int(apartment_id),
+                                        ym=str(ym),
+                                        meter_type=str(force_kind),
+                                        current_value=float(value_float),
+                                        max_delta=20.0,
+                                    )
+
+                            if recovered is not None:
+                                try:
+                                    prev_val = float(value_float)
+                                except Exception:
+                                    prev_val = None
+                                apply_recovered = False
+                                recover_mode = None
+                                if water_fraction_missing:
+                                    apply_recovered = True
+                                    recover_mode = "missing_fraction"
+                                else:
+                                    # Если целая часть совпала, но OCR-значение ниже исторически подтвержденного:
+                                    # считаем это ошибкой дробной части и поднимаем до recovered.
+                                    # Ограничиваем разницу 1.0 (только внутри одного целого шага).
+                                    try:
+                                        if (
+                                            (prev_val is not None)
+                                            and (float(prev_val) < float(recovered))
+                                            and (float(recovered) - float(prev_val) <= 0.9995)
+                                            and (int(float(prev_val)) == int(float(recovered)))
+                                        ):
+                                            apply_recovered = True
+                                            recover_mode = "fraction_regression"
+                                    except Exception:
+                                        apply_recovered = False
+
+                                if apply_recovered:
+                                    value_float = float(recovered)
+                                    diag["warnings"].append(
+                                        {
+                                            "water_fraction_recovered": {
+                                                "from": prev_val,
+                                                "to": float(recovered),
+                                                "meter_type": str(force_kind or kind or "unknown"),
+                                                "mode": str(recover_mode or "unknown"),
+                                            }
+                                        }
+                                    )
+                            elif water_fraction_missing:
+                                diag["warnings"].append(
+                                    {
+                                        "water_fraction_unrecovered": {
+                                            "meter_type": str(force_kind or kind or "unknown"),
+                                            "black_digits": ocr_black_digits,
+                                        }
+                                    }
+                                )
+
                         # если OCR не уверен в типе, сортируем как max->ХВС, min->ГВС
-                        water_uncertain = is_water_unknown or (kind in ("cold", "hot") and ocr_conf < WATER_TYPE_CONF_MIN)
+                        water_uncertain = (
+                            bool(water_fraction_missing)
+                            or is_water_unknown
+                            or (kind in ("cold", "hot") and ocr_conf < WATER_TYPE_CONF_MIN)
+                        )
                         if water_uncertain:
                             diag["warnings"].append({"water_type_uncertain": {"confidence": ocr_conf, "ocr_type": ocr_type}})
                         force_sort = _has_open_water_uncertain_flag(conn, int(apartment_id), str(ym))
@@ -1124,6 +1511,30 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         # If serial matched, do not force sort even if uncertain
                         if force_kind and force_no_sort:
                             force_sort = False
+
+                        # Для воды запрещаем "откат" показаний вниз в рамках месяца
+                        # для уже определенного типа счетчика.
+                        guard_kind = None
+                        if force_kind in ("cold", "hot"):
+                            guard_kind = str(force_kind)
+                        elif kind in ("cold", "hot"):
+                            guard_kind = str(kind)
+                        if guard_kind and (guard_kind in prev_map) and (value_float is not None):
+                            try:
+                                prev_same = float(prev_map[guard_kind][0])
+                                if float(value_float) < prev_same:
+                                    diag["warnings"].append(
+                                        {
+                                            "water_non_decreasing_clamp": {
+                                                "meter_type": str(guard_kind),
+                                                "from": float(value_float),
+                                                "to": float(prev_same),
+                                            }
+                                        }
+                                    )
+                                    value_float = float(prev_same)
+                            except Exception:
+                                pass
 
                         assigned_kind = _write_water_ocr_with_uncertainty(
                             conn,
@@ -1350,6 +1761,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     meter_written = true,
                                     meter_index = :meter_index,
                                     meter_kind = COALESCE(:meter_kind, meter_kind),
+                                    ocr_reading = COALESCE(:ocr_reading, ocr_reading),
                                     meter_value = COALESCE(:meter_value, meter_value),
                                     stage = 'meter_written',
                                     stage_updated_at = now(),
@@ -1359,8 +1771,9 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             {
                                 "id": int(photo_event_id),
                                 "meter_index": int(assigned_meter_index),
-                    "meter_kind": str(kind),
-                    "meter_value": float(value_float),
+                                "meter_kind": str(kind),
+                                "ocr_reading": float(value_float),
+                                "meter_value": float(value_float),
                                 "diag_json": diag_json_str,
                             },
                         )
@@ -1400,6 +1813,22 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 bill = _calc_month_bill(conn, int(apartment_id), ym)
         except Exception as e:
             diag["warnings"].append({"bill_calc_failed": str(e)})
+
+    if isinstance(ocr_data, dict):
+        if value_float is not None:
+            try:
+                ocr_data["effective_reading"] = float(value_float)
+            except Exception:
+                pass
+            if water_like_ocr and water_fraction_missing:
+                # Для бота/UI показываем фактическое сохраненное значение,
+                # даже если исходный OCR дал неполную дробную часть.
+                try:
+                    ocr_data["reading"] = float(value_float)
+                except Exception:
+                    pass
+        if water_fraction_missing:
+            ocr_data["fraction_missing"] = True
 
     return JSONResponse(
         status_code=200,

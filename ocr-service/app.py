@@ -16,6 +16,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 OCR_MODEL = os.getenv("OCR_MODEL", "gpt-4o-mini").strip()
 OCR_ENABLE_PADDLE = os.getenv("OCR_ENABLE_PADDLE", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_FAST_MODE = os.getenv("OCR_FAST_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_WATER_SIMPLE_MODE = os.getenv("OCR_WATER_SIMPLE_MODE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 _PADDLE_OCR = None
 _PADDLE_INIT_FAILED = False
@@ -625,6 +626,111 @@ def _make_water_smart_window_variants(img_bytes: bytes) -> list[tuple[str, bytes
         out.append((f"smart_odo_{idx}", _encode_jpeg(sharp, quality=95)))
         out.append((f"smart_odo_bw_{idx}", _encode_jpeg(bw, quality=95)))
     return out
+
+
+def _detect_serial_bbox_paddle(img_bytes: bytes) -> Optional[tuple[int, int, int, int, str, float]]:
+    """
+    Возвращает bbox серийника (в координатах исходного изображения) и его digits.
+    Используется как якорь для построения кропа окна барабана.
+    """
+    ocr = _get_paddle_ocr()
+    if ocr is None:
+        return None
+    try:
+        arr = np.array(Image.open(BytesIO(img_bytes)).convert("RGB"))
+        res = ocr.ocr(arr, cls=False)
+    except Exception:
+        return None
+
+    best = None
+    best_score = -1e9
+    lines = res[0] if isinstance(res, list) and res else []
+    for line in (lines or []):
+        try:
+            box = line[0]
+            txt = str(line[1][0] or "")
+            conf = float(line[1][1] or 0.0)
+        except Exception:
+            continue
+        digits = _normalize_digits(txt)
+        if not digits:
+            continue
+        # Серийники воды обычно 7..12 цифр.
+        if len(digits) < 7 or len(digits) > 12:
+            continue
+        try:
+            pts = np.array(box, dtype=float)
+            x1 = int(max(0.0, float(pts[:, 0].min())))
+            y1 = int(max(0.0, float(pts[:, 1].min())))
+            x2 = int(max(0.0, float(pts[:, 0].max())))
+            y2 = int(max(0.0, float(pts[:, 1].max())))
+        except Exception:
+            continue
+        bw = max(1, x2 - x1)
+        bh = max(1, y2 - y1)
+        if bw < 24 or bh < 10:
+            continue
+        horiz_bonus = 0.06 if bw >= int(2.2 * bh) else 0.0
+        score = float(conf) + horiz_bonus + min(0.08, 0.02 * max(0, len(digits) - 7))
+        if score > best_score:
+            best_score = score
+            best = (x1, y1, x2, y2, digits, float(conf))
+    return best
+
+
+def _make_water_serial_anchor_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    """
+    Строит кропы окна барабана относительно bbox серийника.
+    Это уменьшает вероятность чтения серийника как показания.
+    """
+    anchor = _detect_serial_bbox_paddle(img_bytes)
+    if not anchor:
+        return []
+    x1, y1, x2, y2, _, _ = anchor
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return []
+    w, h = img.size
+    sw = max(1, x2 - x1)
+    sh = max(1, y2 - y1)
+
+    # Геометрия подобрана для типовых водосчетчиков:
+    # окно барабана расположено выше серийника и немного левее.
+    cfgs = [
+        (-1.25, +0.55, -0.20, +2.45),
+        (-1.05, +0.50, -0.16, +2.30),
+        (-1.45, +0.72, -0.28, +2.75),
+    ]
+
+    out: list[tuple[str, bytes]] = []
+    resample = getattr(Image, "Resampling", Image).LANCZOS
+    for idx, (lx, rx, ty, by) in enumerate(cfgs, start=1):
+        cx1 = max(0, min(w - 2, int(x1 + lx * sw)))
+        cx2 = max(cx1 + 1, min(w, int(x2 + rx * sw)))
+        cy1 = max(0, min(h - 2, int(y1 + ty * sh)))
+        cy2 = max(cy1 + 1, min(h, int(y2 + by * sh)))
+        if (cx2 - cx1) < 60 or (cy2 - cy1) < 24:
+            continue
+        crop = img.crop((cx1, cy1, cx2, cy2))
+        crop = crop.resize((max(1, crop.width * 4), max(1, crop.height * 4)), resample)
+        sharp = ImageEnhance.Contrast(crop).enhance(1.9).filter(
+            ImageFilter.UnsharpMask(radius=1, percent=260, threshold=2)
+        )
+        bw = ImageOps.autocontrast(sharp.convert("L")).point(lambda p: 255 if p > 150 else 0, "L").convert("RGB")
+        out.append((f"serial_odo_{idx}", _encode_jpeg(sharp, quality=95)))
+        out.append((f"serial_odo_bw_{idx}", _encode_jpeg(bw, quality=95)))
+
+    # dedupe by content hash
+    seen = set()
+    deduped: list[tuple[str, bytes]] = []
+    for label, data in out:
+        key = hash(data)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((label, data))
+    return deduped[:4]
 
 
 def _get_paddle_ocr():
@@ -1264,6 +1370,17 @@ def _pick_best_candidate(candidates: list[dict]) -> tuple[dict, float]:
                 score -= 1.20
             if _digits_overlap_serial(black_digits, serial):
                 score -= 0.70
+        if provider == "water_serial_anchor":
+            score += 0.26
+            if black_digits and len(str(black_digits)) >= 3:
+                score += 0.12
+            if red_digits and len(str(red_digits)) == 3:
+                score += 0.12
+            elif red_digits:
+                # Для воды без 3-х знаков дроби кандидат считаем слабым.
+                score -= 1.10
+            if _digits_overlap_serial(black_digits, serial):
+                score -= 0.85
         if provider == "paddle_seq":
             score += 0.26
             if black_digits and len(str(black_digits)) >= 3:
@@ -1359,45 +1476,18 @@ async def recognize(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="empty_file")
 
     mime = _guess_mime(file.filename, file.content_type)
-    variants = _make_variants(img)
-    if OCR_FAST_MODE and variants:
-        variants = variants[:1]
-
     candidates = []
-    for label, b in variants:
-        resp = _call_openai_vision(b, mime=mime)
 
-        t = _sanitize_type(resp.get("type", "unknown"))
-        reading = _normalize_reading(resp.get("reading", None))
-        serial = resp.get("serial", None)
-        if isinstance(serial, str):
-            serial = serial.strip() or None
-        conf = _clamp_confidence(resp.get("confidence", 0.0))
-
-        # plausibility
-        reading, conf, note2 = _plausibility_filter(t, reading, conf)
-
-        candidates.append(
-            {
-                "type": t,
-                "reading": reading,
-                "serial": serial,
-                "confidence": conf,
-                "notes": str(resp.get("notes", "") or ""),
-                "note2": note2,
-                "variant": label,
-                "provider": "base",
-                "black_digits": None,
-                "red_digits": None,
-            }
-        )
-
-    # Water digit-first pass (independent candidates)
+    # Water pass first: в simple-режиме это позволяет часто обойтись без base LLM
+    # и заметно снизить задержку на типичных фото воды.
     water_variant_bytes: dict[str, bytes] = {}
     water_variants = _make_water_digit_variants(img)
-    if OCR_FAST_MODE and water_variants:
-        # В fast режиме достаточно 1-2 лучших кропов окна барабана.
-        water_variants = water_variants[:2]
+    if water_variants:
+        if OCR_WATER_SIMPLE_MODE:
+            # Упрощенный режим: минимальный набор кропов (быстрее и меньше ложных веток).
+            water_variants = water_variants[:1] if OCR_FAST_MODE else water_variants[:2]
+        elif OCR_FAST_MODE:
+            water_variants = water_variants[:2]
     for label, wb in water_variants:
         water_variant_bytes[label] = wb
         try:
@@ -1421,7 +1511,6 @@ async def recognize(file: UploadFile = File(...)):
             red_digits = red_digits[:3]
         elif red_digits:
             red_digits = None
-        # Fast mode: red-zone уточняем только локально ниже (без дополнительных LLM-вызовов).
         reading = _reading_from_digits(black_digits, red_digits)
         if reading is None:
             reading = _normalize_reading(wr.get("reading", None))
@@ -1442,7 +1531,8 @@ async def recognize(file: UploadFile = File(...)):
         )
 
         # Specialized OCR sequence pass (PaddleOCR) for exact digit reading.
-        if OCR_ENABLE_PADDLE:
+        # В simple-режиме отключаем для воды, чтобы исключить влияние серийника.
+        if OCR_ENABLE_PADDLE and not OCR_WATER_SIMPLE_MODE:
             for pc in _paddle_water_candidates(wb):
                 candidates.append(
                     {
@@ -1460,69 +1550,239 @@ async def recognize(file: UploadFile = File(...)):
                     }
                 )
 
+    water_ready = any(
+        str(c.get("provider") or "") == "water_digit"
+        and _normalize_digits(c.get("black_digits"))
+        and c.get("reading") is not None
+        for c in candidates
+    )
+    run_base = not (OCR_WATER_SIMPLE_MODE and water_ready)
+
+    if run_base:
+        variants = _make_variants(img)
+        if OCR_FAST_MODE and variants:
+            variants = variants[:1]
+        for label, b in variants:
+            resp = _call_openai_vision(b, mime=mime)
+
+            t = _sanitize_type(resp.get("type", "unknown"))
+            reading = _normalize_reading(resp.get("reading", None))
+            serial = resp.get("serial", None)
+            if isinstance(serial, str):
+                serial = serial.strip() or None
+            conf = _clamp_confidence(resp.get("confidence", 0.0))
+
+            # plausibility
+            reading, conf, note2 = _plausibility_filter(t, reading, conf)
+
+            candidates.append(
+                {
+                    "type": t,
+                    "reading": reading,
+                    "serial": serial,
+                    "confidence": conf,
+                    "notes": str(resp.get("notes", "") or ""),
+                    "note2": note2,
+                    "variant": label,
+                    "provider": "base",
+                    "black_digits": None,
+                    "red_digits": None,
+                }
+            )
+
     if not candidates:
         raise HTTPException(status_code=500, detail="openai_empty_response")
 
     best, _ = _pick_best_candidate(candidates)
+
+    if OCR_WATER_SIMPLE_MODE:
+        water_only = [c for c in candidates if str(c.get("provider") or "") == "water_digit" and _normalize_digits(c.get("black_digits"))]
+        if water_only:
+            best, _ = _pick_best_candidate(water_only)
+
+    # Дополнительный water-pass на serial-anchor кропе:
+    # включаем только когда базовый water-кандидат слабый.
+    # Для уверенного black-only чтения (например 00999 без красной части)
+    # этот проход чаще замедляет ответ и может увести в неверную разрядность.
+    best_provider = str(best.get("provider") or "")
+    best_black = _normalize_digits(best.get("black_digits"))
+    best_red = _normalize_digits(best.get("red_digits"))
+    best_conf = float(best.get("confidence") or 0.0)
+    if (
+        best_provider in ("water_digit", "water_serial_anchor")
+        and (not best_red or len(best_red) != 3)
+        and ((not best_black) or (len(best_black) < 5) or (best_conf < 0.78))
+    ):
+        baseline_reading = None
+        try:
+            if best.get("reading") is not None:
+                baseline_reading = float(best.get("reading"))
+        except Exception:
+            baseline_reading = None
+        serial_variants = _make_water_serial_anchor_variants(img)
+        for label, sb in serial_variants:
+            water_variant_bytes[label] = sb
+            try:
+                sr = _call_openai_vision(
+                    sb,
+                    mime="image/jpeg",
+                    system_prompt=WATER_ODOMETER_PROMPT,
+                    user_text="Считай только окно цифр воды: black_digits, red_digits, reading.",
+                )
+            except Exception:
+                continue
+            t = _sanitize_type(sr.get("type", "unknown"))
+            serial = sr.get("serial", None)
+            if isinstance(serial, str):
+                serial = serial.strip() or None
+            conf = _clamp_confidence(sr.get("confidence", 0.0))
+            black_digits = _normalize_digits(sr.get("black_digits"))
+            red_digits = _normalize_digits(sr.get("red_digits"))
+            if red_digits and len(red_digits) >= 3:
+                red_digits = red_digits[:3]
+            elif red_digits:
+                red_digits = None
+            reading = _reading_from_digits(black_digits, red_digits)
+            if reading is None:
+                reading = _normalize_reading(sr.get("reading", None))
+            # Защита от срыва в неверную разрядность на serial-anchor кропе.
+            if black_digits and len(black_digits) > 5:
+                continue
+            if (reading is not None) and (baseline_reading is not None) and baseline_reading > 0:
+                ratio = float(reading) / float(baseline_reading)
+                if ratio > 1.8 or ratio < 0.45:
+                    continue
+            reading, conf, note2 = _plausibility_filter(t, reading, conf)
+            candidates.append(
+                {
+                    "type": t,
+                    "reading": reading,
+                    "serial": serial,
+                    "confidence": conf,
+                    "notes": str(sr.get("notes", "") or ""),
+                    "note2": note2,
+                    "variant": label,
+                    "provider": "water_serial_anchor",
+                    "black_digits": black_digits,
+                    "red_digits": red_digits,
+                }
+            )
+
+        water_pool = [
+            c
+            for c in candidates
+            if str(c.get("provider") or "") in ("water_digit", "water_serial_anchor")
+            and _normalize_digits(c.get("black_digits"))
+        ]
+        if water_pool:
+            best, _ = _pick_best_candidate(water_pool)
+
     chosen_label = str(best.get("variant") or "orig")
 
     # Deterministic refinement for red fractional part:
     # читаем 3 красные ячейки по всем water-кропам и выбираем лучший результат.
-    if str(best.get("provider") or "") in ("water_digit", "paddle_seq"):
+    if str(best.get("provider") or "") in ("water_digit", "water_serial_anchor", "paddle_seq"):
         bd = _normalize_digits(best.get("black_digits"))
         rd = _normalize_digits(best.get("red_digits"))
+        serial_norm = _normalize_digits(best.get("serial"))
         if bd:
-            best_red = None
-            best_red_conf = -1.0
-            best_red_src = None
-            for src in water_variant_bytes.values():
-                # 1) color-guided (лучше ловит красные барабаны при плохом свете)
-                red_refined, red_conf = _refine_red_digits_color_guided(src)
-                red_src = "color"
-                # 2) fallback LLM только по зоне красных цифр (если color не дал 3 цифры)
-                if not red_refined or len(red_refined) != 3:
-                    red_refined, red_conf = _refine_red_digits_llm(src)
-                    red_src = "llm_red"
-                # 3) deterministic positional fallback (без цвета/LLM)
-                if not red_refined or len(red_refined) != 3:
-                    red_refined, red_conf = _refine_red_digits_positional(src)
-                    red_src = "positional"
-                if red_refined and len(red_refined) == 3 and red_conf > best_red_conf:
-                    best_red = red_refined
-                    best_red_conf = red_conf
-                    best_red_src = red_src
+            if chosen_label in water_variant_bytes:
+                refine_sources = [water_variant_bytes[chosen_label]]
+            else:
+                refine_sources = list(water_variant_bytes.values())[:1]
+            if OCR_WATER_SIMPLE_MODE:
+                # В простом режиме используем только локальные (быстрые) методы,
+                # без дополнительных LLM-вызовов по дробной части.
+                best_red = None
+                best_red_conf = -1.0
+                best_red_src = None
+                for src in refine_sources:
+                    red_refined, red_conf = _refine_red_digits_color_guided(src)
+                    red_src = "color"
+                    if not red_refined or len(red_refined) != 3:
+                        red_refined, red_conf = _refine_red_digits_positional(src)
+                        red_src = "positional"
+                    if red_refined and len(red_refined) == 3 and red_conf > best_red_conf:
+                        best_red = red_refined
+                        best_red_conf = red_conf
+                        best_red_src = red_src
 
-            if best_red is not None:
-                should_replace = False
-                # Было 2 знака дроби (типичный провал): почти всегда нужно заменять на уверенные 3.
-                if not rd or len(rd) < 3:
-                    if best_red_src == "positional":
-                        should_replace = best_red_conf >= 0.72
-                    elif best_red_src == "llm_red":
-                        should_replace = best_red_conf >= 0.52
-                    else:
-                        should_replace = best_red_conf >= 0.45
-                elif best_red != rd:
-                    # Для конфликта 3 vs 3:
-                    # - color-guided обычно надежнее и может перезаписать;
-                    # - llm_red тоже допускаем для сложных кадров.
-                    if best_red_src in ("color", "llm_red", "positional"):
-                        should_replace = best_red_conf >= 0.58
+                if best_red is not None:
+                    # Жесткая защита: если дробь равна хвосту серийника — отбрасываем.
+                    if serial_norm and len(serial_norm) >= 3 and best_red == serial_norm[-3:]:
+                        best["note2"] = ((best.get("note2") or "") + "; red_reject=serial_tail").strip("; ")
                     else:
                         should_replace = False
-                if should_replace:
-                    best["red_digits"] = best_red
-                    best["reading"] = _reading_from_digits(bd, best_red)
-                    best["confidence"] = max(float(best.get("confidence") or 0.0), best_red_conf)
-                    best["note2"] = (
-                        (best.get("note2") or "")
-                        + (f"; red_refined={best_red}@{best_red_conf:.2f}/{best_red_src}" if best_red_src else "")
-                    ).strip("; ")
+                        if not rd or len(rd) < 3:
+                            if best_red_src == "color":
+                                should_replace = best_red_conf >= 0.62
+                            else:
+                                should_replace = best_red_conf >= 0.72
+                        elif best_red != rd:
+                            # При конфликте ужесточаем порог, чтобы не ухудшать стабильные случаи.
+                            should_replace = best_red_conf >= 0.78
+                        if should_replace:
+                            best["red_digits"] = best_red
+                            best["reading"] = _reading_from_digits(bd, best_red)
+                            best["confidence"] = max(float(best.get("confidence") or 0.0), best_red_conf)
+                            best["note2"] = (
+                                (best.get("note2") or "")
+                                + f"; red_refined={best_red}@{best_red_conf:.2f}/{best_red_src}"
+                            ).strip("; ")
+            else:
+                best_red = None
+                best_red_conf = -1.0
+                best_red_src = None
+                for src in refine_sources:
+                    # 1) color-guided (лучше ловит красные барабаны при плохом свете)
+                    red_refined, red_conf = _refine_red_digits_color_guided(src)
+                    red_src = "color"
+                    # 2) fallback LLM только по зоне красных цифр (если color не дал 3 цифры)
+                    if not red_refined or len(red_refined) != 3:
+                        red_refined, red_conf = _refine_red_digits_llm(src)
+                        red_src = "llm_red"
+                    # 3) deterministic positional fallback (без цвета/LLM)
+                    if not red_refined or len(red_refined) != 3:
+                        red_refined, red_conf = _refine_red_digits_positional(src)
+                        red_src = "positional"
+                    if red_refined and len(red_refined) == 3 and red_conf > best_red_conf:
+                        best_red = red_refined
+                        best_red_conf = red_conf
+                        best_red_src = red_src
 
-        # Жесткое правило: для воды не принимаем 2 знака дроби.
-        rd2 = _normalize_digits(best.get("red_digits"))
-        if rd2 and len(rd2) != 3:
-            best["reading"] = None
+                if best_red is not None:
+                    should_replace = False
+                    # Было 2 знака дроби (типичный провал): почти всегда нужно заменять на уверенные 3.
+                    if not rd or len(rd) < 3:
+                        if best_red_src == "positional":
+                            should_replace = best_red_conf >= 0.72
+                        elif best_red_src == "llm_red":
+                            should_replace = best_red_conf >= 0.52
+                        else:
+                            should_replace = best_red_conf >= 0.45
+                    elif best_red != rd:
+                        # Для конфликта 3 vs 3:
+                        # - color-guided обычно надежнее и может перезаписать;
+                        # - llm_red тоже допускаем для сложных кадров.
+                        if best_red_src in ("color", "llm_red", "positional"):
+                            should_replace = best_red_conf >= 0.58
+                        else:
+                            should_replace = False
+                    if should_replace:
+                        best["red_digits"] = best_red
+                        best["reading"] = _reading_from_digits(bd, best_red)
+                        best["confidence"] = max(float(best.get("confidence") or 0.0), best_red_conf)
+                        best["note2"] = (
+                            (best.get("note2") or "")
+                            + (f"; red_refined={best_red}@{best_red_conf:.2f}/{best_red_src}" if best_red_src else "")
+                        ).strip("; ")
+
+            # Жесткое правило: для воды в хранилище либо 3 знака дроби, либо none.
+            rd2 = _normalize_digits(best.get("red_digits"))
+            if rd2 and len(rd2) != 3:
+                rd2 = None
+                best["red_digits"] = None
+            best["reading"] = _reading_from_digits(bd, rd2)
 
     t = best["type"]
     reading = best["reading"]
