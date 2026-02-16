@@ -1864,3 +1864,39 @@ async def recognize(file: UploadFile = File(...)):
         "red_digits": best.get("red_digits"),
         "provider": best.get("provider"),
     }
+
+
+@app.post("/recognize_serial")
+async def recognize_serial(file: UploadFile = File(...)):
+    img = await file.read()
+    if not img:
+        raise HTTPException(status_code=400, detail="empty_file")
+
+    mime = _guess_mime(file.filename, file.content_type)
+    serial = None
+    conf = 0.0
+    notes: list[str] = []
+
+    # Fast path: Paddle-детекция серийника.
+    try:
+        anchor = _detect_serial_bbox_paddle(img)
+    except Exception:
+        anchor = None
+    if anchor:
+        serial = _normalize_digits(anchor[4])
+        conf = _clamp_confidence(anchor[5])
+        notes.append("paddle_anchor")
+
+    # Fallback: serial-only vision call.
+    if not serial:
+        s2, c2 = _read_serial_fallback(img, mime)
+        if s2:
+            serial = s2
+            conf = _clamp_confidence(c2)
+            notes.append("llm_serial_fallback")
+
+    return {
+        "serial": serial,
+        "confidence": _clamp_confidence(conf),
+        "notes": "; ".join(notes)[:200],
+    }

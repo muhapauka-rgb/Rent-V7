@@ -2,6 +2,7 @@ import json
 import re
 import hashlib
 import requests
+import threading
 
 from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -45,6 +46,106 @@ WATER_RETAKE_THRESHOLD = 1.0
 ELECTRIC_RETAKE_THRESHOLD = 5.0
 WATER_ANOMALY_THRESHOLD = 50.0
 ELECTRIC_ANOMALY_THRESHOLD = 500.0
+
+
+def _ocr_serial_endpoint() -> str:
+    base = (OCR_URL or "").strip()
+    if not base:
+        return ""
+    if base.endswith("/recognize"):
+        return base[: -len("/recognize")] + "/recognize_serial"
+    return base.rstrip("/") + "/recognize_serial"
+
+
+def _async_fill_water_serial(
+    *,
+    apartment_id: int,
+    meter_kind: str,
+    image_bytes: bytes,
+    chat_id: str,
+    telegram_username: str | None,
+    ym: str,
+) -> None:
+    """
+    Ленивая фоновая подстановка серийника:
+    - не блокирует ответ боту,
+    - не трогает ручные серийники.
+    """
+    if meter_kind not in ("cold", "hot"):
+        return
+    url = _ocr_serial_endpoint()
+    if not url:
+        return
+    blob = bytes(image_bytes or b"")
+    if not blob:
+        return
+
+    def _run() -> None:
+        try:
+            resp = requests.post(
+                url,
+                files={"file": ("serial.jpg", blob)},
+                timeout=(8, 120),
+            )
+            if not resp.ok:
+                return
+            js = resp.json() if resp.content else {}
+            serial_norm = _normalize_serial(js.get("serial"))
+            if not serial_norm:
+                return
+
+            col = "cold_serial" if meter_kind == "cold" else "hot_serial"
+            col_src = "cold_serial_source" if meter_kind == "cold" else "hot_serial_source"
+            with engine.begin() as conn:
+                row = conn.execute(
+                    text(
+                        f"""
+                        SELECT {col} AS serial, {col_src} AS src
+                        FROM apartments
+                        WHERE id=:aid
+                        """
+                    ),
+                    {"aid": int(apartment_id)},
+                ).mappings().first()
+                if not row:
+                    return
+                existing = (row.get("serial") if row else None) or ""
+                existing_norm = _normalize_serial(existing)
+                src = (row.get("src") if row else None) or ""
+                if str(src) == "manual":
+                    return
+                if existing_norm:
+                    return
+                conn.execute(
+                    text(
+                        f"""
+                        UPDATE apartments
+                        SET {col} = :serial,
+                            {col_src} = CASE WHEN COALESCE({col_src}, '') = '' THEN 'auto' ELSE {col_src} END
+                        WHERE id=:aid
+                          AND COALESCE({col_src}, '') <> 'manual'
+                          AND ({col} IS NULL OR {col} = '')
+                        """
+                    ),
+                    {"aid": int(apartment_id), "serial": serial_norm},
+                )
+            logger.info(
+                "lazy_serial_filled apartment_id=%s ym=%s meter_kind=%s serial=%s chat_id=%s username=%s",
+                int(apartment_id),
+                str(ym),
+                str(meter_kind),
+                serial_norm,
+                str(chat_id),
+                str(telegram_username or ""),
+            )
+        except Exception as e:
+            logger.warning("lazy_serial_fill_failed apartment_id=%s meter_kind=%s err=%s", apartment_id, meter_kind, e)
+
+    threading.Thread(
+        target=_run,
+        daemon=True,
+        name=f"lazy-serial-{apartment_id}-{meter_kind}",
+    ).start()
 
 
 def _prev_ym(ym: str) -> str:
@@ -1746,6 +1847,20 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             ),
                             {"aid": int(apartment_id), "serial": serial_norm},
                         )
+            except Exception:
+                pass
+
+            # 6.36) lazy serial fill for water (background, no impact on bot latency)
+            try:
+                if (not serial_norm) and wrote_meter and kind in ("cold", "hot"):
+                    _async_fill_water_serial(
+                        apartment_id=int(apartment_id),
+                        meter_kind=str(kind),
+                        image_bytes=blob,
+                        chat_id=str(chat_id),
+                        telegram_username=telegram_username,
+                        ym=str(ym),
+                    )
             except Exception:
                 pass
 
