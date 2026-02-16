@@ -364,23 +364,32 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     # 1) OCR
     ocr_data = None
     try:
-        ocr_resp = requests.post(OCR_URL, files={"file": ("file.bin", blob)}, timeout=15)
+        # OCR with Paddle can have slow cold-start on first request (model init/download).
+        # Keep connect timeout short, but allow longer read timeout.
+        ocr_resp = requests.post(OCR_URL, files={"file": ("file.bin", blob)}, timeout=(10, 300))
         if ocr_resp.ok:
             ocr_data = ocr_resp.json()
         else:
             diag["warnings"].append(f"ocr_http_{ocr_resp.status_code}")
-    except Exception:
+    except Exception as e:
         diag["warnings"].append("ocr_unavailable")
+        diag["warnings"].append({"ocr_error": str(e)})
 
     ocr_type = None
     ocr_reading = None
     ocr_confidence = None
     ocr_serial = None
+    ocr_provider = None
+    ocr_black_digits = None
+    ocr_red_digits = None
     if isinstance(ocr_data, dict):
         ocr_type = ocr_data.get("type")
         ocr_reading = ocr_data.get("reading")
         ocr_confidence = ocr_data.get("confidence")
         ocr_serial = ocr_data.get("serial")
+        ocr_provider = str(ocr_data.get("provider") or "").strip()
+        ocr_black_digits = "".join(ch for ch in str(ocr_data.get("black_digits") or "") if ch.isdigit()) or None
+        ocr_red_digits = "".join(ch for ch in str(ocr_data.get("red_digits") or "") if ch.isdigit()) or None
 
     kind = _ocr_to_kind(ocr_type)
     value_float = _parse_reading_to_float(ocr_reading)
@@ -390,6 +399,13 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     except Exception:
         ocr_conf = 0.0
     is_water_unknown = str(ocr_type or "").strip().lower() == "unknown"
+    water_like_ocr = (ocr_provider in ("water_digit", "paddle_seq")) or bool(ocr_black_digits)
+
+    # Water safety gate: don't auto-accept reading without full 3-digit fractional part.
+    if water_like_ocr and (value_float is not None):
+        if (not ocr_red_digits) or (len(ocr_red_digits) != 3):
+            diag["warnings"].append({"water_fraction_missing": {"black_digits": ocr_black_digits, "red_digits": ocr_red_digits}})
+            value_float = None
 
     if kind != "electric":
         meter_index = 1

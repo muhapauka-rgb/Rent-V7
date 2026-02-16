@@ -862,7 +862,10 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
     anomaly_info = _extract_anomaly_warning(js)
 
-    if (meter_written is False) or ocr_failed:
+    has_any_value = ocr_reading is not None
+    # Если вообще не удалось получить число — просим новое фото/ручной ввод.
+    # Если число есть (даже частично/под вопросом), продолжаем и показываем его пользователю.
+    if (meter_written is False and not has_any_value) or (ocr_failed and not has_any_value):
         await message.reply(
             "Фото получено, но не удалось распознать показания (нечётко/блики/обрезано).\n"
             "Пожалуйста, пришлите фото лучшего качества.\n\n"
@@ -880,6 +883,8 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     msg = f"Принято. (meter_index={assigned})"
     if ocr_type or shown_reading is not None:
         msg += f"\nРаспознано: {ocr_type or '—'} / {shown_reading if shown_reading is not None else '—'}"
+    if ocr_failed and shown_reading is not None:
+        msg += "\nДробная часть/тип распознаны неуверенно: значение сохранено с пометкой «Проверить значение»."
     if anomaly_info:
         msg += "\nЗначение выглядит подозрительным, но мы сохранили его и отметили «Проверить значение» для администратора."
     await message.reply(msg, reply_markup=_kb_main())

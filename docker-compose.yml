@@ -22,6 +22,8 @@ services:
     env_file: .env
     ports:
       - "8002:8000"
+    volumes:
+      - rent_paddle:/root/.paddleocr
     restart: unless-stopped
 
   api:
@@ -62,3 +64,4 @@ services:
 
 volumes:
   rent_pg: {}
+  rent_paddle: {}
