@@ -212,6 +212,25 @@ def _missing_to_text(missing: List[str]) -> str:
             out.append(x)
     return ", ".join(out)
 
+
+def _format_reading_for_user(value: Any) -> str:
+    """Human-friendly number for bot messages: always 2 decimals."""
+    if value is None:
+        return "—"
+    try:
+        if isinstance(value, str):
+            raw = value.strip().replace(" ", "")
+            if not raw:
+                return "—"
+            num = float(raw.replace(",", "."))
+        else:
+            num = float(value)
+    except Exception:
+        return str(value)
+
+    return f"{num:.2f}".replace(".", ",")
+
+
 def _expected_missing_from_bill(bill: dict) -> List[str]:
     # For expected >=2 we require T1+T2; T3 is derived and not required
     missing = ["cold", "hot"]
@@ -854,7 +873,9 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     assigned = js.get("assigned_meter_index", meter_index)
 
     ocr = js.get("ocr") or {}
-    ocr_type = ocr.get("type")
+    ocr_type = ocr.get("effective_type")
+    if ocr_type is None:
+        ocr_type = ocr.get("type")
     ocr_reading = ocr.get("effective_reading")
     if ocr_reading is None:
         ocr_reading = ocr.get("reading")
@@ -881,10 +902,11 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     shown_reading = ocr_reading
     if shown_reading is None and isinstance(anomaly_info, dict):
         shown_reading = anomaly_info.get("curr")
+    shown_reading_text = _format_reading_for_user(shown_reading)
 
     msg = f"Принято. (meter_index={assigned})"
     if ocr_type or shown_reading is not None:
-        msg += f"\nРаспознано: {ocr_type or '—'} / {shown_reading if shown_reading is not None else '—'}"
+        msg += f"\nРаспознано: {ocr_type or '—'} / {shown_reading_text}"
     if ocr_failed and shown_reading is not None:
         msg += "\nДробная часть/тип распознаны неуверенно: значение сохранено с пометкой «Проверить значение»."
     if anomaly_info:
@@ -899,7 +921,7 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         val = dup.get("value")
         caption = (
             "Похоже, это дубликат уже присланного значения.\n"
-            f"Совпало с: {mt} #{mi}, значение {val}."
+            f"Совпало с: {mt} #{mi}, значение {_format_reading_for_user(val)}."
         )
         try:
             await bot.send_photo(
