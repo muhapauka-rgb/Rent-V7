@@ -1690,22 +1690,34 @@ async def recognize(file: UploadFile = File(...)):
                 refine_sources = [water_variant_bytes[chosen_label]]
             else:
                 refine_sources = list(water_variant_bytes.values())[:1]
+            # Fast-path: если целая часть воды считалась уверенно, а дробная отсутствует,
+            # не тратим время на тяжелый red-refine (API потом восстановит дробь по истории/ручным данным).
+            best_provider_local = str(best.get("provider") or "")
+            best_conf_local = float(best.get("confidence") or 0.0)
+            skip_heavy_red_refine = (
+                OCR_FAST_MODE
+                and best_provider_local in ("water_digit", "water_serial_anchor")
+                and (not rd or len(rd) < 3)
+                and len(bd) >= 5
+                and best_conf_local >= 0.88
+            )
             if OCR_WATER_SIMPLE_MODE:
                 # В простом режиме используем только локальные (быстрые) методы,
                 # без дополнительных LLM-вызовов по дробной части.
                 best_red = None
                 best_red_conf = -1.0
                 best_red_src = None
-                for src in refine_sources:
-                    red_refined, red_conf = _refine_red_digits_color_guided(src)
-                    red_src = "color"
-                    if not red_refined or len(red_refined) != 3:
-                        red_refined, red_conf = _refine_red_digits_positional(src)
-                        red_src = "positional"
-                    if red_refined and len(red_refined) == 3 and red_conf > best_red_conf:
-                        best_red = red_refined
-                        best_red_conf = red_conf
-                        best_red_src = red_src
+                if not skip_heavy_red_refine:
+                    for src in refine_sources:
+                        red_refined, red_conf = _refine_red_digits_color_guided(src)
+                        red_src = "color"
+                        if not red_refined or len(red_refined) != 3:
+                            red_refined, red_conf = _refine_red_digits_positional(src)
+                            red_src = "positional"
+                        if red_refined and len(red_refined) == 3 and red_conf > best_red_conf:
+                            best_red = red_refined
+                            best_red_conf = red_conf
+                            best_red_src = red_src
 
                 if best_red is not None:
                     # Жесткая защита: если дробь равна хвосту серийника — отбрасываем.
@@ -1807,6 +1819,21 @@ async def recognize(file: UploadFile = File(...)):
         if serial_pick:
             serial = serial_pick
         elif t in ("ХВС", "ГВС", "unknown"):
+            # Fast-path: для воды на быстрых настройках пропускаем дополнительный
+            # serial-only LLM call, если уже уверенно прочитаны black_digits.
+            maybe_bd = _normalize_digits(best.get("black_digits"))
+            maybe_conf = float(best.get("confidence") or 0.0)
+            if OCR_FAST_MODE and maybe_bd and len(maybe_bd) >= 4 and maybe_conf >= 0.85:
+                return {
+                    "type": t,
+                    "reading": reading if (isinstance(reading, (int, float)) or reading is None) else None,
+                    "serial": serial,
+                    "confidence": conf,
+                    "notes": (str(best.get("notes", "") or "") + (f"; variant={chosen_label}" if chosen_label else "")).strip()[:200],
+                    "black_digits": best.get("black_digits"),
+                    "red_digits": best.get("red_digits"),
+                    "provider": str(best.get("provider") or "base"),
+                }
             s2, s2c = _read_serial_fallback(img, mime)
             if s2:
                 serial = s2
