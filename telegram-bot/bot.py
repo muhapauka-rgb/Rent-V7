@@ -3,6 +3,7 @@ import asyncio
 import re
 import requests
 import io
+import aiohttp
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 from contextvars import ContextVar
@@ -12,6 +13,7 @@ logging.basicConfig(level=logging.INFO)
 
 from aiogram import Bot, Dispatcher, types
 from aiogram.utils import executor
+from aiogram.utils import exceptions as tg_exceptions
 from aiogram.types import (
     ContentType,
     ReplyKeyboardMarkup,
@@ -36,6 +38,38 @@ HTTP_READ_TIMEOUT_FAST = 25
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
+TG_SEND_RETRIES = int(os.getenv("TG_SEND_RETRIES", "3"))
+
+
+async def _retry_tg_send(coro_factory):
+    last_exc = None
+    for attempt in range(max(1, TG_SEND_RETRIES)):
+        try:
+            return await coro_factory()
+        except (tg_exceptions.NetworkError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+            last_exc = e
+            if attempt < max(1, TG_SEND_RETRIES) - 1:
+                await asyncio.sleep(0.35 * (attempt + 1))
+            else:
+                raise
+    if last_exc:
+        raise last_exc
+
+
+_orig_send_message = bot.send_message
+_orig_send_photo = bot.send_photo
+
+
+async def _send_message_with_retry(*args, **kwargs):
+    return await _retry_tg_send(lambda: _orig_send_message(*args, **kwargs))
+
+
+async def _send_photo_with_retry(*args, **kwargs):
+    return await _retry_tg_send(lambda: _orig_send_photo(*args, **kwargs))
+
+
+bot.send_message = _send_message_with_retry
+bot.send_photo = _send_photo_with_retry
 
 
 # -------------------------
@@ -862,7 +896,7 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
     anomaly_info = _extract_anomaly_warning(js)
 
-    if (meter_written is False) or ocr_failed:
+    if ocr_failed or ((meter_written is False) and (ocr_reading is None)):
         await message.reply(
             "Фото получено, но не удалось распознать показания (нечётко/блики/обрезано).\n"
             "Пожалуйста, пришлите фото лучшего качества.\n\n"
@@ -871,6 +905,21 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         )
         MANUAL_CTX[message.chat.id] = {"ym": ym, "step": "idle"}
         logging.info(f"MANUAL_CTX set for chat_id={message.chat.id} ym={ym!r} step='idle'")
+        return
+
+    if (meter_written is False) and (ocr_reading is not None):
+        shown_reading = ocr_reading
+        if isinstance(shown_reading, (int, float)):
+            try:
+                shown_reading = f"{float(shown_reading):.2f}"
+            except Exception:
+                pass
+        msg = (
+            "Фото получено.\n"
+            f"Распознано: {ocr_type or '—'} / {shown_reading}\n"
+            "Значение выглядит спорным: мы отметили «Проверить» для администратора."
+        )
+        await message.reply(msg, reply_markup=_kb_main())
         return
 
     shown_reading = ocr_reading
@@ -925,12 +974,26 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
 
 @dp.message_handler(content_types=ContentType.PHOTO)
 async def on_photo(message: types.Message):
+    logging.info(
+        "TG photo received: chat_id=%s message_id=%s photos=%s",
+        message.chat.id,
+        message.message_id,
+        len(message.photo or []),
+    )
     photo = message.photo[-1]
     f = await bot.get_file(photo.file_id)
     stream = await bot.download_file(f.file_path)
+    payload = stream.read()
+    logging.info(
+        "TG photo downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
+        message.chat.id,
+        message.message_id,
+        len(payload),
+        photo.file_id,
+    )
     await _handle_file_message(
         message,
-        file_bytes=stream.read(),
+        file_bytes=payload,
         filename=f"photo_{photo.file_unique_id}.jpg",
         mime_type="image/jpeg",
     )
@@ -938,12 +1001,27 @@ async def on_photo(message: types.Message):
 
 @dp.message_handler(content_types=ContentType.DOCUMENT)
 async def on_document(message: types.Message):
+    logging.info(
+        "TG document received: chat_id=%s message_id=%s file_name=%s mime=%s",
+        message.chat.id,
+        message.message_id,
+        (message.document.file_name if message.document else None),
+        (message.document.mime_type if message.document else None),
+    )
     doc = message.document
     f = await bot.get_file(doc.file_id)
     stream = await bot.download_file(f.file_path)
+    payload = stream.read()
+    logging.info(
+        "TG document downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
+        message.chat.id,
+        message.message_id,
+        len(payload),
+        doc.file_id,
+    )
     await _handle_file_message(
         message,
-        file_bytes=stream.read(),
+        file_bytes=payload,
         filename=doc.file_name or "file.bin",
         mime_type=doc.mime_type or "application/octet-stream",
     )
@@ -1072,6 +1150,6 @@ async def on_manual_cancel(call: types.CallbackQuery):
 if __name__ == "__main__":
     executor.start_polling(
         dp,
-        skip_updates=True,
+        skip_updates=False,
         allowed_updates=["message", "callback_query"]
     )

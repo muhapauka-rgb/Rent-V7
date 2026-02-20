@@ -228,24 +228,34 @@ export default function MetersTable(props: Props) {
             const nE3 = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "electric" && Number(notificationHighlight.meter_index || 1) === 3;
             const nSewer = notificationHighlight && notificationHighlight.ym === h.month && notificationHighlight.meter_type === "sewer" && Number(notificationHighlight.meter_index || 1) === 1;
             const reviewBtnStyle: React.CSSProperties = {
-              background: "#fee2e2",
-              color: "#991b1b",
-              border: "1px solid #fca5a5",
-              borderRadius: 999,
-              padding: "2px 8px",
-              fontSize: 11,
-              fontWeight: 700,
+              color: "var(--text)",
+              background: "transparent",
+              border: "none",
+              borderRadius: 0,
+              padding: "0",
+              fontSize: 13,
+              fontWeight: 500,
               cursor: "pointer",
+              textDecoration: "none",
+              boxShadow: "none",
+              outline: "none",
+              appearance: "none",
+              WebkitAppearance: "none",
             };
             const resolveBtnStyle: React.CSSProperties = {
               background: "transparent",
               color: "var(--text)",
-              border: "1px solid var(--hair)",
-              borderRadius: 999,
-              padding: "2px 8px",
-              fontSize: 11,
-              fontWeight: 700,
+              border: "none",
+              borderRadius: 0,
+              padding: "0",
+              fontSize: 13,
+              fontWeight: 500,
               cursor: "pointer",
+              textDecoration: "none",
+              boxShadow: "none",
+              outline: "none",
+              appearance: "none",
+              WebkitAppearance: "none",
             };
 
             // Если в квартире ожидается 3 электро-индекса — сумму НЕ показываем, пока не пришёл T3
