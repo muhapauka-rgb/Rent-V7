@@ -5,6 +5,7 @@ import requests
 import math
 import os
 import time
+import uuid
 
 from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -84,13 +85,21 @@ def _as_image_upload_tuple(blob: bytes, filename: str | None, mime_type: str | N
     return ("photo.jpg", blob, "image/jpeg")
 
 
-def _call_ocr_with_retries(blob: bytes, *, filename: str | None = None, mime_type: str | None = None):
+def _call_ocr_with_retries(
+    blob: bytes,
+    *,
+    filename: str | None = None,
+    mime_type: str | None = None,
+    trace_id: str | None = None,
+):
     last_exc = None
     upload_file = _as_image_upload_tuple(blob, filename, mime_type)
+    post_data = {"trace_id": str(trace_id)} if trace_id else None
     for attempt in range(max(1, OCR_HTTP_RETRIES)):
         try:
             resp = requests.post(
                 OCR_URL,
+                data=post_data,
                 files={"file": upload_file},
                 timeout=(5, OCR_HTTP_TIMEOUT_SEC),
             )
@@ -670,9 +679,13 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
 
     form = await request.form()
+    trace_id_raw = form.get("trace_id")
+    trace_id = (str(trace_id_raw).strip() if trace_id_raw is not None else "") or f"evt-{uuid.uuid4().hex[:12]}"
+    diag["trace_id"] = trace_id
     chat_id = form.get("chat_id") or "unknown"
     telegram_username = form.get("telegram_username") or None
     phone = form.get("phone") or None
+    t0 = time.monotonic()
 
     # month (ym) for this photo event. Bot may send it; otherwise default to current month.
     ym_raw = form.get("ym")
@@ -701,6 +714,15 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     blob = await file.read()
     file_sha256 = hashlib.sha256(blob).hexdigest()
+    logger.info(
+        "photo_event start trace_id=%s chat_id=%s ym=%s file=%s mime=%s size_bytes=%s",
+        trace_id,
+        str(chat_id),
+        str(ym),
+        file.filename,
+        file.content_type,
+        len(blob),
+    )
 
     if db_ready():
         try:
@@ -710,11 +732,14 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     # 1) OCR
     ocr_data = None
+    ocr_t0 = time.monotonic()
     ocr_resp, ocr_exc = _call_ocr_with_retries(
         blob,
         filename=file.filename,
         mime_type=file.content_type,
+        trace_id=trace_id,
     )
+    diag["ocr_latency_ms"] = int((time.monotonic() - ocr_t0) * 1000)
     if ocr_resp is not None:
         if ocr_resp.ok:
             ocr_data = ocr_resp.json()
@@ -724,6 +749,13 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         diag["warnings"].append("ocr_unavailable")
         if ocr_exc is not None:
             diag["warnings"].append({"ocr_error": str(ocr_exc)})
+    logger.info(
+        "photo_event ocr_result trace_id=%s ok=%s status=%s latency_ms=%s",
+        trace_id,
+        bool(ocr_resp is not None and ocr_resp.ok),
+        (ocr_resp.status_code if ocr_resp is not None else None),
+        diag.get("ocr_latency_ms"),
+    )
 
     ocr_type = None
     ocr_reading = None
@@ -734,6 +766,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         ocr_reading = ocr_data.get("reading")
         ocr_confidence = ocr_data.get("confidence")
         ocr_serial = ocr_data.get("serial")
+        if ocr_data.get("trace_id"):
+            diag["ocr_trace_id"] = ocr_data.get("trace_id")
 
     kind = _ocr_to_kind(ocr_type)
     value_float = _parse_reading_to_float(ocr_reading)
@@ -2233,23 +2267,33 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         except Exception as e:
             diag["warnings"].append({"bill_calc_failed": str(e)})
 
-    return JSONResponse(
-        status_code=200,
-        content={
-            "status": "ok",
-            "chat_id": str(chat_id),
-            "telegram_username": telegram_username,
-            "phone": phone,
-            "photo_event_id": photo_event_id,
-            "ydisk_path": ydisk_path,
-            "apartment_id": apartment_id,
-            "event_status": status,
-            "ocr": ocr_data,
-            "meter_written": wrote_meter,
-            "ocr_failed": bool((value_float is None) or (not kind and not is_water_unknown)),
-            "diag": diag,
-            "assigned_meter_index": assigned_meter_index,
-            "ym": ym,
-            "bill": bill,
-        },
+    payload = {
+        "trace_id": trace_id,
+        "status": "ok",
+        "chat_id": str(chat_id),
+        "telegram_username": telegram_username,
+        "phone": phone,
+        "photo_event_id": photo_event_id,
+        "ydisk_path": ydisk_path,
+        "apartment_id": apartment_id,
+        "event_status": status,
+        "ocr": ocr_data,
+        "meter_written": wrote_meter,
+        "ocr_failed": bool((value_float is None) or (not kind and not is_water_unknown)),
+        "diag": diag,
+        "assigned_meter_index": assigned_meter_index,
+        "ym": ym,
+        "bill": bill,
+    }
+    logger.info(
+        "photo_event done trace_id=%s elapsed_ms=%s apartment_id=%s meter_written=%s ocr_type=%s ocr_reading=%s warnings=%s errors=%s",
+        trace_id,
+        int((time.monotonic() - t0) * 1000),
+        apartment_id,
+        bool(wrote_meter),
+        (ocr_data.get("type") if isinstance(ocr_data, dict) else None),
+        (ocr_data.get("reading") if isinstance(ocr_data, dict) else None),
+        len(diag.get("warnings") or []),
+        len(diag.get("errors") or []),
     )
+    return JSONResponse(status_code=200, content=payload)

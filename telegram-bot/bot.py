@@ -3,6 +3,7 @@ import asyncio
 import re
 import requests
 import io
+import uuid
 import aiohttp
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
@@ -289,6 +290,32 @@ def _extract_anomaly_warning(js: dict) -> Optional[dict]:
     return None
 
 
+def _extract_review_reason(js: dict) -> Optional[str]:
+    diag = js.get("diag") or {}
+    warnings = diag.get("warnings") or []
+    reasons: list[str] = []
+    for w in warnings:
+        if isinstance(w, str):
+            if w.startswith("ocr_http_"):
+                reasons.append("ошибка OCR сервиса")
+            continue
+        if not isinstance(w, dict):
+            continue
+        if "anomaly_jump" in w:
+            reasons.append("аномалия относительно прошлого месяца")
+        if "water_type_uncertain" in w:
+            reasons.append("неуверенный тип водосчётчика")
+        if "serial_mismatch" in w:
+            reasons.append("серийный номер не совпал")
+        if "serial_as_reading_detected" in w:
+            reasons.append("распознано как серийный номер, а не показание")
+    uniq: list[str] = []
+    for r in reasons:
+        if r not in uniq:
+            uniq.append(r)
+    return ", ".join(uniq) if uniq else None
+
+
 def _parse_float(text: str) -> Optional[float]:
     if text is None:
         return None
@@ -337,8 +364,10 @@ async def _post_photo_event(
     mime_type: str,
 ) -> dict:
     url = f"{API_BASE}/events/photo"
+    trace_id = f"tg-{uuid.uuid4().hex[:12]}"
     files = {"file": (filename or "file.bin", file_bytes, mime_type or "application/octet-stream")}
     data = {
+        "trace_id": trace_id,
         "chat_id": str(chat_id),
         "telegram_username": telegram_username or "",
         "phone": phone or "",
@@ -347,7 +376,15 @@ async def _post_photo_event(
         "meter_index_mode": "explicit",
     }
     resp = await _http_post(url, data=data, files=files, read_timeout=HTTP_READ_TIMEOUT_PHOTO)
-    return {"status_code": resp.status_code, "ok": resp.ok, "text": resp.text, "json": (resp.json() if resp.ok else None)}
+    payload = resp.json() if resp.ok else None
+    return {
+        "status_code": resp.status_code,
+        "ok": resp.ok,
+        "text": resp.text,
+        "json": payload,
+        "trace_id": trace_id,
+        "server_trace_id": (payload.get("trace_id") if isinstance(payload, dict) else None),
+    }
 
 
 async def _fetch_bill(chat_id: int, ym: str) -> Optional[dict]:
@@ -886,15 +923,31 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     js = r.get("json") or {}
     ym = js.get("ym") or ""
     assigned = js.get("assigned_meter_index", meter_index)
+    trace_id = js.get("trace_id") or r.get("server_trace_id") or r.get("trace_id")
 
     ocr = js.get("ocr") or {}
     ocr_type = ocr.get("type")
     ocr_reading = ocr.get("reading")
+    ocr_conf = ocr.get("confidence")
 
     meter_written = js.get("meter_written")
     ocr_failed = bool(js.get("ocr_failed"))
+    review_reason = _extract_review_reason(js)
+    conf_txt = None
+    if isinstance(ocr_conf, (int, float)):
+        conf_txt = f"{float(ocr_conf):.2f}"
 
     anomaly_info = _extract_anomaly_warning(js)
+    logging.info(
+        "PHOTO_EVENT trace_id=%s meter_written=%s ocr_failed=%s ocr_type=%s ocr_reading=%s ocr_conf=%s review_reason=%s",
+        trace_id,
+        meter_written,
+        ocr_failed,
+        ocr_type,
+        ocr_reading,
+        conf_txt,
+        review_reason,
+    )
 
     if ocr_failed or ((meter_written is False) and (ocr_reading is None)):
         await message.reply(
@@ -914,10 +967,13 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
                 shown_reading = f"{float(shown_reading):.2f}"
             except Exception:
                 pass
+        conf_line = f"\nУверенность OCR: {conf_txt}" if conf_txt is not None else ""
+        reason_line = f"\nПричина проверки: {review_reason}" if review_reason else ""
         msg = (
             "Фото получено.\n"
             f"Распознано: {ocr_type or '—'} / {shown_reading}\n"
-            "Значение выглядит спорным: мы отметили «Проверить» для администратора."
+            f"Значение выглядит спорным: мы отметили «Проверить» для администратора."
+            f"{conf_line}{reason_line}"
         )
         await message.reply(msg, reply_markup=_kb_main())
         return
@@ -929,6 +985,10 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
     msg = f"Принято. (meter_index={assigned})"
     if ocr_type or shown_reading is not None:
         msg += f"\nРаспознано: {ocr_type or '—'} / {shown_reading if shown_reading is not None else '—'}"
+    if conf_txt is not None:
+        msg += f"\nУверенность OCR: {conf_txt}"
+    if review_reason:
+        msg += f"\nПричина проверки: {review_reason}"
     if anomaly_info:
         msg += "\nЗначение выглядит подозрительным, но мы сохранили его и отметили «Проверить значение» для администратора."
     await message.reply(msg, reply_markup=_kb_main())

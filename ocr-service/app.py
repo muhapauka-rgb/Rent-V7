@@ -4,10 +4,12 @@ import json
 import requests
 import re
 import time
+import uuid
+import logging
 from io import BytesIO
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance
 from typing import Optional, Tuple
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
 import cv2
 
@@ -33,6 +35,7 @@ OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() 
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
 
 app = FastAPI()
+logger = logging.getLogger("ocr_service")
 
 SYSTEM_PROMPT = """Ты — OCR-ассистент для коммунальных счётчиков (вода/электро).
 
@@ -1854,8 +1857,13 @@ def _water_digit_candidates(candidates: list[dict]) -> list[dict]:
 
 
 @app.post("/recognize")
-async def recognize(file: UploadFile = File(...)):
+async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form(None)):
     started_at = time.monotonic()
+    req_trace_id = (str(trace_id or "").strip() or f"ocr-{uuid.uuid4().hex[:12]}")
+    stage_ms: dict[str, int] = {}
+
+    def _mark_stage(name: str) -> None:
+        stage_ms[name] = int((time.monotonic() - started_at) * 1000)
 
     # Keep part of time budget for dedicated odometer passes on water meters.
     odo_reserve_sec = 16.0 if OCR_WATER_DIGIT_FIRST else 0.0
@@ -1869,7 +1877,16 @@ async def recognize(file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="empty_file")
 
     mime = _guess_mime(file.filename, file.content_type)
+    logger.info(
+        "ocr_recognize start trace_id=%s filename=%s content_type=%s mime=%s size_bytes=%s",
+        req_trace_id,
+        file.filename,
+        file.content_type,
+        mime,
+        len(img),
+    )
     variants = _make_variants(img)
+    _mark_stage("variants")
     variant_image_map: dict[str, bytes] = {}
 
     candidates: list[dict] = []
@@ -1914,6 +1931,7 @@ async def recognize(file: UploadFile = File(...)):
                 )
             except Exception:
                 pass
+    _mark_stage("bootstrap_passes")
     initial_variant_limit = 1 if OCR_WATER_DIGIT_FIRST else 2
     for label, b in variants[:initial_variant_limit]:
         variant_image_map.setdefault(label, b)
@@ -1949,6 +1967,7 @@ async def recognize(file: UploadFile = File(...)):
 
     if not candidates:
         raise HTTPException(status_code=500, detail="openai_empty_response")
+    _mark_stage("primary_candidates")
 
     # propagate best-known serial to candidates that returned none/"unknown"
     global_serial = _pick_best_serial(candidates)
@@ -1994,6 +2013,7 @@ async def recognize(file: UploadFile = File(...)):
                     "provider": f"openai:{OCR_MODEL_FALLBACK}",
                 }
             )
+    _mark_stage("fallback_candidates")
 
     # water-specific second stage: always try dial-focused OCR and let ranker decide
     water_variants = _make_water_dial_variants(img)
@@ -2032,6 +2052,7 @@ async def recognize(file: UploadFile = File(...)):
                 "provider": f"openai-water:{OCR_MODEL_PRIMARY}",
             }
         )
+    _mark_stage("water_variants")
 
     # water-special prompt on generic variants too (helps when circle detection misses)
     for label, b in ([] if OCR_WATER_DIGIT_FIRST else variants[:1]):
@@ -2163,6 +2184,7 @@ async def recognize(file: UploadFile = File(...)):
             # Keep bounded runtime even without consensus.
             if idx >= 14 and (not _time_budget_left(3.0)):
                 break
+    _mark_stage("odometer_variants")
 
     # full-image odometer pass (helps when circle/window crop misses the counter zone)
     for label, b in ([] if fast_water_hit else variants[:1]):
@@ -2203,6 +2225,7 @@ async def recognize(file: UploadFile = File(...)):
             }
         )
         variant_image_map.setdefault(f"odo_full_{label}", b)
+    _mark_stage("full_image_odo")
 
     # single high-quality "sheet" pass over multiple odometer windows
     sheet = _make_water_odometer_sheet(img)
@@ -2241,6 +2264,7 @@ async def recognize(file: UploadFile = File(...)):
             )
         except Exception:
             pass
+    _mark_stage("odo_sheet")
 
     # optional external provider (Google Vision) as extra candidate
     # only when best still low-confidence
@@ -2270,6 +2294,7 @@ async def recognize(file: UploadFile = File(...)):
                 )
         except Exception:
             pass
+    _mark_stage("google_fallback")
 
     water_pool = _water_digit_candidates(candidates)
     # Main path for water: strict odometer digit-first pipeline (feature flag).
@@ -2512,6 +2537,8 @@ async def recognize(file: UploadFile = File(...)):
             }
             for c in ranked
         ]
+        out["timings_ms"] = dict(stage_ms)
+    out["trace_id"] = req_trace_id
 
     # Hard safety for water:
     # if final winner is not a strong odometer-digit read, do not return numeric value.
@@ -2534,4 +2561,17 @@ async def recognize(file: UploadFile = File(...)):
         base_notes = str(out.get("notes") or "").strip()
         tail = "water_no_strong_odometer_winner"
         out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+    _mark_stage("finalize")
+    if OCR_DEBUG:
+        out["timings_ms"] = dict(stage_ms)
+    logger.info(
+        "ocr_recognize done trace_id=%s elapsed_ms=%s type=%s reading=%s confidence=%s variant=%s provider=%s",
+        req_trace_id,
+        int((time.monotonic() - started_at) * 1000),
+        out.get("type"),
+        out.get("reading"),
+        out.get("confidence"),
+        chosen_label,
+        str(best.get("provider") or ""),
+    )
     return out
