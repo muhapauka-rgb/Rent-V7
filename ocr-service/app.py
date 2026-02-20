@@ -1217,6 +1217,164 @@ def _make_water_top_strip_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     return out[:3]
 
 
+def _crop_rectified_row_from_rect(
+    im: np.ndarray,
+    rect: tuple[tuple[float, float], tuple[float, float], float],
+    *,
+    pad_x: float = 0.12,
+    pad_y: float = 0.55,
+) -> Optional[np.ndarray]:
+    try:
+        (cx, cy), (rw, rh), angle = rect
+        if rw < 1 or rh < 1:
+            return None
+        if rw < rh:
+            rw, rh = rh, rw
+            angle += 90.0
+        h, w = im.shape[:2]
+        M = cv2.getRotationMatrix2D((float(cx), float(cy)), float(angle), 1.0)
+        rotated = cv2.warpAffine(
+            im,
+            M,
+            (w, h),
+            flags=cv2.INTER_CUBIC,
+            borderMode=cv2.BORDER_REPLICATE,
+        )
+        ww = int(max(12, round(rw * (1.0 + pad_x))))
+        hh = int(max(12, round(rh * (1.0 + pad_y))))
+        x1, y1, x2, y2 = _clamp_box(
+            int(round(cx - ww / 2.0)),
+            int(round(cy - hh / 2.0)),
+            int(round(cx + ww / 2.0)),
+            int(round(cy + hh / 2.0)),
+            w,
+            h,
+        )
+        crop = rotated[y1:y2, x1:x2]
+        if crop.size == 0:
+            return None
+        return crop
+    except Exception:
+        return None
+
+
+def _detect_water_odometer_rects(im: np.ndarray) -> list[tuple[float, tuple[tuple[float, float], tuple[float, float], float]]]:
+    out: list[tuple[float, tuple[tuple[float, float], tuple[float, float], float]]] = []
+    try:
+        h, w = im.shape[:2]
+        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
+        g = clahe.apply(gray)
+
+        kh = max(3, ((h // 120) | 1))
+        kw = max(19, ((w // 12) | 1))
+        k_blackhat = cv2.getStructuringElement(cv2.MORPH_RECT, (kw, kh))
+        blackhat = cv2.morphologyEx(g, cv2.MORPH_BLACKHAT, k_blackhat)
+
+        gradx = cv2.Sobel(blackhat, cv2.CV_32F, 1, 0, ksize=3)
+        gradx = np.absolute(gradx)
+        m = float(np.max(gradx)) if gradx.size else 0.0
+        if m > 0:
+            gradx = (gradx / m) * 255.0
+        gradx_u8 = gradx.astype("uint8")
+
+        _, th = cv2.threshold(gradx_u8, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+        th = cv2.morphologyEx(
+            th,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(15, w // 20), max(3, h // 140))),
+            iterations=2,
+        )
+        th = cv2.dilate(
+            th,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (max(9, w // 28), max(3, h // 170))),
+            iterations=1,
+        )
+
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            area = float(cv2.contourArea(c))
+            if area < float(w * h) * 0.0012:
+                continue
+            rect = cv2.minAreaRect(c)
+            (_cx, _cy), (rw, rh), _angle = rect
+            if rw < 1 or rh < 1:
+                continue
+            major = max(rw, rh)
+            minor = min(rw, rh)
+            if major < float(w) * 0.18:
+                continue
+            if minor < float(h) * 0.02 or minor > float(h) * 0.30:
+                continue
+            ar = float(major) / float(max(1.0, minor))
+            if ar < 2.5 or ar > 22.0:
+                continue
+            y_norm = float(_cy) / float(max(1, h))
+            if y_norm < 0.22 or y_norm > 0.90:
+                continue
+            area_norm = area / float(max(1, w * h))
+            pos_score = 1.0 - min(1.0, abs(y_norm - 0.58))
+            score = (ar * 0.6) + (area_norm * 28.0) + (pos_score * 2.4)
+            out.append((score, rect))
+    except Exception:
+        return out
+    out.sort(key=lambda t: t[0], reverse=True)
+    return out[:4]
+
+
+def _make_water_roi_row_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    """
+    ROI-first: ищем прямоугольное окно барабана цифр по морфологии/контурам,
+    выпрямляем и только потом подаём в OCR.
+    """
+    out: list[tuple[str, bytes]] = []
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if im is None:
+            return out
+        rects = _detect_water_odometer_rects(im)
+        for idx, (_score, rect) in enumerate(rects, start=1):
+            crop = _crop_rectified_row_from_rect(im, rect, pad_x=0.12, pad_y=0.62)
+            if crop is None or crop.size == 0:
+                continue
+            pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            pil = pil.resize((max(1, pil.width * 4), max(1, pil.height * 4)), Image.Resampling.LANCZOS)
+
+            base = ImageEnhance.Contrast(pil).enhance(2.2).filter(
+                ImageFilter.UnsharpMask(radius=1, percent=300, threshold=2)
+            )
+            out.append((f"roi_row_{idx}", _encode_jpeg(base, quality=95)))
+
+            g = cv2.cvtColor(np.array(base), cv2.COLOR_RGB2GRAY)
+            g = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(g)
+            out.append(
+                (
+                    f"roi_row_clahe_{idx}",
+                    _encode_jpeg(Image.fromarray(cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)), quality=95),
+                )
+            )
+
+            bw = cv2.adaptiveThreshold(
+                g,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                35,
+                8,
+            )
+            out.append(
+                (
+                    f"roi_row_bw_{idx}",
+                    _encode_jpeg(Image.fromarray(cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB)), quality=95),
+                )
+            )
+    except Exception:
+        return out
+    return out[:12]
+
+
 def _make_water_odometer_window_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     out: list[tuple[str, bytes]] = []
     try:
@@ -1607,49 +1765,42 @@ def _make_water_counter_row_variants(img_bytes: bytes) -> list[tuple[str, bytes]
 
 def _make_water_odometer_sheet(img_bytes: bytes) -> Optional[bytes]:
     try:
-        arr = np.frombuffer(img_bytes, dtype=np.uint8)
-        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-        if im is None:
-            return None
-        h, w = im.shape[:2]
-        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
-        gray = cv2.medianBlur(gray, 5)
-        circles = cv2.HoughCircles(
-            gray,
-            cv2.HOUGH_GRADIENT,
-            dp=1.2,
-            minDist=max(30, min(w, h) // 6),
-            param1=90,
-            param2=30,
-            minRadius=max(30, min(w, h) // 12),
-            maxRadius=max(300, min(w, h) // 2),
-        )
-        if circles is None:
-            return None
-        circles = np.round(circles[0, :]).astype(int)
-        x, y, r = max(circles, key=lambda c: c[2])
+        tiles: list[Image.Image] = []
 
-        boxes = [
-            (x - int(r * 0.72), y - int(r * 0.40), x + int(r * 0.78), y + int(r * 0.10)),
-            (x - int(r * 0.68), y - int(r * 0.32), x + int(r * 0.72), y + int(r * 0.16)),
-            (x - int(r * 0.82), y - int(r * 0.46), x + int(r * 0.88), y + int(r * 0.14)),
-            (x - int(r * 0.76), y - int(r * 0.52), x + int(r * 0.78), y - int(r * 0.10)),
-            (x - int(r * 0.90), y - int(r * 0.20), x + int(r * 0.92), y + int(r * 0.26)),
-            (x - int(r * 0.95), y - int(r * 0.05), x + int(r * 0.96), y + int(r * 0.36)),
-        ]
-
-        tiles = []
-        for (bx1, by1, bx2, by2) in boxes:
-            bx1, by1, bx2, by2 = _clamp_box(bx1, by1, bx2, by2, w, h)
-            crop = im[by1:by2, bx1:bx2]
-            if crop.size == 0:
+        # 1) ROI-first candidates from rectified row detector
+        roi_variants = _make_water_roi_row_variants(img_bytes)
+        for _label, b in roi_variants:
+            arr2 = np.frombuffer(b, dtype=np.uint8)
+            im2 = cv2.imdecode(arr2, cv2.IMREAD_COLOR)
+            if im2 is None:
                 continue
-            rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-            p = Image.fromarray(rgb).resize((540, 220), Image.Resampling.LANCZOS)
-            p = ImageEnhance.Contrast(p).enhance(1.7).filter(
-                ImageFilter.UnsharpMask(radius=1, percent=240, threshold=2)
+            p = Image.fromarray(cv2.cvtColor(im2, cv2.COLOR_BGR2RGB)).resize(
+                (540, 220),
+                Image.Resampling.LANCZOS,
             )
             tiles.append(p)
+            if len(tiles) >= 6:
+                break
+
+        # 2) Fallback to existing geometric windows if not enough
+        if len(tiles) < 4:
+            odo_windows = _make_water_odometer_window_variants(img_bytes)
+            for _label, b in odo_windows:
+                arr2 = np.frombuffer(b, dtype=np.uint8)
+                im2 = cv2.imdecode(arr2, cv2.IMREAD_COLOR)
+                if im2 is None:
+                    continue
+                p = Image.fromarray(cv2.cvtColor(im2, cv2.COLOR_BGR2RGB)).resize(
+                    (540, 220),
+                    Image.Resampling.LANCZOS,
+                )
+                p = ImageEnhance.Contrast(p).enhance(1.65).filter(
+                    ImageFilter.UnsharpMask(radius=1, percent=240, threshold=2)
+                )
+                tiles.append(p)
+                if len(tiles) >= 6:
+                    break
+
         if len(tiles) < 4:
             return None
         while len(tiles) < 6:
@@ -1657,10 +1808,8 @@ def _make_water_odometer_sheet(img_bytes: bytes) -> Optional[bytes]:
 
         sheet = Image.new("RGB", (1100, 760), (250, 250, 250))
         positions = [(20, 20), (560, 20), (20, 270), (560, 270), (20, 520), (560, 520)]
-        labels = ["A1", "A2", "A3", "A4", "A5", "A6"]
         for i, (tx, ty) in enumerate(positions):
             sheet.paste(tiles[i], (tx, ty))
-            # simple label strip
             lab = Image.new("RGB", (80, 28), (20, 20, 20))
             sheet.paste(lab, (tx + 6, ty + 6))
         return _encode_jpeg(sheet, quality=92)
@@ -1731,6 +1880,8 @@ def _candidate_score(item: dict, all_items: list[dict]) -> float:
         score += 0.24
     if variant.startswith("counter_row_"):
         score += 0.42
+    if variant.startswith("roi_row_"):
+        score += 0.52
     if variant.startswith("circle_row_"):
         score += 0.34
     if variant.startswith("odo_global_"):
@@ -1782,6 +1933,7 @@ def _is_odometer_variant(label: str) -> bool:
         or s.startswith("odo_sheet_")
         or s.startswith("box_window_")
         or s.startswith("counter_row_")
+        or s.startswith("roi_row_")
         or s.startswith("circle_row_")
         or s.startswith("circle_odo_")
         or s.startswith("blackhat_row_")
@@ -2085,6 +2237,7 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
 
     # dedicated odometer-window pass (digit-first extraction)
     odo_variants = _make_water_odometer_window_variants(img)
+    roi_row_variants = _make_water_roi_row_variants(img)
     global_variants = _make_water_global_strip_variants(img)
     box_variants = _make_water_counter_box_variants(img)
     row_variants = _make_water_counter_row_variants(img)
@@ -2115,7 +2268,8 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
     # Use a broader but still bounded set of odometer-focused crops.
     # Previous narrow selection often missed the correct digit row on dark/angled shots.
     odometer_variants = (
-        face_row_variants[:8]
+        roi_row_variants[:8]
+        + face_row_variants[:8]
         + blackhat_row_variants[:4]
         + circle_odo_variants[:4]
         +
