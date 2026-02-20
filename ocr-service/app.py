@@ -1987,6 +1987,20 @@ def _is_strong_water_digits(item: dict) -> bool:
     return True
 
 
+def _is_ok_water_digits(item: dict) -> bool:
+    b = _normalize_digits_string(item.get("black_digits"))
+    if not b:
+        return False
+    sig = len(b.lstrip("0"))
+    if sig < 3:
+        return False
+    if len(b) < 4:
+        return False
+    if b.startswith("000") and sig <= 4:
+        return False
+    return True
+
+
 def _water_digit_candidates(candidates: list[dict]) -> list[dict]:
     return [
         c
@@ -2695,8 +2709,9 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
     out["trace_id"] = req_trace_id
 
     # Hard safety for water:
-    # if final winner is not a strong odometer-digit read, do not return numeric value.
-    # This blocks hallucinated large readings from full-frame prompts.
+    # - "ok" odometer read (black digits) is enough to keep integer result;
+    # - "strong" odometer read (black + reliable red digits) keeps high confidence;
+    # - no "ok" read => block numeric result (anti-hallucination guard).
     winner_provider = str(best.get("provider") or "")
     winner_is_water_family = (
         str(best.get("type") or "") in ("ХВС", "ГВС", "unknown")
@@ -2707,13 +2722,25 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             or winner_provider.startswith("google_vision")
         )
     )
+    winner_black = _normalize_digits_string(best.get("black_digits"))
+    winner_is_ok_odo = _is_ok_water_digits(best)
     winner_is_strong_odo = _is_strong_water_digits(best)
-    if OCR_WATER_DIGIT_FIRST and winner_is_water_family and not winner_is_strong_odo:
+    if OCR_WATER_DIGIT_FIRST and winner_is_water_family and not winner_is_ok_odo:
         out["type"] = "unknown"
         out["reading"] = None
         out["confidence"] = min(float(out.get("confidence") or 0.0), 0.45)
         base_notes = str(out.get("notes") or "").strip()
-        tail = "water_no_strong_odometer_winner"
+        tail = "water_no_ok_odometer_winner"
+        out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+    elif OCR_WATER_DIGIT_FIRST and winner_is_water_family and winner_is_ok_odo and not winner_is_strong_odo:
+        if out.get("reading") is None and winner_black:
+            try:
+                out["reading"] = float(int(winner_black))
+            except Exception:
+                pass
+        out["confidence"] = min(float(out.get("confidence") or 0.0), 0.70)
+        base_notes = str(out.get("notes") or "").strip()
+        tail = "water_black_only_or_weak_red"
         out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
     _mark_stage("finalize")
     if OCR_DEBUG:
