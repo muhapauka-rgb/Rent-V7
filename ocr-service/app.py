@@ -43,6 +43,12 @@ GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
 OCR_DEBUG = os.getenv("OCR_DEBUG", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
+try:
+    OCR_ELECTRIC_BOOTSTRAP_VARIANTS = int(os.getenv("OCR_ELECTRIC_BOOTSTRAP_VARIANTS", "4"))
+except Exception:
+    OCR_ELECTRIC_BOOTSTRAP_VARIANTS = 4
+OCR_ELECTRIC_BOOTSTRAP_VARIANTS = max(2, min(8, OCR_ELECTRIC_BOOTSTRAP_VARIANTS))
 OCR_WATER_HYPOTHESIS_PASS = os.getenv("OCR_WATER_HYPOTHESIS_PASS", "1").strip().lower() in ("1", "true", "yes", "on")
 try:
     OCR_WATER_HYPOTHESIS_MAX_CALLS = int(os.getenv("OCR_WATER_HYPOTHESIS_MAX_CALLS", "1"))
@@ -588,6 +594,96 @@ def _extract_serial_from_text(s: str) -> Optional[str]:
     return None
 
 
+def _electric_hint_score(item: dict) -> float:
+    txt = f"{item.get('type','')} {item.get('notes','')}".lower()
+    score = 0.0
+    for token in ("квт", "kwh", "1.8.", "t1", "t2", "t3", "электро"):
+        if token in txt:
+            score += 0.08
+    return min(0.24, score)
+
+
+def _pick_electric_bootstrap(candidates: list[dict]) -> tuple[Optional[dict], int]:
+    if not candidates:
+        return None, 0
+    ranked: list[tuple[float, dict, int]] = []
+    for i, c in enumerate(candidates):
+        r = _normalize_reading(c.get("reading"))
+        if r is None:
+            continue
+        if r < 0 or r > 100000000000:
+            continue
+        conf = _clamp_confidence(c.get("confidence", 0.0))
+        agree = 0
+        for j, d in enumerate(candidates):
+            if j == i:
+                continue
+            rd = _normalize_reading(d.get("reading"))
+            if rd is None:
+                continue
+            if abs(float(rd) - float(r)) <= 2.0:
+                agree += 1
+        score = conf + _electric_hint_score(c) + min(0.20, 0.06 * float(agree))
+        ranked.append((score, c, agree))
+    if not ranked:
+        return None, 0
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    top_score, top, top_agree = ranked[0]
+    top_conf = _clamp_confidence(top.get("confidence", 0.0))
+    if top_conf >= 0.90:
+        return top, top_agree
+    if top_conf >= 0.72 and top_agree >= 1:
+        return top, top_agree
+    if top_score >= 0.98:
+        return top, top_agree
+    return None, top_agree
+
+
+def _pick_electric_bootstrap_relaxed(candidates: list[dict]) -> tuple[Optional[dict], int]:
+    """
+    Relaxed selector for hard photos:
+    allow uncertain type if several variants converge to close numeric readings.
+    """
+    numeric: list[dict] = []
+    for c in candidates:
+        r = _normalize_reading(c.get("reading"))
+        if r is None:
+            continue
+        if r < 0 or r > 100000000000:
+            continue
+        cc = dict(c)
+        cc["reading"] = float(r)
+        numeric.append(cc)
+    if not numeric:
+        return None, 0
+    best = None
+    best_support = -1
+    best_score = -1e9
+    for c in numeric:
+        r = float(c.get("reading"))
+        conf = _clamp_confidence(c.get("confidence", 0.0))
+        support = 0
+        for d in numeric:
+            rd = _normalize_reading(d.get("reading"))
+            if rd is None:
+                continue
+            if abs(float(rd) - r) <= 2.0:
+                support += 1
+        score = support * 1.0 + conf * 0.7 + _electric_hint_score(c)
+        if (support > best_support) or (support == best_support and score > best_score):
+            best_support = support
+            best_score = score
+            best = c
+    if best is None:
+        return None, 0
+    best_conf = _clamp_confidence(best.get("confidence", 0.0))
+    if best_support >= 2:
+        return best, best_support - 1
+    if best_conf >= 0.90:
+        return best, 0
+    return None, best_support - 1
+
+
 def _looks_like_serial_candidate(reading: Optional[float], serial: Optional[str]) -> bool:
     if reading is None or not serial:
         return False
@@ -823,6 +919,54 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
             variants.append(("contrast", contrast))
 
     return variants[:6]
+
+
+def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return out
+    try:
+        w, h = img.size
+        bands = [
+            ("ed_mid", (0, int(h * 0.26), w, int(h * 0.72))),
+            ("ed_center", (int(w * 0.08), int(h * 0.22), int(w * 0.92), int(h * 0.78))),
+            ("ed_lower_mid", (0, int(h * 0.34), w, int(h * 0.82))),
+        ]
+        for base_label, (x1, y1, x2, y2) in bands:
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(x1 + 1, min(w, x2))
+            y2 = max(y1 + 1, min(h, y2))
+            crop = img.crop((x1, y1, x2, y2))
+
+            c1 = ImageEnhance.Contrast(crop).enhance(1.75)
+            c1 = ImageEnhance.Sharpness(c1).enhance(1.45)
+            c1 = c1.filter(ImageFilter.UnsharpMask(radius=1, percent=220, threshold=2))
+            out.append((f"{base_label}_contrast", _encode_jpeg(c1, quality=94)))
+
+            g = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+            g = cv2.GaussianBlur(g, (3, 3), 0)
+            clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
+            g2 = clahe.apply(g)
+            rgb2 = Image.fromarray(cv2.cvtColor(g2, cv2.COLOR_GRAY2RGB))
+            rgb2 = ImageEnhance.Contrast(rgb2).enhance(1.38)
+            out.append((f"{base_label}_clahe", _encode_jpeg(rgb2, quality=94)))
+
+            bw = cv2.adaptiveThreshold(
+                g2,
+                255,
+                cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY,
+                31,
+                6,
+            )
+            rgb3 = Image.fromarray(cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB))
+            out.append((f"{base_label}_bw", _encode_jpeg(rgb3, quality=94)))
+    except Exception:
+        return out[:8]
+    return out[:8]
 
 
 def _clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -3492,6 +3636,186 @@ async def recognize(
     candidates: list[dict] = []
     serial_target_hit = False
     quick_bootstrap_deferred = False
+
+    # Electric bootstrap:
+    # When digit-first water mode is enabled, generic passes are mostly skipped.
+    # Probe a few generic variants first and early-return on confident electric reads.
+    if OCR_ELECTRIC_BOOTSTRAP and variants and _time_budget_left(odo_reserve_sec):
+        electric_variants: list[tuple[str, bytes]] = []
+        preferred = ("middle_band", "focused_crop", "center_crop_strong", "orig", "contrast", "lowlight_enhanced")
+        seen_ev: set[str] = set()
+        by_label = {str(lbl): vb for lbl, vb in variants}
+        for p in preferred:
+            vb = by_label.get(p)
+            if vb is None:
+                continue
+            electric_variants.append((p, vb))
+            seen_ev.add(p)
+        for lbl, vb in variants:
+            s_lbl = str(lbl)
+            if s_lbl in seen_ev:
+                continue
+            electric_variants.append((s_lbl, vb))
+            seen_ev.add(s_lbl)
+
+        electric_candidates: list[dict] = []
+        for label, b in electric_variants[:OCR_ELECTRIC_BOOTSTRAP_VARIANTS]:
+            if not _time_budget_left(odo_reserve_sec):
+                break
+            variant_image_map.setdefault(label, b)
+            try:
+                er = _vision(
+                    b,
+                    mime=mime,
+                    model=OCR_MODEL_PRIMARY,
+                    system_prompt=SYSTEM_PROMPT,
+                    user_text=(
+                        "Если это электросчётчик, верни type='Электро' и reading. "
+                        "Игнорируй серийный номер, напряжение и служебные цифры."
+                    ),
+                    max_call_timeout_sec=7.5,
+                )
+            except Exception:
+                continue
+            t = _sanitize_type(er.get("type", "unknown"))
+            notes = str(er.get("notes", "") or "")
+            if t == "unknown":
+                t2 = _classify_meter_type_from_text(f"{er.get('type','')} {notes}")
+                if t2 == "Электро":
+                    t = "Электро"
+            reading = _normalize_reading(er.get("reading", None))
+            serial = er.get("serial", None)
+            if isinstance(serial, str):
+                serial = serial.strip() or None
+            conf = _clamp_confidence(er.get("confidence", 0.0))
+            reading, conf, note2 = _plausibility_filter(t, reading, conf)
+            if t != "Электро":
+                # OCR type can be unknown on dusty LCD, but numeric value is still useful.
+                # Keep only reasonably confident numeric candidates.
+                if (reading is not None) and (conf >= 0.56):
+                    t = "Электро"
+                    notes = (f"{notes}; electric_infer_from_numeric").strip("; ").strip()
+                else:
+                    continue
+            electric_candidates.append(
+                {
+                    "type": t,
+                    "reading": reading,
+                    "serial": serial,
+                    "confidence": conf,
+                    "notes": notes,
+                    "note2": note2,
+                    "variant": f"electric_{label}",
+                    "provider": f"openai-electric:{OCR_MODEL_PRIMARY}",
+                }
+            )
+
+        electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
+        if electric_best is None and _time_budget_left(odo_reserve_sec):
+            disp_variants = _make_electric_display_variants(img)
+            for label, b in disp_variants[:4]:
+                if not _time_budget_left(odo_reserve_sec):
+                    break
+                variant_image_map.setdefault(label, b)
+                try:
+                    er2 = _vision(
+                        b,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=SYSTEM_PROMPT,
+                        user_text=(
+                            "Это фото электросчётчика. Найди показание на LCD/LED дисплее. "
+                            "Игнорируй серийный номер и служебные числа. "
+                            "Если число не видно, верни reading=null."
+                        ),
+                        detail="high",
+                        max_call_timeout_sec=7.5,
+                    )
+                except Exception:
+                    continue
+                t2 = _sanitize_type(er2.get("type", "unknown"))
+                notes2 = str(er2.get("notes", "") or "")
+                if t2 == "unknown":
+                    guess2 = _classify_meter_type_from_text(f"{er2.get('type','')} {notes2}")
+                    if guess2 == "Электро":
+                        t2 = "Электро"
+                reading2 = _normalize_reading(er2.get("reading", None))
+                serial2 = er2.get("serial", None)
+                if isinstance(serial2, str):
+                    serial2 = serial2.strip() or None
+                conf2 = _clamp_confidence(er2.get("confidence", 0.0))
+                reading2, conf2, note2b = _plausibility_filter(t2, reading2, conf2)
+                if t2 != "Электро":
+                    if (reading2 is not None) and (conf2 >= 0.56):
+                        t2 = "Электро"
+                        notes2 = (f"{notes2}; electric_infer_from_numeric").strip("; ").strip()
+                    else:
+                        continue
+                electric_candidates.append(
+                    {
+                        "type": t2,
+                        "reading": reading2,
+                        "serial": serial2,
+                        "confidence": conf2,
+                        "notes": notes2,
+                        "note2": note2b,
+                        "variant": f"electric_{label}",
+                        "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
+                    }
+                )
+            electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
+        if electric_best is None:
+            electric_best, electric_agree = _pick_electric_bootstrap_relaxed(electric_candidates)
+        if electric_best is not None:
+            e_label = str(electric_best.get("variant") or "electric")
+            e_conf = _clamp_confidence(
+                float(electric_best.get("confidence") or 0.0) + min(0.12, 0.04 * float(electric_agree))
+            )
+            e_notes = str(electric_best.get("notes") or "").strip()
+            e_provider = str(electric_best.get("provider") or "openai-electric")
+            e_tail = f"provider={e_provider}; variant={e_label}; agree={electric_agree+1}/{len(electric_candidates)}; electric_bootstrap"
+            e_notes = f"{e_notes}; {e_tail}".strip("; ").strip()[:240]
+            out = {
+                "type": "Электро",
+                "reading": _normalize_reading(electric_best.get("reading")),
+                "serial": electric_best.get("serial"),
+                "confidence": e_conf,
+                "notes": e_notes,
+                "trace_id": req_trace_id,
+            }
+            _mark_stage("electric_bootstrap_finalize")
+            if OCR_DEBUG:
+                ranked_e = sorted(
+                    electric_candidates,
+                    key=lambda x: _clamp_confidence(x.get("confidence", 0.0)) + _electric_hint_score(x),
+                    reverse=True,
+                )[:20]
+                out["debug"] = [
+                    {
+                        "provider": str(c.get("provider") or "unknown"),
+                        "variant": str(c.get("variant") or "orig"),
+                        "type": str(c.get("type") or "unknown"),
+                        "reading": c.get("reading"),
+                        "confidence": float(c.get("confidence") or 0.0),
+                        "black_digits": c.get("black_digits"),
+                        "red_digits": c.get("red_digits"),
+                    }
+                    for c in ranked_e
+                ]
+                out["timings_ms"] = dict(stage_ms)
+                out["openai_calls"] = vision_calls
+            logger.info(
+                "ocr_recognize done trace_id=%s elapsed_ms=%s type=%s reading=%s confidence=%s variant=%s provider=%s early=%s",
+                req_trace_id,
+                int((time.monotonic() - started_at) * 1000),
+                out.get("type"),
+                out.get("reading"),
+                out.get("confidence"),
+                e_label,
+                e_provider,
+                True,
+            )
+            return out
 
     # Serial-targeted pass for scenes with multiple water meters in one photo.
     # Try to read only the meter whose serial tail matches context hint.
