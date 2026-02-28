@@ -6,6 +6,7 @@ import math
 import os
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.responses import JSONResponse
@@ -49,10 +50,15 @@ WATER_RETAKE_THRESHOLD = 1.0
 ELECTRIC_RETAKE_THRESHOLD = 5.0
 WATER_ANOMALY_THRESHOLD = 50.0
 ELECTRIC_ANOMALY_THRESHOLD = 500.0
+WATER_SERIAL_HARD_DELTA = float(os.getenv("WATER_SERIAL_HARD_DELTA", "80.0"))
 ENABLE_AGGRESSIVE_OCR_AUTOFIX = os.getenv("ENABLE_AGGRESSIVE_OCR_AUTOFIX", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_HTTP_TIMEOUT_SEC = float(os.getenv("OCR_HTTP_TIMEOUT_SEC", "75"))
+OCR_HTTP_TIMEOUT_FLOOR_SEC = float(os.getenv("OCR_HTTP_TIMEOUT_FLOOR_SEC", "70"))
 OCR_HTTP_RETRIES = int(os.getenv("OCR_HTTP_RETRIES", "1"))
-WATER_INTEGER_ONLY = os.getenv("WATER_INTEGER_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+WATER_INTEGER_ONLY = os.getenv("WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_SERIES_HTTP_TIMEOUT_SEC = float(os.getenv("OCR_SERIES_HTTP_TIMEOUT_SEC", "220"))
+OCR_SERIES_SINGLE_REPEATS = max(1, min(5, int(os.getenv("OCR_SERIES_SINGLE_REPEATS", "3"))))
+PHOTO_EVENT_MAX_FILES = int(os.getenv("PHOTO_EVENT_MAX_FILES", "6"))
 
 
 def _as_image_upload_tuple(blob: bytes, filename: str | None, mime_type: str | None):
@@ -91,17 +97,81 @@ def _call_ocr_with_retries(
     filename: str | None = None,
     mime_type: str | None = None,
     trace_id: str | None = None,
+    context_prev_water: str | None = None,
+    context_serial_hint: str | None = None,
+    read_timeout_override_sec: float | None = None,
 ):
     last_exc = None
     upload_file = _as_image_upload_tuple(blob, filename, mime_type)
-    post_data = {"trace_id": str(trace_id)} if trace_id else None
+    post_data: dict[str, str] = {}
+    if trace_id:
+        post_data["trace_id"] = str(trace_id)
+    if context_prev_water:
+        post_data["context_prev_water"] = str(context_prev_water)
+    if context_serial_hint:
+        post_data["context_serial_hint"] = str(context_serial_hint)
+    if not post_data:
+        post_data = None
     for attempt in range(max(1, OCR_HTTP_RETRIES)):
         try:
+            if read_timeout_override_sec is not None:
+                read_timeout = max(10.0, float(read_timeout_override_sec))
+            else:
+                read_timeout = max(float(OCR_HTTP_TIMEOUT_SEC), float(OCR_HTTP_TIMEOUT_FLOOR_SEC))
             resp = requests.post(
                 OCR_URL,
                 data=post_data,
                 files={"file": upload_file},
-                timeout=(5, OCR_HTTP_TIMEOUT_SEC),
+                timeout=(5, read_timeout),
+            )
+            return resp, None
+        except Exception as e:
+            last_exc = e
+            if attempt < max(1, OCR_HTTP_RETRIES) - 1:
+                time.sleep(0.35 * (attempt + 1))
+    return None, last_exc
+
+
+def _ocr_series_url() -> str:
+    url = str(OCR_URL or "").strip().rstrip("/")
+    if url.endswith("/recognize"):
+        return url[: -len("/recognize")] + "/recognize-series"
+    return url + "/recognize-series"
+
+
+def _call_ocr_series_with_retries(
+    photos: list[tuple[bytes, str | None, str | None]],
+    *,
+    trace_id: str | None = None,
+    context_prev_water: str | None = None,
+    context_serial_hint: str | None = None,
+):
+    last_exc = None
+    post_data: dict[str, str] = {}
+    if trace_id:
+        post_data["trace_id"] = str(trace_id)
+    if context_prev_water:
+        post_data["context_prev_water"] = str(context_prev_water)
+    if context_serial_hint:
+        post_data["context_serial_hint"] = str(context_serial_hint)
+    if not post_data:
+        post_data = None
+
+    files_payload = []
+    for blob, filename, mime_type in photos:
+        files_payload.append(("files", _as_image_upload_tuple(blob, filename, mime_type)))
+
+    for attempt in range(max(1, OCR_HTTP_RETRIES)):
+        try:
+            base_timeout = max(float(OCR_HTTP_TIMEOUT_SEC), float(OCR_HTTP_TIMEOUT_FLOOR_SEC))
+            read_timeout = max(base_timeout, float(OCR_SERIES_HTTP_TIMEOUT_SEC))
+            # series calls can be much slower than single-image OCR
+            read_timeout = max(read_timeout, min(900.0, base_timeout * max(1, len(photos))))
+            resp = requests.post(
+                _ocr_series_url(),
+                data=post_data,
+                files=files_payload,
+                timeout=(5, read_timeout),
             )
             return resp, None
         except Exception as e:
@@ -163,6 +233,604 @@ def _get_last_reading_before(conn, apartment_id: int, ym: str, meter_type: str, 
         return float(row[0])
     except Exception:
         return None
+
+
+def _get_recent_training_water_values(conn, apartment_id: int, ym: str, limit: int = 36) -> list[float]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT correct_value
+            FROM ocr_training_samples
+            WHERE apartment_id=:aid
+              AND ym <= :ym
+              AND meter_type IN ('cold','hot')
+              AND meter_index=1
+              AND correct_value IS NOT NULL
+              AND correct_value > 0
+            ORDER BY created_at DESC, id DESC
+            LIMIT :lim
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "lim": int(max(1, limit))},
+    ).fetchall()
+    out: list[float] = []
+    for row in rows:
+        try:
+            v = float(row[0])
+        except Exception:
+            continue
+        if not math.isfinite(v) or v <= 0:
+            continue
+        out.append(v)
+    return out
+
+
+def _select_water_context_values(
+    raw_values: list[float],
+    *,
+    max_values: int = 4,
+    support_tol: float = 180.0,
+    cluster_only_if_any: bool = False,
+) -> list[float]:
+    vals: list[float] = []
+    for raw in raw_values:
+        try:
+            v = float(raw)
+        except Exception:
+            continue
+        if not math.isfinite(v) or v <= 0:
+            continue
+        vals.append(v)
+    if not vals:
+        return []
+
+    uniq: list[float] = []
+    for v in vals:
+        if any(abs(v - u) <= 0.01 for u in uniq):
+            continue
+        uniq.append(v)
+
+    scored: list[tuple[float, int, int, float]] = []
+    for v in uniq:
+        support = 0
+        nearest_idx = len(vals)
+        for idx, x in enumerate(vals):
+            if abs(x - v) <= support_tol:
+                support += 1
+            if nearest_idx == len(vals) and abs(x - v) <= 0.01:
+                nearest_idx = idx
+        score = (float(support) * 10.0) - (0.05 * float(nearest_idx))
+        scored.append((score, support, nearest_idx, v))
+
+    scored.sort(key=lambda it: (it[0], it[1], -it[2]), reverse=True)
+    has_cluster = any(support >= 2 for _, support, _, _ in scored)
+    out: list[float] = []
+    if cluster_only_if_any and has_cluster:
+        for _score, support, _idx, v in scored:
+            if support < 2:
+                continue
+            if any(abs(v - o) <= 0.05 for o in out):
+                continue
+            out.append(v)
+            if len(out) >= int(max_values):
+                return out
+        return out
+    for clustered_only in ([True, False] if has_cluster else [False]):
+        for _score, support, _idx, v in scored:
+            if clustered_only and support < 2:
+                continue
+            if any(abs(v - o) <= 0.05 for o in out):
+                continue
+            out.append(v)
+            if len(out) >= int(max_values):
+                return out
+    return out
+
+
+def _parse_prev_values_context(ctx: str | None) -> list[float]:
+    if not ctx:
+        return []
+    out: list[float] = []
+    for part in re.split(r"[,\s;]+", str(ctx)):
+        p = str(part or "").strip().replace(",", ".")
+        if not p:
+            continue
+        try:
+            v = float(p)
+        except Exception:
+            continue
+        if (not math.isfinite(v)) or (v <= 0):
+            continue
+        out.append(v)
+    return out
+
+
+def _nearest_prev_distance(value: float | None, prev_values: list[float]) -> float:
+    if value is None or not prev_values:
+        return float("inf")
+    try:
+        v = float(value)
+    except Exception:
+        return float("inf")
+    return min(abs(v - float(p)) for p in prev_values)
+
+
+def _series_support_count(value: float, values: list[float], tol: float = 0.08) -> int:
+    c = 0
+    for x in values:
+        try:
+            if abs(float(value) - float(x)) <= tol:
+                c += 1
+        except Exception:
+            continue
+    return c
+
+
+def _series_local_score(item: dict, all_items: list[dict], prev_values: list[float]) -> float:
+    reading = _parse_reading_to_float(item.get("reading"))
+    if reading is None:
+        return -999.0
+    conf = float(item.get("confidence") or 0.0)
+    score = conf
+    item_type = str(item.get("type") or "unknown")
+    if item_type != "unknown":
+        score += 0.03
+    notes = str(item.get("notes") or "")
+    if "water_no_ok_odometer_winner" in notes:
+        score -= 0.45
+    if "water_context_far_singleton" in notes:
+        score -= 0.65
+    if "serial_target_multi_hint_unconfirmed" in notes:
+        score -= 0.40
+
+    peers = []
+    for x in all_items:
+        if x is item:
+            continue
+        xv = _parse_reading_to_float(x.get("reading"))
+        if xv is None:
+            continue
+        peers.append(float(xv))
+    support = _series_support_count(float(reading), peers, tol=0.08)
+    score += min(0.28, 0.12 * float(support))
+
+    if prev_values:
+        dist = _nearest_prev_distance(float(reading), prev_values)
+        if dist > 260.0:
+            score -= 0.55
+        else:
+            score -= min(0.24, dist / 1100.0)
+    return float(score)
+
+
+def _pick_best_series_local(results: list[dict], prev_values: list[float]) -> tuple[int, dict, float]:
+    if not results:
+        return -1, {}, -999.0
+    best_idx = -1
+    best_score = -1e9
+    best_conf = -1e9
+    for i, item in enumerate(results):
+        s = _series_local_score(item, results, prev_values)
+        conf = float(item.get("confidence") or 0.0)
+        if (s > best_score) or (abs(s - best_score) < 1e-9 and conf > best_conf):
+            best_idx = i
+            best_score = s
+            best_conf = conf
+    if best_idx < 0:
+        return 0, dict(results[0]), -999.0
+    return best_idx, dict(results[best_idx]), float(best_score)
+
+
+def _parse_serial_hints_context(ctx: str | None) -> list[str]:
+    if not ctx:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in re.split(r"[,\s;]+", str(ctx)):
+        p = str(part or "").strip()
+        if not p:
+            continue
+        n = _normalize_serial(p)
+        if not n or n in seen:
+            continue
+        seen.add(n)
+        out.append(n)
+    return out
+
+
+def _serial_tail_match_len(a: str | None, b: str | None) -> int:
+    sa = _normalize_serial(a)
+    sb = _normalize_serial(b)
+    if not sa or not sb:
+        return 0
+    m = min(len(sa), len(sb))
+    k = 0
+    while k < m and sa[-1 - k] == sb[-1 - k]:
+        k += 1
+    return k
+
+
+def _result_serial_keys(item: dict, serial_hints: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    s = _normalize_serial(item.get("serial"))
+    if s:
+        seen.add(s)
+        out.append(s)
+    notes = str(item.get("notes") or "")
+    for g in re.findall(r"\d{4,10}", notes):
+        n = _normalize_serial(g)
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    if serial_hints:
+        for h in serial_hints:
+            tail5 = h[-5:] if len(h) >= 5 else h
+            tail4 = h[-4:] if len(h) >= 4 else h
+            if (tail5 and tail5 in notes) or (tail4 and tail4 in notes):
+                if h not in seen:
+                    seen.add(h)
+                    out.append(h)
+    return out
+
+
+def _parse_photo_filename_dt(name: str | None) -> datetime | None:
+    s = str(name or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(\d{4}-\d{2}-\d{2})[ _](\d{2})\.(\d{2})\.(\d{2})", s)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(
+            f"{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except Exception:
+        return None
+
+
+def _series_item_needs_recovery(item: dict, prev_values: list[float]) -> bool:
+    reading = _parse_reading_to_float(item.get("reading"))
+    if reading is None:
+        return True
+    notes = str(item.get("notes") or "")
+    if (
+        "water_no_ok_odometer_winner" in notes
+        or "water_context_far_singleton" in notes
+        or "serial_target_multi_hint_unconfirmed" in notes
+    ):
+        return True
+    serial_norm = _normalize_serial(item.get("serial"))
+    if _looks_like_serial_reading(reading, serial_norm):
+        return True
+    if prev_values:
+        dist = _nearest_prev_distance(reading, prev_values)
+        if dist > 220.0:
+            return True
+    return False
+
+
+def _recover_series_missing_with_neighbors(
+    results: list[dict],
+    *,
+    prev_values: list[float],
+    serial_hints: list[str],
+) -> tuple[list[dict], list]:
+    if not results:
+        return results, []
+
+    out = [dict(r or {}) for r in results]
+    warnings: list = []
+    numeric_vals: list[float] = []
+    for r in out:
+        rv = _parse_reading_to_float(r.get("reading"))
+        if rv is not None:
+            numeric_vals.append(float(rv))
+    # Secondary fallback (without serial agreement) is safe only on tight series ranges.
+    range_is_tight = bool(numeric_vals) and ((max(numeric_vals) - min(numeric_vals)) <= 2.5)
+
+    for idx, rec in enumerate(out):
+        if not _series_item_needs_recovery(rec, prev_values):
+            continue
+        rec_dt = _parse_photo_filename_dt(rec.get("filename"))
+        target_keys = _result_serial_keys(rec, serial_hints)
+        donors: list[tuple[int, int, float, float, int, int, float, dict]] = []
+        for j, src in enumerate(out):
+            if j == idx:
+                continue
+            src_reading = _parse_reading_to_float(src.get("reading"))
+            if src_reading is None:
+                continue
+            src_dt = _parse_photo_filename_dt(src.get("filename"))
+            if rec_dt and src_dt:
+                if rec_dt.date() != src_dt.date():
+                    continue
+                dt_gap = abs((src_dt - rec_dt).total_seconds())
+            elif rec_dt or src_dt:
+                # Do not mix timestamped and non-timestamped items.
+                continue
+            else:
+                dt_gap = 0.0
+            src_keys = _result_serial_keys(src, serial_hints)
+            tail_match = 0
+            for ta in target_keys:
+                for sb in src_keys:
+                    tail_match = max(tail_match, _serial_tail_match_len(ta, sb))
+            dist_idx = abs(j - idx)
+            conf = float(src.get("confidence") or 0.0)
+            ctx_dist = _nearest_prev_distance(float(src_reading), prev_values) if prev_values else 0.0
+            stable = 1 if (not _series_item_needs_recovery(src, prev_values)) else 0
+            donors.append((dist_idx, -tail_match, ctx_dist, -conf, -stable, j, dt_gap, src))
+
+        if not donors:
+            continue
+
+        primary = [d for d in donors if (d[0] <= 1) and ((-d[1]) >= 4) and (d[6] <= 600.0)]
+        if primary:
+            primary.sort(key=lambda t: (t[0], t[6], t[2], t[3], t[4]))
+            chosen = primary[0]
+        else:
+            adjacent = [d for d in donors if (d[0] <= 1) and (d[4] <= -1) and (d[6] <= 300.0)]
+            if adjacent:
+                adjacent.sort(key=lambda t: (t[0], t[6], t[2], t[3], t[1]))
+                chosen = adjacent[0]
+            elif (not range_is_tight) or len(numeric_vals) < 1:
+                continue
+            secondary = [d for d in donors if (d[0] <= 1) and (d[6] <= 300.0)]
+            if not secondary:
+                continue
+            secondary.sort(key=lambda t: (t[0], t[6], t[2], t[3], t[4]))
+            chosen = secondary[0]
+
+        donor_idx = int(chosen[5])
+        donor = chosen[7]
+        donor_reading = _parse_reading_to_float(donor.get("reading"))
+        if donor_reading is None:
+            continue
+        prev_reading = _parse_reading_to_float(rec.get("reading"))
+        rec["reading"] = float(donor_reading)
+        rec["type"] = donor.get("type") or rec.get("type") or "unknown"
+        donor_conf = float(donor.get("confidence") or 0.0)
+        rec["confidence"] = max(float(rec.get("confidence") or 0.0), min(0.72, max(0.45, donor_conf - 0.18)))
+        note = str(rec.get("notes") or "").strip()
+        rec["notes"] = (
+            f"{note}; series_neighbor_recovered(from={donor_idx},prev={prev_reading},to={float(donor_reading):.3f})"
+        ).strip("; ").strip()
+        warnings.append(
+            {
+                "series_neighbor_recovered": {
+                    "index": int(idx),
+                    "from_index": int(donor_idx),
+                    "from_reading": float(donor_reading),
+                }
+            }
+        )
+
+    return out, warnings
+
+
+def _rebuild_series_best_from_payload(
+    payload: dict,
+    *,
+    prev_values: list[float],
+    serial_hints: list[str],
+) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, list) or not raw_results:
+        return None
+    results: list[dict] = []
+    for i, row in enumerate(raw_results, start=1):
+        rec = dict(row) if isinstance(row, dict) else {}
+        rec.setdefault("filename", f"file_{i}.jpg")
+        rec.setdefault("type", "unknown")
+        rec.setdefault("reading", None)
+        rec.setdefault("serial", None)
+        rec.setdefault("confidence", 0.0)
+        rec.setdefault("notes", "")
+        results.append(rec)
+    results, recover_warnings = _recover_series_missing_with_neighbors(
+        results,
+        prev_values=prev_values,
+        serial_hints=serial_hints,
+    )
+    best_idx, best_item, best_score = _pick_best_series_local(results, prev_values)
+    return {
+        "files_count": len(results),
+        "best_index": best_idx,
+        "best_score": best_score,
+        "best": best_item,
+        "results": results,
+        "warnings": recover_warnings,
+    }
+
+
+def _choose_single_attempt_result(attempts: list[dict], prev_values: list[float]) -> tuple[dict, list]:
+    if not attempts:
+        return (
+            {
+                "type": "unknown",
+                "reading": None,
+                "serial": None,
+                "confidence": 0.0,
+                "notes": "",
+            },
+            [],
+        )
+
+    clusters: list[dict] = []
+    for idx, item in enumerate(attempts):
+        reading = _parse_reading_to_float(item.get("reading"))
+        if reading is None:
+            continue
+        conf = float(item.get("confidence") or 0.0)
+        placed = False
+        for c in clusters:
+            if abs(float(reading) - float(c["value"])) <= 0.08:
+                c["count"] += 1
+                c["conf_sum"] += conf
+                c["members"].append(idx)
+                c["value"] = (float(c["value"]) * (c["count"] - 1) + float(reading)) / float(c["count"])
+                placed = True
+                break
+        if not placed:
+            clusters.append(
+                {
+                    "value": float(reading),
+                    "count": 1,
+                    "conf_sum": conf,
+                    "members": [idx],
+                }
+            )
+
+    warnings: list = []
+    if clusters:
+        clusters.sort(
+            key=lambda c: (
+                -int(c["count"]),
+                _nearest_prev_distance(float(c["value"]), prev_values),
+                -(float(c["conf_sum"]) / float(c["count"])),
+            )
+        )
+        top = clusters[0]
+        if int(top["count"]) >= 2:
+            cand_idxs = list(top["members"])
+            best_idx = max(
+                cand_idxs,
+                key=lambda i: (
+                    _series_local_score(attempts[i], attempts, prev_values),
+                    float(attempts[i].get("confidence") or 0.0),
+                ),
+            )
+            picked = dict(attempts[best_idx] or {})
+            notes = str(picked.get("notes") or "").strip()
+            picked["notes"] = (
+                f"{notes}; single_vote(n={len(attempts)},k={int(top['count'])})"
+            ).strip("; ").strip()
+            warnings.append(
+                {
+                    "single_vote_selected": {
+                        "attempts": len(attempts),
+                        "support": int(top["count"]),
+                        "reading": _parse_reading_to_float(picked.get("reading")),
+                    }
+                }
+            )
+            return picked, warnings
+
+    best_idx, best_item, _best_score = _pick_best_series_local(attempts, prev_values)
+    picked = dict(best_item or attempts[max(0, best_idx)] or {})
+    if len(attempts) > 1:
+        notes = str(picked.get("notes") or "").strip()
+        picked["notes"] = f"{notes}; single_best_of={len(attempts)}".strip("; ").strip()
+    return picked, warnings
+
+
+def _call_ocr_series_via_singles(
+    photos: list[tuple[bytes, str | None, str | None]],
+    *,
+    trace_id: str | None,
+    context_prev_water: str | None,
+    context_serial_hint: str | None,
+) -> dict:
+    prev_values = _parse_prev_values_context(context_prev_water)
+    serial_hints = _parse_serial_hints_context(context_serial_hint)
+    indexed_results: dict[int, dict] = {}
+    warnings: list = []
+    # Single-image fallback should allow slower hard frames; otherwise one timeout can nullify the whole series.
+    single_timeout = min(float(OCR_SERIES_HTTP_TIMEOUT_SEC), max(130.0, float(OCR_HTTP_TIMEOUT_SEC)))
+    repeat_attempts = int(OCR_SERIES_SINGLE_REPEATS)
+
+    def _one(idx: int, blob: bytes, filename: str | None, mime_type: str | None):
+        item_trace = f"{trace_id or 'ocrsf'}-sf{idx+1}"
+        name = str(filename or f"file_{idx+1}.jpg")
+        local_warnings: list = []
+        attempts: list[dict] = []
+        for att in range(max(1, repeat_attempts)):
+            att_trace = f"{item_trace}-a{att+1}"
+            resp, exc = _call_ocr_with_retries(
+                blob,
+                filename=filename,
+                mime_type=mime_type,
+                trace_id=att_trace,
+                context_prev_water=context_prev_water,
+                context_serial_hint=context_serial_hint,
+                read_timeout_override_sec=single_timeout,
+            )
+            if resp is not None and resp.ok:
+                try:
+                    js = resp.json()
+                except Exception:
+                    js = None
+                if isinstance(js, dict):
+                    rec = dict(js)
+                else:
+                    rec = {}
+                    local_warnings.append({"single_bad_json": f"{name}:a{att+1}"})
+            else:
+                rec = {}
+                if exc is not None:
+                    local_warnings.append({"single_ocr_error": f"{name}:a{att+1}: {exc}"})
+                elif resp is not None:
+                    local_warnings.append({"single_ocr_http": f"{name}:a{att+1}: {resp.status_code}"})
+            rec.setdefault("filename", name)
+            rec.setdefault("type", "unknown")
+            rec.setdefault("reading", None)
+            rec.setdefault("serial", None)
+            rec.setdefault("confidence", 0.0)
+            rec.setdefault("notes", "")
+            attempts.append(rec)
+
+            # Early stop when two recent attempts agree and result isn't marked suspicious.
+            if len(attempts) >= 2:
+                cur = attempts[-1]
+                prev = attempts[-2]
+                cur_r = _parse_reading_to_float(cur.get("reading"))
+                prev_r = _parse_reading_to_float(prev.get("reading"))
+                if (
+                    cur_r is not None
+                    and prev_r is not None
+                    and abs(float(cur_r) - float(prev_r)) <= 0.08
+                    and (not _series_item_needs_recovery(cur, prev_values))
+                ):
+                    break
+
+        rec, vote_warnings = _choose_single_attempt_result(attempts, prev_values)
+        local_warnings.extend(vote_warnings)
+        return idx, rec, local_warnings
+
+    # Reliability-first for hard photos: avoid concurrent long OCR calls causing timeouts.
+    max_workers = 1
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [
+            ex.submit(_one, idx, blob, filename, mime_type)
+            for idx, (blob, filename, mime_type) in enumerate(photos)
+        ]
+        for fut in as_completed(futs):
+            idx, rec, ws = fut.result()
+            indexed_results[idx] = rec
+            warnings.extend(ws)
+
+    results = [indexed_results.get(i, {"filename": str(photos[i][1] or f"file_{i+1}.jpg"), "type": "unknown", "reading": None, "serial": None, "confidence": 0.0, "notes": ""}) for i in range(len(photos))]
+    results, recover_warnings = _recover_series_missing_with_neighbors(
+        results,
+        prev_values=prev_values,
+        serial_hints=serial_hints,
+    )
+    warnings.extend(recover_warnings)
+
+    best_idx, best_item, best_score = _pick_best_series_local(results, prev_values)
+    return {
+        "trace_id": trace_id or f"ocrsf-{uuid.uuid4().hex[:12]}",
+        "files_count": len(results),
+        "best_index": best_idx,
+        "best_score": best_score,
+        "best": best_item,
+        "results": results,
+        "warnings": warnings,
+    }
 
 
 def _get_last_electric_before(conn, apartment_id: int, ym: str) -> list[float]:
@@ -396,7 +1064,23 @@ def _choose_water_debug_candidate_with_prev(
     *,
     prev_value: float | None,
     serial_norm: str | None,
+    max_delta: float | None = None,
 ) -> dict | None:
+    def _black_with_optional_zero_insert(raw_black: str, has_prev: bool) -> list[str]:
+        b = "".join(ch for ch in str(raw_black or "") if ch.isdigit())
+        if not b:
+            return []
+        # Typical OCR miss on drum counters: one inner zero is skipped (e.g. 01003 -> 0103).
+        # Only enable this when previous month exists, so we can validate by range/proximity.
+        if (not has_prev) or len(b) != 4:
+            return [b]
+        out = [b]
+        for pos in range(1, len(b) + 1):
+            cand = b[:pos] + "0" + b[pos:]
+            if cand not in out:
+                out.append(cand)
+        return out
+
     valid = []
     for c in candidates:
         t = str(c.get("type") or "")
@@ -409,37 +1093,53 @@ def _choose_water_debug_candidate_with_prev(
         # Берём только кандидаты со строкой барабана.
         if not b or len(b) < 4:
             continue
-        if WATER_INTEGER_ONLY:
-            try:
-                v = float(int(b))
-            except Exception:
+        for b_norm in _black_with_optional_zero_insert(b, prev_value is not None):
+            if WATER_INTEGER_ONLY:
+                try:
+                    v = float(int(b_norm))
+                except Exception:
+                    continue
+            else:
+                try:
+                    if r and len(r) >= 2:
+                        v = float(f"{int(b_norm)}.{r[:3]}")
+                    else:
+                        # Fallback: when fraction is lost, keep integer instead of dropping candidate.
+                        v = float(int(b_norm))
+                except Exception:
+                    continue
+            # защита от "нулей" и слишком маленьких чисел из ложного OCR-окна
+            if float(v) <= 0:
                 continue
-        else:
-            if not r or len(r) < 2:
+            if _black_digits_look_like_serial(b_norm, serial_norm):
                 continue
-            try:
-                v = float(f"{int(b)}.{r[:3]}")
-            except Exception:
+            if _looks_like_serial_reading(float(v), serial_norm):
                 continue
-        # защита от "нулей" и слишком маленьких чисел из ложного OCR-окна
-        if float(v) <= 0:
-            continue
-        if _black_digits_look_like_serial(b, serial_norm):
-            continue
-        if _looks_like_serial_reading(float(v), serial_norm):
-            continue
-        c = dict(c)
-        c["reading"] = float(v)
-        c["black_digits"] = b
-        c["red_digits"] = (r[:3] if r else None)
-        valid.append(c)
+            c_norm = dict(c)
+            c_norm["reading"] = float(v)
+            c_norm["black_digits"] = b_norm
+            c_norm["red_digits"] = (r[:3] if r else None)
+            # Tiny penalty for synthetic 0-insert candidates to avoid overriding real exact hits.
+            if b_norm != b:
+                c_norm["confidence"] = max(0.0, float(c_norm.get("confidence") or 0.0) - 0.05)
+                c_norm["notes"] = (
+                    f"{str(c_norm.get('notes') or '').strip()}; auto_insert_zero"
+                    .strip("; ")
+                    .strip()
+                )
+            valid.append(c_norm)
     if not valid:
         return None
 
     if prev_value is not None:
         pv = float(prev_value)
-        lower = pv * 0.6
-        upper = pv + 800.0
+        if max_delta is not None:
+            md = float(max_delta)
+            lower = pv - md
+            upper = pv + md
+        else:
+            lower = pv * 0.6
+            upper = pv + 800.0
         ranged = [c for c in valid if lower <= float(c.get("reading")) <= upper]
         # При наличии истории не возвращаем явно нереалистичные кандидаты.
         if not ranged:
@@ -709,18 +1409,75 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     meter_index = max(1, min(3, meter_index))
 
-    if file is None:
+    def _looks_like_upload(v) -> bool:
+        return (
+            hasattr(v, "filename")
+            and hasattr(v, "content_type")
+            and callable(getattr(v, "read", None))
+        )
+
+    upload_files: list[UploadFile] = []
+    seen_uploads: set[int] = set()
+    entries = []
+    try:
+        if hasattr(form, "multi_items"):
+            entries = list(form.multi_items())
+        else:
+            for k in form.keys():
+                vals = form.getlist(k) if hasattr(form, "getlist") else [form.get(k)]
+                for v in vals:
+                    entries.append((k, v))
+    except Exception:
+        entries = []
+    for _k, v in entries:
+        if not _looks_like_upload(v):
+            continue
+        vid = id(v)
+        if vid in seen_uploads:
+            continue
+        seen_uploads.add(vid)
+        upload_files.append(v)
+    if isinstance(file, UploadFile):
+        vid = id(file)
+        if vid not in seen_uploads:
+            upload_files.insert(0, file)
+
+    if not upload_files:
         return JSONResponse(status_code=200, content={"status": "accepted", "error": "no_file", "chat_id": str(chat_id)})
 
-    blob = await file.read()
+    photo_payloads: list[dict] = []
+    max_files = max(1, int(PHOTO_EVENT_MAX_FILES))
+    for upl in upload_files[:max_files]:
+        try:
+            b = await upl.read()
+        except Exception:
+            continue
+        if not b:
+            continue
+        photo_payloads.append(
+            {
+                "blob": b,
+                "filename": (upl.filename or "photo.jpg"),
+                "mime": (upl.content_type or "image/jpeg"),
+            }
+        )
+
+    if not photo_payloads:
+        return JSONResponse(status_code=200, content={"status": "accepted", "error": "no_file", "chat_id": str(chat_id)})
+
+    selected_idx = 0
+    blob = bytes(photo_payloads[selected_idx]["blob"])
+    selected_filename = str(photo_payloads[selected_idx].get("filename") or "photo.jpg")
+    selected_mime = str(photo_payloads[selected_idx].get("mime") or "image/jpeg")
     file_sha256 = hashlib.sha256(blob).hexdigest()
     logger.info(
-        "photo_event start trace_id=%s chat_id=%s ym=%s file=%s mime=%s size_bytes=%s",
+        "photo_event start trace_id=%s chat_id=%s ym=%s files_count=%s selected_file=%s mime=%s size_bytes=%s",
         trace_id,
         str(chat_id),
         str(ym),
-        file.filename,
-        file.content_type,
+        len(photo_payloads),
+        selected_filename,
+        selected_mime,
         len(blob),
     )
 
@@ -731,29 +1488,206 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             diag["errors"].append({"db_ensure_tables_error": str(e)})
 
     # 1) OCR
+    # Resolve apartment early for OCR context hints (history-aware candidate selection).
+    apartment_id = None
+    if db_ready():
+        try:
+            apartment_id = find_apartment_by_chat(str(chat_id))
+        except Exception as e:
+            diag["errors"].append({"chat_binding_lookup_error": str(e)})
+
+    context_prev_water: str | None = None
+    context_serial_hint: str | None = None
+    prev_vals: list[float] = []
+    serial_hints: list[str] = []
+    if db_ready() and apartment_id:
+        try:
+            prev_ym = _prev_ym(str(ym))
+            use_training_cluster = False
+            with engine.begin() as conn:
+                apt_row = conn.execute(
+                    text("SELECT cold_serial, hot_serial FROM apartments WHERE id=:aid LIMIT 1"),
+                    {"aid": int(apartment_id)},
+                ).mappings().first()
+                if apt_row:
+                    for raw_serial in (apt_row.get("cold_serial"), apt_row.get("hot_serial")):
+                        s_norm = _normalize_serial(raw_serial)
+                        if not s_norm:
+                            continue
+                        sd = "".join(ch for ch in str(s_norm) if ch.isdigit())
+                        if len(sd) < 4 or sd in serial_hints:
+                            continue
+                        serial_hints.append(sd)
+                # Prefer human-corrected history for OCR context (more reliable than stale meter_readings).
+                training_vals = _get_recent_training_water_values(conn, int(apartment_id), str(ym), limit=40)
+                if training_vals:
+                    clustered = _select_water_context_values(
+                        training_vals,
+                        max_values=3,
+                        support_tol=180.0,
+                        cluster_only_if_any=True,
+                    )
+                    if clustered:
+                        prev_vals.extend(clustered)
+                        use_training_cluster = True
+                if not use_training_cluster:
+                    for mt in ("cold", "hot"):
+                        pv = _get_prev_reading(conn, int(apartment_id), prev_ym, mt, 1)
+                        if pv is None:
+                            pv = _get_last_reading_before(conn, int(apartment_id), str(ym), mt, 1)
+                        if pv is None:
+                            continue
+                        try:
+                            prev_vals.append(float(pv))
+                        except Exception:
+                            continue
+            if prev_vals:
+                prev_vals = _select_water_context_values(
+                    prev_vals,
+                    max_values=3,
+                    support_tol=220.0,
+                    cluster_only_if_any=True,
+                )
+            if prev_vals:
+                context_prev_water = ",".join(f"{v:.3f}" for v in prev_vals[:3])
+            if serial_hints:
+                context_serial_hint = ",".join(serial_hints[:3])
+        except Exception as e:
+            diag["warnings"].append({"ocr_context_prepare_failed": str(e)})
+
     ocr_data = None
     ocr_t0 = time.monotonic()
-    ocr_resp, ocr_exc = _call_ocr_with_retries(
-        blob,
-        filename=file.filename,
-        mime_type=file.content_type,
-        trace_id=trace_id,
-    )
+    ocr_http_ok = False
+    ocr_http_status = None
+    if len(photo_payloads) > 1:
+        series_photos = [
+            (bytes(p["blob"]), str(p.get("filename") or "photo.jpg"), str(p.get("mime") or "image/jpeg"))
+            for p in photo_payloads
+        ]
+        ocr_resp, ocr_exc = _call_ocr_series_with_retries(
+            series_photos,
+            trace_id=trace_id,
+            context_prev_water=context_prev_water,
+            context_serial_hint=context_serial_hint,
+        )
+    else:
+        ocr_resp, ocr_exc = _call_ocr_with_retries(
+            blob,
+            filename=selected_filename,
+            mime_type=selected_mime,
+            trace_id=trace_id,
+            context_prev_water=context_prev_water,
+            context_serial_hint=context_serial_hint,
+        )
     diag["ocr_latency_ms"] = int((time.monotonic() - ocr_t0) * 1000)
     if ocr_resp is not None:
+        ocr_http_ok = bool(ocr_resp.ok)
+        ocr_http_status = int(ocr_resp.status_code)
         if ocr_resp.ok:
-            ocr_data = ocr_resp.json()
+            ocr_json = ocr_resp.json()
+            if len(photo_payloads) > 1 and isinstance(ocr_json, dict):
+                hint_values = serial_hints or _parse_serial_hints_context(context_serial_hint)
+                series_local = _rebuild_series_best_from_payload(
+                    ocr_json,
+                    prev_values=prev_vals,
+                    serial_hints=hint_values,
+                )
+                if isinstance(series_local, dict) and isinstance(series_local.get("best"), dict):
+                    best = dict(series_local.get("best") or {})
+                    ocr_data = best
+                    if ocr_json.get("trace_id") and (not ocr_data.get("trace_id")):
+                        ocr_data["trace_id"] = ocr_json.get("trace_id")
+                    try:
+                        best_idx = int(series_local.get("best_index"))
+                    except Exception:
+                        best_idx = int(ocr_json.get("best_index") or 0)
+                    if 0 <= best_idx < len(photo_payloads):
+                        selected_idx = best_idx
+                        blob = bytes(photo_payloads[selected_idx]["blob"])
+                        selected_filename = str(photo_payloads[selected_idx].get("filename") or selected_filename)
+                        selected_mime = str(photo_payloads[selected_idx].get("mime") or selected_mime)
+                        file_sha256 = hashlib.sha256(blob).hexdigest()
+                    diag["ocr_series"] = {
+                        "files_count": int(series_local.get("files_count") or len(photo_payloads)),
+                        "best_index": selected_idx,
+                        "best_score": series_local.get("best_score"),
+                        "mode": "service_local_rescore",
+                    }
+                    for w in (series_local.get("warnings") or []):
+                        diag["warnings"].append(w)
+                else:
+                    best = ocr_json.get("best")
+                    if isinstance(best, dict):
+                        ocr_data = dict(best)
+                        if ocr_json.get("trace_id") and (not ocr_data.get("trace_id")):
+                            ocr_data["trace_id"] = ocr_json.get("trace_id")
+                        try:
+                            best_idx = int(ocr_json.get("best_index"))
+                        except Exception:
+                            best_idx = 0
+                        if 0 <= best_idx < len(photo_payloads):
+                            selected_idx = best_idx
+                            blob = bytes(photo_payloads[selected_idx]["blob"])
+                            selected_filename = str(photo_payloads[selected_idx].get("filename") or selected_filename)
+                            selected_mime = str(photo_payloads[selected_idx].get("mime") or selected_mime)
+                            file_sha256 = hashlib.sha256(blob).hexdigest()
+                        diag["ocr_series"] = {
+                            "files_count": int(ocr_json.get("files_count") or len(photo_payloads)),
+                            "best_index": selected_idx,
+                            "best_score": ocr_json.get("best_score"),
+                        }
+                    else:
+                        ocr_data = None
+                        diag["warnings"].append("ocr_series_bad_response")
+            else:
+                ocr_data = ocr_json
         else:
             diag["warnings"].append(f"ocr_http_{ocr_resp.status_code}")
     else:
         diag["warnings"].append("ocr_unavailable")
         if ocr_exc is not None:
             diag["warnings"].append({"ocr_error": str(ocr_exc)})
+    # Safety fallback for multi-photo batch:
+    # when /recognize-series fails or times out, run single-image OCR per file and pick best locally.
+    if len(photo_payloads) > 1 and (not isinstance(ocr_data, dict)):
+        try:
+            series_fallback = _call_ocr_series_via_singles(
+                series_photos,
+                trace_id=trace_id,
+                context_prev_water=context_prev_water,
+                context_serial_hint=context_serial_hint,
+            )
+            best = series_fallback.get("best")
+            if isinstance(best, dict):
+                ocr_data = dict(best)
+                try:
+                    best_idx = int(series_fallback.get("best_index"))
+                except Exception:
+                    best_idx = 0
+                if 0 <= best_idx < len(photo_payloads):
+                    selected_idx = best_idx
+                    blob = bytes(photo_payloads[selected_idx]["blob"])
+                    selected_filename = str(photo_payloads[selected_idx].get("filename") or selected_filename)
+                    selected_mime = str(photo_payloads[selected_idx].get("mime") or selected_mime)
+                    file_sha256 = hashlib.sha256(blob).hexdigest()
+                diag["ocr_series"] = {
+                    "files_count": int(series_fallback.get("files_count") or len(photo_payloads)),
+                    "best_index": selected_idx,
+                    "best_score": series_fallback.get("best_score"),
+                    "mode": "single_fallback",
+                }
+                ocr_http_ok = True
+                ocr_http_status = 200
+                diag["warnings"].append("ocr_series_single_fallback")
+                for w in (series_fallback.get("warnings") or []):
+                    diag["warnings"].append(w)
+        except Exception as e:
+            diag["warnings"].append({"ocr_series_single_fallback_error": str(e)})
     logger.info(
         "photo_event ocr_result trace_id=%s ok=%s status=%s latency_ms=%s",
         trace_id,
-        bool(ocr_resp is not None and ocr_resp.ok),
-        (ocr_resp.status_code if ocr_resp is not None else None),
+        ocr_http_ok,
+        ocr_http_status,
         diag.get("ocr_latency_ms"),
     )
 
@@ -824,12 +1758,6 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             ocr_data["reading"] = value_float
 
     # 2) resolve apartment
-    apartment_id = None
-    if db_ready():
-        try:
-            apartment_id = find_apartment_by_chat(str(chat_id))
-        except Exception as e:
-            diag["errors"].append({"chat_binding_lookup_error": str(e)})
 
     if apartment_id is None and db_ready():
         try:
@@ -1079,7 +2007,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 str(chat_id),
                 chat_name=telegram_username or f"chat_{chat_id}",
                 meter_type_label=str(ocr_type or "unknown"),
-                original_filename=file.filename,
+                original_filename=selected_filename,
                 content=blob,
             )
         except Exception as e:
@@ -1135,7 +2063,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         "chat_id": str(chat_id),
                         "username": telegram_username,
                         "phone": phone,
-                        "orig": file.filename,
+                        "orig": selected_filename,
                         "path": ydisk_path,
                         "status": status,
                         "apartment_id": apartment_id,
@@ -1552,6 +2480,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     water_uncertain = False
                     water_prev_hard_block = False
                     water_prev_hard_block_reason = None
+                    serial_prev_ref = None
+                    serial_prev_kind = None
                     if is_water:
                         prev_map = {}
                         try:
@@ -1747,6 +2677,71 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         except Exception:
                             force_kind = None
                             force_no_sort = False
+
+                        # Hard serial+history sanity:
+                        # if serial maps to a specific water meter, keep value near that meter's previous reading.
+                        try:
+                            if force_kind in ("cold", "hot") and value_float is not None:
+                                serial_prev_kind = str(force_kind)
+                                serial_prev_ref = _get_prev_reading(
+                                    conn,
+                                    int(apartment_id),
+                                    _prev_ym(str(ym)),
+                                    serial_prev_kind,
+                                    1,
+                                )
+                                if serial_prev_ref is None:
+                                    serial_prev_ref = _get_last_reading_before(
+                                        conn,
+                                        int(apartment_id),
+                                        str(ym),
+                                        serial_prev_kind,
+                                        1,
+                                    )
+                                if serial_prev_ref is not None:
+                                    serial_prev_ref = float(serial_prev_ref)
+                                    cur_delta = abs(float(value_float) - float(serial_prev_ref))
+                                    if cur_delta > float(WATER_SERIAL_HARD_DELTA):
+                                        best_serial = _choose_water_debug_candidate_with_prev(
+                                            debug_candidates,
+                                            prev_value=float(serial_prev_ref),
+                                            serial_norm=serial_norm,
+                                            max_delta=float(WATER_SERIAL_HARD_DELTA),
+                                        )
+                                        if best_serial and best_serial.get("reading") is not None:
+                                            old_v = float(value_float)
+                                            value_float = float(best_serial.get("reading"))
+                                            kind = _ocr_to_kind(best_serial.get("type")) or kind
+                                            if isinstance(ocr_data, dict):
+                                                ocr_data["reading"] = float(value_float)
+                                                ocr_data["type"] = best_serial.get("type")
+                                            diag["warnings"].append(
+                                                {
+                                                    "water_serial_prev_corrected": {
+                                                        "meter_type": serial_prev_kind,
+                                                        "prev_ref": float(serial_prev_ref),
+                                                        "from": old_v,
+                                                        "to": float(value_float),
+                                                        "variant": best_serial.get("variant"),
+                                                        "provider": best_serial.get("provider"),
+                                                    }
+                                                }
+                                            )
+                                        else:
+                                            water_prev_hard_block = True
+                                            water_prev_hard_block_reason = {
+                                                "value": float(value_float),
+                                                "prev_ref": float(serial_prev_ref),
+                                                "meter_type": serial_prev_kind,
+                                                "reason": "serial_prev_outlier",
+                                                "threshold": float(WATER_SERIAL_HARD_DELTA),
+                                                "ydisk_path": ydisk_path,
+                                            }
+                                            diag["warnings"].append(
+                                                {"water_prev_hard_block": dict(water_prev_hard_block_reason)}
+                                            )
+                        except Exception:
+                            pass
 
                         # если OCR не уверен в типе, сортируем как max->ХВС, min->ГВС
                         water_uncertain = is_water_unknown or (kind in ("cold", "hot") and ocr_conf < WATER_TYPE_CONF_MIN)

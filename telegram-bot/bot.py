@@ -113,6 +113,15 @@ CURRENT_CHAT_ID: ContextVar[Optional[int]] = ContextVar("current_chat_id", defau
 SENT_BILL: set[Tuple[int, str]] = set()          # (chat_id, ym)
 PENDING_NOTICE: set[Tuple[int, str]] = set()     # (chat_id, ym)
 REMIND_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
+MEDIA_GROUP_BUFFER: Dict[Tuple[int, str], List[Tuple[bytes, str, str]]] = {}
+MEDIA_GROUP_ANCHOR: Dict[Tuple[int, str], types.Message] = {}
+MEDIA_GROUP_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
+MEDIA_GROUP_COLLECT_SEC = float(os.getenv("MEDIA_GROUP_COLLECT_SEC", "1.4"))
+SEQUENTIAL_PHOTO_BUFFER: Dict[int, List[Tuple[bytes, str, str]]] = {}
+SEQUENTIAL_PHOTO_ANCHOR: Dict[int, types.Message] = {}
+SEQUENTIAL_PHOTO_TASKS: Dict[int, asyncio.Task] = {}
+SEQUENTIAL_PHOTO_COLLECT_SEC = float(os.getenv("SEQUENTIAL_PHOTO_COLLECT_SEC", "2.2"))
+SEQUENTIAL_PHOTO_MAX_BATCH = max(1, int(os.getenv("SEQUENTIAL_PHOTO_MAX_BATCH", "4")))
 
 # Manual entry flow
 MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step, meter_type, meter_index}
@@ -359,13 +368,34 @@ async def _post_photo_event(
     phone: Optional[str],
     ym: str,
     meter_index: int,
-    file_bytes: bytes,
-    filename: str,
-    mime_type: str,
+    file_bytes: Optional[bytes] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    file_payloads: Optional[List[Tuple[bytes, str, str]]] = None,
 ) -> dict:
     url = f"{API_BASE}/events/photo"
     trace_id = f"tg-{uuid.uuid4().hex[:12]}"
-    files = {"file": (filename or "file.bin", file_bytes, mime_type or "application/octet-stream")}
+    files = None
+    if file_payloads:
+        if len(file_payloads) > 1:
+            files = [
+                (
+                    "files",
+                    (
+                        (fn or "file.bin"),
+                        fb,
+                        (mt or "application/octet-stream"),
+                    ),
+                )
+                for fb, fn, mt in file_payloads
+            ]
+        else:
+            fb, fn, mt = file_payloads[0]
+            files = {"file": ((fn or "file.bin"), fb, (mt or "application/octet-stream"))}
+    elif file_bytes is not None:
+        files = {"file": ((filename or "file.bin"), file_bytes, (mime_type or "application/octet-stream"))}
+    else:
+        files = {}
     data = {
         "trace_id": trace_id,
         "chat_id": str(chat_id),
@@ -876,9 +906,27 @@ async def on_text(message: types.Message):
     # Не отвечаем на прочий текст — он уже отправлен администратору
 
 
-async def _handle_file_message(message: types.Message, *, file_bytes: bytes, filename: str, mime_type: str):
+async def _handle_file_message(
+    message: types.Message,
+    *,
+    file_bytes: Optional[bytes] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    file_payloads: Optional[List[Tuple[bytes, str, str]]] = None,
+):
     username = message.from_user.username if message.from_user else None
     phone = CHAT_PHONES.get(message.chat.id)  # берём телефон, который пользователь отправил кнопкой
+
+    payloads: List[Tuple[bytes, str, str]] = []
+    if file_payloads:
+        payloads = [(bytes(b), str(fn or "file.bin"), str(mt or "application/octet-stream")) for b, fn, mt in file_payloads if b]
+    elif file_bytes is not None:
+        payloads = [(bytes(file_bytes), str(filename or "file.bin"), str(mime_type or "application/octet-stream"))]
+    if not payloads:
+        await message.reply("Не удалось прочитать файл(ы). Пришлите фото ещё раз.", reply_markup=_kb_main())
+        return
+
+    preview_bytes, preview_name, _preview_mime = payloads[0]
 
     ym = _current_ym()
 
@@ -898,9 +946,7 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
             phone=phone,
             ym=ym,
             meter_index=meter_index,
-            file_bytes=file_bytes,
-            filename=filename,
-            mime_type=mime_type,
+            file_payloads=payloads,
         )
     except requests.exceptions.ReadTimeout:
         await message.reply(
@@ -1006,7 +1052,7 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
         try:
             await bot.send_photo(
                 message.chat.id,
-                photo=types.InputFile(io.BytesIO(file_bytes), filename=filename or "duplicate.jpg"),
+                photo=types.InputFile(io.BytesIO(preview_bytes), filename=preview_name or "duplicate.jpg"),
                 caption=caption,
                 reply_markup=_kb_main(),
             )
@@ -1032,6 +1078,56 @@ async def _handle_file_message(message: types.Message, *, file_bytes: bytes, fil
                 _schedule_missing_reminder(message.chat.id, ym)
 
 
+async def _flush_media_group(key: Tuple[int, str]) -> None:
+    try:
+        await asyncio.sleep(max(0.4, float(MEDIA_GROUP_COLLECT_SEC)))
+        items = MEDIA_GROUP_BUFFER.pop(key, [])
+        anchor = MEDIA_GROUP_ANCHOR.pop(key, None)
+        if not items or anchor is None:
+            return
+        logging.info(
+            "TG media_group flush: chat_id=%s media_group_id=%s items=%s",
+            key[0],
+            key[1],
+            len(items),
+        )
+        await _handle_file_message(anchor, file_payloads=items)
+    except Exception:
+        logging.exception("media_group_flush failed")
+    finally:
+        MEDIA_GROUP_TASKS.pop(key, None)
+
+
+async def _flush_sequential_photos(chat_id: int) -> None:
+    try:
+        await asyncio.sleep(max(0.5, float(SEQUENTIAL_PHOTO_COLLECT_SEC)))
+        items = SEQUENTIAL_PHOTO_BUFFER.pop(chat_id, [])
+        anchor = SEQUENTIAL_PHOTO_ANCHOR.pop(chat_id, None)
+        if not items or anchor is None:
+            return
+        batch = items[:SEQUENTIAL_PHOTO_MAX_BATCH]
+        logging.info(
+            "TG sequential flush: chat_id=%s items=%s",
+            chat_id,
+            len(batch),
+        )
+        await _handle_file_message(anchor, file_payloads=batch)
+    except Exception:
+        logging.exception("sequential_photo_flush failed")
+    finally:
+        SEQUENTIAL_PHOTO_TASKS.pop(chat_id, None)
+
+
+def _queue_sequential_photo(message: types.Message, payload: bytes, filename: str, mime: str) -> None:
+    chat_id = int(message.chat.id)
+    SEQUENTIAL_PHOTO_BUFFER.setdefault(chat_id, []).append((payload, filename, mime))
+    if chat_id not in SEQUENTIAL_PHOTO_ANCHOR:
+        SEQUENTIAL_PHOTO_ANCHOR[chat_id] = message
+    task = SEQUENTIAL_PHOTO_TASKS.get(chat_id)
+    if task is None or task.done():
+        SEQUENTIAL_PHOTO_TASKS[chat_id] = asyncio.create_task(_flush_sequential_photos(chat_id))
+
+
 @dp.message_handler(content_types=ContentType.PHOTO)
 async def on_photo(message: types.Message):
     logging.info(
@@ -1051,11 +1147,27 @@ async def on_photo(message: types.Message):
         len(payload),
         photo.file_id,
     )
-    await _handle_file_message(
+    mgid = str(message.media_group_id or "").strip()
+    if mgid:
+        key = (int(message.chat.id), mgid)
+        MEDIA_GROUP_BUFFER.setdefault(key, []).append(
+            (
+                payload,
+                f"photo_{photo.file_unique_id}.jpg",
+                "image/jpeg",
+            )
+        )
+        if key not in MEDIA_GROUP_ANCHOR:
+            MEDIA_GROUP_ANCHOR[key] = message
+        task = MEDIA_GROUP_TASKS.get(key)
+        if task is None or task.done():
+            MEDIA_GROUP_TASKS[key] = asyncio.create_task(_flush_media_group(key))
+        return
+    _queue_sequential_photo(
         message,
-        file_bytes=payload,
-        filename=f"photo_{photo.file_unique_id}.jpg",
-        mime_type="image/jpeg",
+        payload,
+        f"photo_{photo.file_unique_id}.jpg",
+        "image/jpeg",
     )
 
 

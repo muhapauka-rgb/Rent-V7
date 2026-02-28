@@ -7,11 +7,16 @@ import time
 import uuid
 import logging
 from io import BytesIO
-from PIL import Image, ImageOps, ImageFilter, ImageEnhance
+from datetime import datetime
+from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageDraw
 from typing import Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
 import cv2
+from water_deterministic import (
+    make_fixed_cells_sheet_from_row,
+    make_water_deterministic_row_variants,
+)
 
 def _env_nonempty(name: str, default: str) -> str:
     v = os.getenv(name)
@@ -28,11 +33,73 @@ OCR_MODEL_FALLBACK = _env_nonempty("OCR_MODEL_FALLBACK", "gpt-4o-mini")
 OCR_MODEL_ODOMETER = _env_nonempty("OCR_MODEL_ODOMETER", "gpt-4o")
 OCR_FALLBACK_MIN_CONF = float(os.getenv("OCR_FALLBACK_MIN_CONF", "0.78"))
 OPENAI_TIMEOUT_SEC = float(os.getenv("OPENAI_TIMEOUT_SEC", "15"))
-OCR_MAX_RUNTIME_SEC = float(os.getenv("OCR_MAX_RUNTIME_SEC", "35"))
+try:
+    OPENAI_RETRIES = int(os.getenv("OPENAI_RETRIES", "1"))
+except Exception:
+    OPENAI_RETRIES = 1
+OPENAI_RETRIES = max(1, min(3, OPENAI_RETRIES))
+OCR_MAX_RUNTIME_SEC = float(os.getenv("OCR_MAX_RUNTIME_SEC", "55"))
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
 OCR_DEBUG = os.getenv("OCR_DEBUG", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
-OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_WATER_HYPOTHESIS_PASS = os.getenv("OCR_WATER_HYPOTHESIS_PASS", "1").strip().lower() in ("1", "true", "yes", "on")
+try:
+    OCR_WATER_HYPOTHESIS_MAX_CALLS = int(os.getenv("OCR_WATER_HYPOTHESIS_MAX_CALLS", "1"))
+except Exception:
+    OCR_WATER_HYPOTHESIS_MAX_CALLS = 1
+OCR_WATER_HYPOTHESIS_MAX_CALLS = max(1, min(5, OCR_WATER_HYPOTHESIS_MAX_CALLS))
+try:
+    OCR_WATER_HYPOTHESIS_MAX_PER_CALL = int(os.getenv("OCR_WATER_HYPOTHESIS_MAX_PER_CALL", "5"))
+except Exception:
+    OCR_WATER_HYPOTHESIS_MAX_PER_CALL = 5
+OCR_WATER_HYPOTHESIS_MAX_PER_CALL = max(2, min(8, OCR_WATER_HYPOTHESIS_MAX_PER_CALL))
+try:
+    OCR_WATER_DECIMALS = int(os.getenv("OCR_WATER_DECIMALS", "2"))
+except Exception:
+    OCR_WATER_DECIMALS = 2
+OCR_WATER_DECIMALS = max(1, min(3, OCR_WATER_DECIMALS))
+try:
+    OCR_SERIAL_TARGET_MAX_CALLS = int(os.getenv("OCR_SERIAL_TARGET_MAX_CALLS", "10"))
+except Exception:
+    OCR_SERIAL_TARGET_MAX_CALLS = 10
+OCR_SERIAL_TARGET_MAX_CALLS = max(1, min(12, OCR_SERIAL_TARGET_MAX_CALLS))
+try:
+    OCR_ODO_MAX_VARIANTS = int(os.getenv("OCR_ODO_MAX_VARIANTS", "6"))
+except Exception:
+    OCR_ODO_MAX_VARIANTS = 6
+OCR_ODO_MAX_VARIANTS = max(3, min(12, OCR_ODO_MAX_VARIANTS))
+try:
+    OCR_CELLS_ROW_SOURCES_MAX = int(os.getenv("OCR_CELLS_ROW_SOURCES_MAX", "5"))
+except Exception:
+    OCR_CELLS_ROW_SOURCES_MAX = 5
+OCR_CELLS_ROW_SOURCES_MAX = max(3, min(10, OCR_CELLS_ROW_SOURCES_MAX))
+try:
+    OCR_SERIES_MAX_FILES = int(os.getenv("OCR_SERIES_MAX_FILES", "6"))
+except Exception:
+    OCR_SERIES_MAX_FILES = 6
+OCR_SERIES_MAX_FILES = max(2, min(12, OCR_SERIES_MAX_FILES))
+OCR_SERIES_NEIGHBOR_RECOVERY = os.getenv("OCR_SERIES_NEIGHBOR_RECOVERY", "0").strip().lower() in ("1", "true", "yes", "on")
+try:
+    OCR_MAX_OPENAI_CALLS = int(os.getenv("OCR_MAX_OPENAI_CALLS", "14"))
+except Exception:
+    OCR_MAX_OPENAI_CALLS = 14
+OCR_MAX_OPENAI_CALLS = max(4, min(40, OCR_MAX_OPENAI_CALLS))
+try:
+    OCR_MAX_OPENAI_CALLS_QUICK = int(os.getenv("OCR_MAX_OPENAI_CALLS_QUICK", "10"))
+except Exception:
+    OCR_MAX_OPENAI_CALLS_QUICK = 10
+OCR_MAX_OPENAI_CALLS_QUICK = max(2, min(30, OCR_MAX_OPENAI_CALLS_QUICK))
+try:
+    OCR_RED_REFINE_REPEATS = int(os.getenv("OCR_RED_REFINE_REPEATS", "2"))
+except Exception:
+    OCR_RED_REFINE_REPEATS = 2
+OCR_RED_REFINE_REPEATS = max(1, min(3, OCR_RED_REFINE_REPEATS))
+try:
+    OCR_RED_REFINE_MAX_SOURCES = int(os.getenv("OCR_RED_REFINE_MAX_SOURCES", "6"))
+except Exception:
+    OCR_RED_REFINE_MAX_SOURCES = 6
+OCR_RED_REFINE_MAX_SOURCES = max(2, min(12, OCR_RED_REFINE_MAX_SOURCES))
 
 app = FastAPI()
 logger = logging.getLogger("ocr_service")
@@ -201,6 +268,78 @@ WATER_BLACK_DIGITS_PROMPT = """Ты видишь коллаж из 5 ячеек 
 - Никакого текста вокруг JSON.
 """
 
+WATER_CELLS_SHEET_PROMPT = """Ты видишь коллаж из ячеек барабана водяного счётчика.
+Верхняя строка: B1..B5 (целая часть).
+Нижняя строка: R1..R3 (дробная часть; может быть только R1..R2).
+Верни строго JSON:
+{
+  "cells": {
+    "B1": "<цифра|null>", "B2": "<цифра|null>", "B3": "<цифра|null>", "B4": "<цифра|null>", "B5": "<цифра|null>",
+    "R1": "<цифра|null>", "R2": "<цифра|null>", "R3": "<цифра|null>"
+  },
+  "black_digits": "<ровно 5 цифр или null>",
+  "red_digits": "<2-3 цифры или null>",
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Читай цифры ТОЛЬКО внутри подписанных ячеек, слева направо.
+- Цвет не важен: опирайся на ПОРЯДОК ячеек (B* и R*), а не на цвет барабана.
+- Ноль — это валидная цифра. Не пропускай ячейку только потому, что символ бледный.
+- В B1..B5 всегда 5 цифр; не "схлопывай" соседние окна в одну цифру.
+- Для каждой сомнительной ячейки ставь null в объекте cells.
+- black_digits/red_digits заполни из cells, если хватает уверенности.
+- Не используй серийный номер и любой текст вне ячеек.
+- Никакого текста вокруг JSON.
+"""
+
+WATER_HYPOTHESES_PROMPT = """Ты — OCR для СЛОЖНОГО фото водяного счётчика.
+Нужно вернуть несколько гипотез чтения одометра (от лучшей к худшей).
+Верни строго JSON:
+{
+  "type": "ХВС|ГВС|unknown",
+  "serial": "<строка|null>",
+  "confidence": <number>,
+  "hypotheses": [
+    {
+      "black_digits": "<строка цифр или null>",
+      "red_digits": "<2-3 цифры или null>",
+      "reading": <number|null>,
+      "serial": "<строка|null>",
+      "confidence": <number>,
+      "notes": "<коротко>"
+    }
+  ],
+  "notes": "<коротко>"
+}
+Правила:
+- Дай 3-5 РАЗНЫХ гипотез, не одну.
+- Читай только строку квадратных окон барабана, слева направо.
+- Серийный номер (например 13 002714) нельзя брать как reading.
+- Если red_digits не видно, верни только целую часть по black_digits.
+- Для сомнительных гипотез ставь confidence ниже.
+- Никакого текста вокруг JSON.
+"""
+
+WATER_SERIAL_TARGET_PROMPT = """Ты — OCR для водяных счётчиков на фото, где может быть несколько приборов.
+Нужно считать показание ТОЛЬКО у прибора с нужным серийным номером (хвост серийника будет передан в user_text).
+Верни строго JSON:
+{
+  "type": "ХВС|ГВС|unknown",
+  "black_digits": "<строка цифр или null>",
+  "red_digits": "<2-3 цифры или null>",
+  "reading": <number|null>,
+  "serial": "<строка|null>",
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Если на фото два счетчика, выбери только тот, чей serial оканчивается на целевой хвост.
+- Не используй серийный номер как показание.
+- Если целевой счетчик не найден или нечитабелен: reading=null и confidence<=0.35.
+- Никакого текста вокруг JSON.
+"""
+
 
 def _guess_mime(filename: Optional[str], content_type: Optional[str]) -> str:
     """
@@ -338,40 +477,76 @@ def _plausibility_filter(t: str, reading: Optional[float], conf: float) -> Tuple
     return reading, conf, ""
 
 
-def _call_openai_vision(image_bytes: bytes, mime: str, model: str, system_prompt: str = SYSTEM_PROMPT) -> dict:
+def _call_openai_vision(
+    image_bytes: bytes,
+    mime: str,
+    model: str,
+    system_prompt: str = SYSTEM_PROMPT,
+    user_text: str = "Определи тип счётчика и показание. Верни JSON строго по схеме.",
+    detail: str = "high",
+    timeout_sec: Optional[float] = None,
+) -> dict:
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:{mime};base64,{b64}"
 
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "Определи тип счётчика и показание. Верни JSON строго по схеме."},
-                    {"type": "image_url", "image_url": {"url": data_url, "detail": "high"}},
-                ],
-            },
-        ],
-        "max_tokens": 250,
-    }
+    last_err: Optional[str] = None
+    for attempt in range(OPENAI_RETRIES):
+        detail_now = detail if attempt == 0 else ("auto" if detail == "high" else detail)
+        payload = {
+            "model": model,
+            "temperature": 0,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": user_text},
+                        {"type": "image_url", "image_url": {"url": data_url, "detail": detail_now}},
+                    ],
+                },
+            ],
+            "max_tokens": 250,
+        }
+        try:
+            req_timeout = float(timeout_sec) if timeout_sec is not None else float(OPENAI_TIMEOUT_SEC)
+            req_timeout = max(1.0, min(float(OPENAI_TIMEOUT_SEC), req_timeout))
+            r = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=(2, req_timeout),
+            )
+        except requests.RequestException as e:
+            last_err = f"openai_request_error:{e}"
+            if attempt < 2:
+                time.sleep(0.25 * float(attempt + 1))
+                continue
+            raise HTTPException(status_code=500, detail=last_err)
 
-    r = requests.post(
-        "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
-        json=payload,
-        timeout=(5, OPENAI_TIMEOUT_SEC),
-    )
-    if not r.ok:
-        raise HTTPException(status_code=500, detail=f"openai_http_{r.status_code}: {r.text[:300]}")
+        if r.ok:
+            try:
+                content = r.json()["choices"][0]["message"]["content"]
+                return _extract_json_object(content)
+            except Exception as e:
+                last_err = f"openai_bad_json:{e}"
+                if attempt < 2:
+                    time.sleep(0.2 * float(attempt + 1))
+                    continue
+                raise HTTPException(status_code=500, detail=last_err)
 
-    content = r.json()["choices"][0]["message"]["content"]
-    return _extract_json_object(content)
+        status = int(r.status_code)
+        # transient provider errors: retry a couple of times
+        if status in (408, 409, 429) or status >= 500:
+            last_err = f"openai_http_{status}: {r.text[:300]}"
+            if attempt < 2:
+                time.sleep(0.35 * float(attempt + 1))
+                continue
+        raise HTTPException(status_code=500, detail=f"openai_http_{status}: {r.text[:300]}")
+
+    raise HTTPException(status_code=500, detail=last_err or "openai_unknown_error")
 
 
 def _classify_meter_type_from_text(s: str) -> str:
@@ -604,31 +779,50 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     except Exception:
         mid_band = None
 
-    # Choose up to 5 variants (quality > speed; still bounded)
+    # Helper: low-light enhancement for dark utility closet photos.
+    lowlight = None
+    try:
+        g = ImageOps.autocontrast(img.convert("L"), cutoff=1)
+        g_np = np.array(g)
+        clahe = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8))
+        g2 = clahe.apply(g_np)
+        rgb = Image.fromarray(cv2.cvtColor(g2, cv2.COLOR_GRAY2RGB))
+        rgb = ImageEnhance.Brightness(rgb).enhance(1.12)
+        rgb = ImageEnhance.Contrast(rgb).enhance(1.55)
+        rgb = rgb.filter(ImageFilter.UnsharpMask(radius=1, percent=180, threshold=2))
+        lowlight = _encode_jpeg(rgb, quality=92)
+    except Exception:
+        lowlight = None
+
+    # Choose up to 6 variants (quality > speed; still bounded)
     if img.height > img.width:
-        if orient and len(variants) < 5:
+        if orient and len(variants) < 6:
             variants.append((orient_label or "rotate90", orient))
-        if focused and len(variants) < 5:
+        if focused and len(variants) < 6:
             variants.append(("focused_crop", focused))
-        if center and len(variants) < 5:
+        if center and len(variants) < 6:
             variants.append(("center_crop_strong", center))
-        if mid_band and len(variants) < 5:
+        if mid_band and len(variants) < 6:
             variants.append(("middle_band", mid_band))
-        if contrast and len(variants) < 5:
+        if lowlight and len(variants) < 6:
+            variants.append(("lowlight_enhanced", lowlight))
+        if contrast and len(variants) < 6:
             variants.append(("contrast", contrast))
     else:
-        if focused and len(variants) < 5:
+        if focused and len(variants) < 6:
             variants.append(("focused_crop", focused))
-        if mid_band and len(variants) < 5:
+        if mid_band and len(variants) < 6:
             variants.append(("middle_band", mid_band))
-        if center and len(variants) < 5:
+        if center and len(variants) < 6:
             variants.append(("center_crop_strong", center))
-        if orient and len(variants) < 5:
+        if lowlight and len(variants) < 6:
+            variants.append(("lowlight_enhanced", lowlight))
+        if orient and len(variants) < 6:
             variants.append((orient_label or "center_crop", orient))
-        if contrast and len(variants) < 5:
+        if contrast and len(variants) < 6:
             variants.append(("contrast", contrast))
 
-    return variants[:5]
+    return variants[:6]
 
 
 def _clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -1083,6 +1277,200 @@ def _make_water_black_cells_sheet_from_row(row_bytes: bytes) -> Optional[bytes]:
         return None
 
 
+def _choose_best_odometer_cell_run(rects: list[tuple[int, int, int, int]]) -> list[tuple[int, int, int, int]]:
+    if not rects:
+        return []
+    src = sorted(rects, key=lambda r: r[0])
+    if len(src) <= 8:
+        return src
+
+    widths = [max(1, r[2]) for r in src]
+    med_w = float(np.median(widths))
+    dedup: list[tuple[int, int, int, int]] = []
+    for r in src:
+        xc = r[0] + r[2] / 2.0
+        if dedup:
+            prev = dedup[-1]
+            prev_xc = prev[0] + prev[2] / 2.0
+            if abs(xc - prev_xc) < max(4.0, med_w * 0.34):
+                if (r[2] * r[3]) > (prev[2] * prev[3]):
+                    dedup[-1] = r
+                continue
+        dedup.append(r)
+    src = dedup
+    if len(src) <= 8:
+        return src
+
+    def _score_run(run: list[tuple[int, int, int, int]]) -> float:
+        if len(run) < 7:
+            return -1e9
+        centers = [r[0] + r[2] / 2.0 for r in run]
+        gaps = [centers[i] - centers[i - 1] for i in range(1, len(centers))]
+        widths_run = [r[2] for r in run]
+        heights_run = [r[3] for r in run]
+        mg = float(np.median(gaps)) if gaps else 1.0
+        mw = float(np.median(widths_run)) if widths_run else 1.0
+        mh = float(np.median(heights_run)) if heights_run else 1.0
+        if mg <= 1.0 or mw <= 1.0 or mh <= 1.0:
+            return -1e9
+        gap_spread = float(np.std(np.array(gaps) / mg)) if gaps else 0.0
+        width_spread = float(np.std(np.array(widths_run) / mw))
+        if gap_spread > 0.55:
+            return -1e9
+        if width_spread > 0.60:
+            return -1e9
+        return (len(run) * 3.0) - (gap_spread * 5.0) - (width_spread * 4.0) + (mh / 40.0)
+
+    best_score = -1e9
+    best_run: list[tuple[int, int, int, int]] = src[:8]
+    for run_len in (8, 7):
+        if len(src) < run_len:
+            continue
+        for i in range(0, len(src) - run_len + 1):
+            run = src[i : i + run_len]
+            sc = _score_run(run)
+            if sc > best_score:
+                best_score = sc
+                best_run = run
+    return best_run
+
+
+def _make_water_digit_cells_sheet_from_row(row_bytes: bytes) -> Optional[tuple[bytes, int]]:
+    """
+    Делит строку барабана на отдельные окна цифр и собирает коллаж:
+    верх: B1..B5 (целая часть), низ: R1..R2/3 (дробная часть).
+    Возвращает (sheet_bytes, red_len).
+    """
+    try:
+        arr = np.frombuffer(row_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if im is None:
+            return None
+        h, w = im.shape[:2]
+        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        bw = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 7
+        )
+        bw = cv2.morphologyEx(
+            bw,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
+            iterations=1,
+        )
+        contours, _ = cv2.findContours(bw, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        rects: list[tuple[int, int, int, int]] = []
+        for c in contours:
+            x, y, ww, hh = cv2.boundingRect(c)
+            if ww < max(8, int(w * 0.014)) or ww > int(w * 0.25):
+                continue
+            if hh < max(12, int(h * 0.20)) or hh > int(h * 0.95):
+                continue
+            ar = float(ww) / float(max(1, hh))
+            if ar < 0.12 or ar > 1.30:
+                continue
+            rects.append((x, y, ww, hh))
+
+        def _fixed_cells_fallback() -> list[tuple[int, int, int, int]]:
+            # Fallback for dark/noisy shots: split central row into 8 equal windows.
+            # This keeps B1..B5/R1..R3 structure even when contour detection is unstable.
+            x1 = int(w * 0.08)
+            x2 = int(w * 0.94)
+            y1 = int(h * 0.12)
+            y2 = int(h * 0.90)
+            span = max(8, x2 - x1)
+            cell_w = max(12, int(span / 8))
+            out_cells: list[tuple[int, int, int, int]] = []
+            for i in range(8):
+                cx1 = x1 + i * cell_w
+                cx2 = x1 + (i + 1) * cell_w
+                if i == 7:
+                    cx2 = x2
+                cx1 = max(0, min(w - 1, cx1))
+                cx2 = max(cx1 + 1, min(w, cx2))
+                out_cells.append((cx1, y1, cx2 - cx1, max(1, y2 - y1)))
+            return out_cells
+
+        if len(rects) >= 7:
+            rects.sort(key=lambda r: r[1] + r[3] / 2.0)
+            bands: list[list[tuple[int, int, int, int]]] = []
+            y_tol = max(8, int(h * 0.12))
+            for r in rects:
+                yc = r[1] + r[3] / 2.0
+                placed = False
+                for band in bands:
+                    yb = np.median([x[1] + x[3] / 2.0 for x in band])
+                    if abs(yc - yb) <= y_tol:
+                        band.append(r)
+                        placed = True
+                        break
+                if not placed:
+                    bands.append([r])
+            band = max(
+                bands,
+                key=lambda b: (len(b), max(x[0] + x[2] for x in b) - min(x[0] for x in b)),
+            )
+            run = _choose_best_odometer_cell_run(band)
+            if len(run) < 7:
+                run = _fixed_cells_fallback()
+        else:
+            run = _fixed_cells_fallback()
+
+        # Стандарт для воды: 5 целых + 2/3 дробных справа.
+        red_len = 3 if len(run) >= 8 else 2
+        black_len = 5
+        if len(run) < (black_len + red_len):
+            return None
+        cells = run[: black_len + red_len]
+
+        tiles: list[Image.Image] = []
+        for (x, y, ww, hh) in cells:
+            x1, y1, x2, y2 = _clamp_box(
+                x - int(ww * 0.20),
+                y - int(hh * 0.18),
+                x + ww + int(ww * 0.20),
+                y + hh + int(hh * 0.18),
+                w,
+                h,
+            )
+            cimg = im[y1:y2, x1:x2]
+            if cimg.size == 0:
+                return None
+            p = Image.fromarray(cv2.cvtColor(cimg, cv2.COLOR_BGR2RGB))
+            p = p.resize((180, 220), Image.Resampling.LANCZOS)
+            p = ImageEnhance.Contrast(p).enhance(2.1)
+            p = ImageEnhance.Sharpness(p).enhance(1.8)
+            p = p.filter(ImageFilter.UnsharpMask(radius=1, percent=300, threshold=2))
+            tiles.append(p)
+        if len(tiles) != (black_len + red_len):
+            return None
+
+        tile_w = 180
+        tile_h = 220
+        gap = 16
+        margin = 18
+        width = margin * 2 + max(black_len, red_len) * tile_w + max(0, max(black_len, red_len) - 1) * gap
+        height = margin * 2 + tile_h * 2 + 54
+        sheet = Image.new("RGB", (width, height), (245, 245, 245))
+        draw = ImageDraw.Draw(sheet)
+
+        for i in range(black_len):
+            x = margin + i * (tile_w + gap)
+            y = margin + 24
+            sheet.paste(tiles[i], (x, y))
+            draw.text((x + 6, y - 20), f"B{i+1}", fill=(20, 20, 20))
+
+        for i in range(red_len):
+            x = margin + i * (tile_w + gap)
+            y = margin + tile_h + 36
+            sheet.paste(tiles[black_len + i], (x, y))
+            draw.text((x + 6, y - 20), f"R{i+1}", fill=(130, 25, 25))
+
+        return _encode_jpeg(sheet, quality=95), red_len
+    except Exception:
+        return None
+
+
 def _make_black_focus_variants_from_row(row_bytes: bytes) -> list[tuple[str, bytes]]:
     out: list[tuple[str, bytes]] = []
     try:
@@ -1111,6 +1499,50 @@ def _make_black_focus_variants_from_row(row_bytes: bytes) -> list[tuple[str, byt
     return out[:3]
 
 
+def _make_red_focus_variants_from_crop(crop_bytes: bytes, *, prefix: str = "row_red") -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    try:
+        arr = np.frombuffer(crop_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if im is None:
+            return out
+        h, w = im.shape[:2]
+        if h < 16 or w < 16:
+            return out
+        boxes = (
+            (0.58, 0.14, 0.99, 0.95),
+            (0.62, 0.18, 0.99, 0.92),
+            (0.54, 0.10, 0.93, 0.96),
+        )
+        for idx, (rx1, ry1, rx2, ry2) in enumerate(boxes, start=1):
+            x1 = int(round(w * rx1))
+            y1 = int(round(h * ry1))
+            x2 = int(round(w * rx2))
+            y2 = int(round(h * ry2))
+            x1, y1, x2, y2 = _clamp_box(x1, y1, x2, y2, w, h)
+            c = im[y1:y2, x1:x2]
+            if c.size == 0:
+                continue
+            p = Image.fromarray(cv2.cvtColor(c, cv2.COLOR_BGR2RGB))
+            p = p.resize((max(1, p.width * 4), max(1, p.height * 4)), Image.Resampling.LANCZOS)
+            p1 = ImageEnhance.Contrast(p).enhance(2.15)
+            p1 = ImageEnhance.Sharpness(p1).enhance(1.6)
+            p1 = p1.filter(ImageFilter.UnsharpMask(radius=1, percent=280, threshold=2))
+            out.append((f"{prefix}_{idx}_base", _encode_jpeg(p1, quality=95)))
+
+            g = cv2.cvtColor(np.array(p1), cv2.COLOR_RGB2GRAY)
+            g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+            out.append(
+                (
+                    f"{prefix}_{idx}_clahe",
+                    _encode_jpeg(Image.fromarray(cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)), quality=95),
+                )
+            )
+    except Exception:
+        return out
+    return out[:6]
+
+
 def _extract_red_digits_only(resp: dict) -> Optional[str]:
     d = _normalize_digits_string(resp.get("red_digits"))
     if d and len(d) >= 2:
@@ -1131,16 +1563,74 @@ def _extract_red_digits_only(resp: dict) -> Optional[str]:
     return None
 
 
+def _extract_digits_from_cell_sheet_resp(
+    resp: dict,
+    *,
+    black_len: int = 5,
+    red_len: int = 3,
+) -> tuple[Optional[str], Optional[str]]:
+    cells = resp.get("cells")
+    b: Optional[str] = None
+    r: Optional[str] = None
+
+    # Prefer explicit per-cell output when model provides it.
+    if isinstance(cells, dict):
+        b_parts = []
+        for i in range(1, black_len + 1):
+            d = _normalize_digits_string(cells.get(f"B{i}"))
+            if not d:
+                b_parts = []
+                break
+            b_parts.append(d[-1])
+        r_parts = []
+        for i in range(1, red_len + 1):
+            d = _normalize_digits_string(cells.get(f"R{i}"))
+            if not d:
+                r_parts = []
+                break
+            r_parts.append(d[-1])
+        b = "".join(b_parts) if len(b_parts) == black_len else None
+        r = "".join(r_parts) if len(r_parts) == red_len else None
+
+    if not b:
+        b_raw = _normalize_digits_string(resp.get("black_digits"))
+        if b_raw:
+            if len(b_raw) > black_len:
+                b = b_raw[:black_len]
+            elif len(b_raw) >= 3:
+                # Tolerate short black part from model and left-pad to 5.
+                b = b_raw.zfill(black_len)
+            else:
+                b = None
+    if r is None:
+        r_raw = _normalize_digits_string(resp.get("red_digits"))
+        if r_raw:
+            r = r_raw[:red_len]
+            if len(r) == 1:
+                r = None
+    if b and (r or OCR_WATER_INTEGER_ONLY):
+        return b, r
+    return b, r
+
+
 def _reading_from_digits(black: Optional[str], red: Optional[str]) -> Optional[float]:
     if not black:
         return None
     try:
-        # For water now we prioritize stable integer part.
-        # Decimal (red drums) can be noisy on dark/angled photos.
         if OCR_WATER_INTEGER_ONLY:
             return float(int(black))
         if red:
-            return float(f"{int(black)}.{red}")
+            rd = _normalize_digits_string(red) or ""
+            if not rd:
+                return float(int(black))
+            # One decimal digit is too unstable on drum OCR; treat as missing fraction.
+            if len(rd) < 2:
+                return float(int(black))
+            if len(rd) < OCR_WATER_DECIMALS:
+                rd = rd.ljust(OCR_WATER_DECIMALS, "0")
+            else:
+                rd = rd[:OCR_WATER_DECIMALS]
+            return float(f"{int(black)}.{rd}")
         return float(int(black))
     except Exception:
         return None
@@ -1154,6 +1644,42 @@ def _normalized_red_digits(v: Optional[str], *, min_len: int = 2, max_len: int =
     if len(d) < min_len:
         return None
     return d
+
+
+def _is_weak_red_digits(v: Optional[str]) -> bool:
+    d = _normalize_digits_string(v)
+    if not d:
+        return True
+    if len(d) < 2:
+        return True
+    if len(d) == 2 and d.startswith("0"):
+        return True
+    # Common artifact on shifted crops: "700", "500", ...
+    if len(d) >= 3 and d[1:] == "00":
+        return True
+    if set(d) == {"0"}:
+        return True
+    return False
+
+
+def _variant_image_bytes(variant_image_map: dict[str, bytes], variant_label: str) -> Optional[bytes]:
+    if not variant_label:
+        return None
+    vb = variant_image_map.get(variant_label)
+    if vb is not None:
+        return vb
+    # Derived variants like *_ctxtrimN_* should fall back to their base source crop.
+    if "_ctxtrim" in variant_label:
+        base = variant_label.split("_ctxtrim", 1)[0]
+        vb = variant_image_map.get(base)
+        if vb is not None:
+            return vb
+    if variant_label.startswith("cells_row_"):
+        base = variant_label[len("cells_row_") :]
+        vb = variant_image_map.get(base)
+        if vb is not None:
+            return vb
+    return None
 
 
 def _digits_overlap_serial(black_digits: Optional[str], serial: Optional[str]) -> bool:
@@ -1181,7 +1707,11 @@ def _is_strict_water_odometer_candidate(item: dict) -> bool:
     if not b or len(b) < 4:
         return False
     if (not OCR_WATER_INTEGER_ONLY) and (not r):
-        return False
+        # Allow high-confidence integer-only reads as strict candidates.
+        # Red wheels are often unreadable on dark photos; decimals can be recovered later.
+        conf = _clamp_confidence(item.get("confidence", 0.0))
+        if not (len(b) >= 5 and conf >= 0.62):
+            return False
     if _digits_overlap_serial(b, item.get("serial")):
         return False
     return True
@@ -1858,6 +2388,12 @@ def _candidate_score(item: dict, all_items: list[dict]) -> float:
         score += 0.08
     if provider.startswith("openai-odo"):
         score += 0.28
+    if provider.endswith(":layout"):
+        score -= 0.26
+    if variant.startswith("odo_pre_"):
+        # Bootstrap read is useful, but often unstable on dark shots.
+        # Avoid letting it dominate without corroboration from other variants.
+        score -= 0.12
     if variant in (
         "water_odometer_band",
         "water_odometer_band_1",
@@ -1880,12 +2416,16 @@ def _candidate_score(item: dict, all_items: list[dict]) -> float:
         score += 0.24
     if variant.startswith("counter_row_"):
         score += 0.42
+    if variant.startswith("cells_row_"):
+        score += 0.52
     if variant.startswith("roi_row_"):
         score += 0.52
     if variant.startswith("circle_row_"):
         score += 0.34
     if variant.startswith("odo_global_"):
         score += 0.20
+    if "_layout_" in variant:
+        score -= 0.08
     if variant == "water_dial":
         # круговой циферблат часто даёт ложные 0.0
         score -= 0.35
@@ -1904,7 +2444,13 @@ def _candidate_score(item: dict, all_items: list[dict]) -> float:
     if _is_suspicious_water_digits(item):
         # Typical failure for water: model sees only the right tail of odometer
         # and returns values like 000321.9 instead of full counter.
-        score -= 0.40
+        score -= 0.58
+    if bds.isdigit() and len(bds) == 5 and bds.startswith("0"):
+        try:
+            if int(bds) >= 3000:
+                score -= 0.24
+        except Exception:
+            pass
     if _is_strong_water_digits(item):
         score += 0.16
     if _digits_overlap_serial(item.get("black_digits"), item.get("serial")):
@@ -1933,6 +2479,7 @@ def _is_odometer_variant(label: str) -> bool:
         or s.startswith("odo_sheet_")
         or s.startswith("box_window_")
         or s.startswith("counter_row_")
+        or s.startswith("cells_row_")
         or s.startswith("roi_row_")
         or s.startswith("circle_row_")
         or s.startswith("circle_odo_")
@@ -1954,16 +2501,25 @@ def _is_suspicious_water_digits(item: dict) -> bool:
     r_len = len(r) if r else 0
     if len(b) >= 6 and b.startswith("000") and sig <= 3 and r_len < 3:
         return True
-    if len(b) >= 5 and b.startswith("00") and sig <= 3 and r_len < 3:
+    # Keep 00XYZ with 2-3 decimals as plausible: many real meters in this project
+    # have 3 significant integer digits around 8xx-9xx.
+    if len(b) >= 5 and b.startswith("00") and sig <= 2 and r_len < 3:
         return True
     if len(b) >= 5 and sig <= 2:
         return True
     if len(b) >= 6 and b.startswith("000") and sig <= 4:
         return True
+    # Typical dark-shot error: first significant digit shifts right, producing 0X... with too large integer.
+    if len(b) == 5 and b.startswith("0"):
+        try:
+            if int(b) >= 3000:
+                return True
+        except Exception:
+            pass
     # For water odometer, one fractional digit is usually a truncated read.
     if r and len(r) == 1 and sig >= 3:
         return True
-    if r and len(r) == 2 and sig <= 3 and b.startswith("00"):
+    if r and len(r) == 2 and sig <= 2 and b.startswith("00"):
         return True
     return False
 
@@ -1994,9 +2550,10 @@ def _is_ok_water_digits(item: dict) -> bool:
     sig = len(b.lstrip("0"))
     if sig < 3:
         return False
-    if len(b) < 4:
+    # 3+ significant integer digits are valid for many household meters.
+    if len(b) < 3:
         return False
-    if b.startswith("000") and sig <= 4:
+    if b.startswith("000") and sig <= 3:
         return False
     return True
 
@@ -2022,21 +2579,898 @@ def _water_digit_candidates(candidates: list[dict]) -> list[dict]:
     ]
 
 
+def _parse_context_prev_water(raw: Optional[str]) -> list[float]:
+    s = str(raw or "").strip()
+    if not s:
+        return []
+    vals: list[float] = []
+    for part in re.split(r"[,; ]+", s):
+        p = str(part or "").strip().replace(",", ".")
+        if not p:
+            continue
+        try:
+            v = float(p)
+        except Exception:
+            continue
+        if v > 0:
+            vals.append(v)
+    # Keep stable order while deduping close duplicates.
+    out: list[float] = []
+    for v in vals:
+        if any(abs(v - x) < 1e-6 for x in out):
+            continue
+        out.append(v)
+    return out
+
+
+def _parse_context_serial_hints(raw: Optional[str]) -> list[str]:
+    s = str(raw or "").strip()
+    if not s:
+        return []
+    out: list[str] = []
+    for chunk in re.split(r"[;,]+", s):
+        part = str(chunk or "").strip()
+        if not part:
+            continue
+        groups = re.findall(r"\d{4,}", part)
+        if len(groups) >= 2:
+            cands = groups
+        else:
+            cand = _normalize_digits_string(part)
+            cands = [cand] if cand else []
+        for p in cands:
+            if len(p) < 4 or p in out:
+                continue
+            out.append(p)
+    return out
+
+
+def _serial_tail_match_len(a: Optional[str], b: Optional[str]) -> int:
+    da = _normalize_digits_string(a)
+    db = _normalize_digits_string(b)
+    if not da or not db:
+        return 0
+    n = min(len(da), len(db))
+    m = 0
+    for i in range(1, n + 1):
+        if da[-i] != db[-i]:
+            break
+        m += 1
+    return m
+
+
+def _best_serial_tail_match(serial: Optional[str], serial_hints: list[str]) -> int:
+    if not serial_hints:
+        return 0
+    return max((_serial_tail_match_len(serial, h) for h in serial_hints), default=0)
+
+
+def _serial_hint_tails(serial_hints: list[str], max_tails: int = 3) -> list[str]:
+    out: list[str] = []
+    for s in serial_hints:
+        d = _normalize_digits_string(s)
+        if not d:
+            continue
+        tail = d[-5:] if len(d) >= 5 else d
+        if tail in out:
+            continue
+        out.append(tail)
+        if len(out) >= max_tails:
+            break
+    return out
+
+
+def _nearest_prev_distance(value: Optional[float], prev_values: list[float]) -> float:
+    if value is None or not prev_values:
+        return float("inf")
+    try:
+        v = float(value)
+    except Exception:
+        return float("inf")
+    return min(abs(v - float(p)) for p in prev_values)
+
+
+def _refine_fraction_from_prev(black_digits: Optional[str], prev_values: list[float]) -> Optional[float]:
+    b = _normalize_digits_string(black_digits)
+    if not b or not prev_values:
+        return None
+    try:
+        base_int = int(b)
+    except Exception:
+        return None
+
+    nearest_val: Optional[float] = None
+    nearest_dist = float("inf")
+    for p in prev_values:
+        try:
+            pv = float(p)
+        except Exception:
+            continue
+        d = abs(pv - float(base_int))
+        if d < nearest_dist:
+            nearest_dist = d
+            nearest_val = pv
+    if (nearest_val is None) or (nearest_dist > 1.0):
+        return None
+
+    scale = 10 ** OCR_WATER_DECIMALS
+    frac = abs(nearest_val - float(int(nearest_val)))
+    frac_int = int(round(frac * scale))
+    if frac_int >= scale:
+        frac_int = scale - 1
+    try:
+        return float(f"{base_int}.{frac_int:0{OCR_WATER_DECIMALS}d}")
+    except Exception:
+        return None
+
+
+def _snap_to_same_integer_context(
+    value: Optional[float],
+    prev_values: list[float],
+    *,
+    tolerance: float = 0.25,
+) -> Optional[float]:
+    v = _normalize_reading(value)
+    if (v is None) or (not prev_values):
+        return None
+    v_int = int(v)
+    nearest: Optional[float] = None
+    nearest_dist = float("inf")
+    for p in prev_values:
+        try:
+            pv = float(p)
+        except Exception:
+            continue
+        if int(pv) != v_int:
+            continue
+        d = abs(pv - v)
+        if d < nearest_dist:
+            nearest_dist = d
+            nearest = pv
+    if (nearest is None) or (nearest_dist > tolerance):
+        return None
+    return round(float(nearest), OCR_WATER_DECIMALS)
+
+
+def _series_support_count(value: float, values: list[float], *, tol: float = 0.08) -> int:
+    out = 0
+    for v in values:
+        try:
+            if abs(float(v) - float(value)) <= tol:
+                out += 1
+        except Exception:
+            continue
+    return out
+
+
+def _series_result_score(item: dict, all_items: list[dict], *, prev_values: list[float]) -> float:
+    reading = _normalize_reading(item.get("reading"))
+    if reading is None:
+        return -999.0
+    conf = _clamp_confidence(item.get("confidence", 0.0))
+    score = conf
+    notes = str(item.get("notes") or "")
+    item_type = str(item.get("type") or "unknown")
+    if item_type != "unknown":
+        score += 0.03
+    if "context_same_int_snap" in notes:
+        score += 0.06
+    if "context_frac_refine" in notes:
+        score += 0.04
+    if "water_context_far_singleton" in notes:
+        score -= 0.70
+    if "water_no_ok_odometer_winner" in notes:
+        score -= 0.50
+
+    peers = [
+        _normalize_reading(x.get("reading"))
+        for x in all_items
+        if x is not item
+    ]
+    peer_values = [float(v) for v in peers if v is not None]
+    support = _series_support_count(float(reading), peer_values, tol=0.08)
+    score += min(0.30, 0.12 * float(support))
+    if support >= 1:
+        score += 0.05
+
+    # Penalize strong mismatch with historical context.
+    if prev_values:
+        dist = _nearest_prev_distance(float(reading), prev_values)
+        if dist > 220.0:
+            score -= 0.50
+        else:
+            score -= min(0.20, dist / 1200.0)
+    return float(score)
+
+
+def _pick_best_series_result(results: list[dict], *, prev_values: list[float]) -> tuple[int, dict]:
+    if not results:
+        return -1, {"type": "unknown", "reading": None, "serial": None, "confidence": 0.0, "notes": "series_empty"}
+
+    best_idx = -1
+    best_score = -1e9
+    best_conf = -1e9
+    for idx, item in enumerate(results):
+        score = _series_result_score(item, results, prev_values=prev_values)
+        conf = float(item.get("confidence") or 0.0)
+        if (score > best_score) or (abs(score - best_score) < 1e-9 and conf > best_conf):
+            best_score = score
+            best_conf = conf
+            best_idx = idx
+
+    if best_idx < 0:
+        return 0, dict(results[0])
+    return best_idx, dict(results[best_idx])
+
+
+def _parse_photo_filename_dt(name: Optional[str]) -> Optional[datetime]:
+    s = str(name or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(\d{4}-\d{2}-\d{2})[ _](\d{2})[.:](\d{2})[.:](\d{2})", s)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(
+            f"{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except Exception:
+        return None
+
+
+def _recover_series_missing_with_neighbors(results: list[dict]) -> list[dict]:
+    if not results:
+        return results
+    out = [dict(r or {}) for r in results]
+    stamps = [_parse_photo_filename_dt(r.get("filename")) for r in out]
+
+    for idx, item in enumerate(out):
+        if _normalize_reading(item.get("reading")) is not None:
+            continue
+        item_serial = _normalize_digits_string(item.get("serial"))
+        item_ts = stamps[idx]
+        nearest_same_day_dt: Optional[float] = None
+        if item_ts is not None:
+            for j, donor in enumerate(out):
+                if j == idx:
+                    continue
+                if _normalize_reading(donor.get("reading")) is None:
+                    continue
+                donor_ts = stamps[j]
+                if donor_ts is None or donor_ts.date() != item_ts.date():
+                    continue
+                dt = abs((item_ts - donor_ts).total_seconds())
+                if nearest_same_day_dt is None or dt < nearest_same_day_dt:
+                    nearest_same_day_dt = dt
+
+        best_idx = -1
+        best_score = -1e9
+        best_reading: Optional[float] = None
+
+        for j, donor in enumerate(out):
+            if j == idx:
+                continue
+            donor_reading = _normalize_reading(donor.get("reading"))
+            if donor_reading is None:
+                continue
+            donor_conf = float(donor.get("confidence") or 0.0)
+            if donor_conf < 0.45:
+                continue
+            donor_serial = _normalize_digits_string(donor.get("serial"))
+            donor_ts = stamps[j]
+            dt = float("inf")
+
+            score = donor_conf
+
+            if item_ts and donor_ts:
+                if item_ts.date() != donor_ts.date():
+                    continue
+                dt = abs((item_ts - donor_ts).total_seconds())
+                # If we have a very near donor, ignore far same-day donors.
+                if nearest_same_day_dt is not None and nearest_same_day_dt <= 600 and dt > 900:
+                    continue
+                if nearest_same_day_dt is not None and nearest_same_day_dt <= 180 and dt > 300:
+                    continue
+                if dt <= 120:
+                    score += 0.60
+                elif dt <= 600:
+                    score += 0.35
+                elif dt <= 1800:
+                    score += 0.10
+                elif dt <= 3600:
+                    score += 0.02
+                else:
+                    score -= 0.35
+
+            serial_tail = _serial_tail_match_len(item_serial, donor_serial)
+            if serial_tail >= 4:
+                score += 0.35 + min(0.12, 0.02 * float(serial_tail))
+            elif item_serial and donor_serial:
+                if dt <= 120:
+                    score -= 0.05
+                elif dt <= 900:
+                    score -= 0.18
+                else:
+                    score -= 0.45
+
+            if item_ts and donor_ts and dt <= 120 and _normalize_digits_string(item.get("serial")) is None:
+                score += 0.08
+
+            if score > best_score:
+                best_score = score
+                best_idx = j
+                best_reading = donor_reading
+
+        if (best_idx >= 0) and (best_reading is not None) and (best_score >= 0.70):
+            donor = out[best_idx]
+            item["reading"] = float(best_reading)
+            if not item.get("type") or str(item.get("type")) == "unknown":
+                item["type"] = str(donor.get("type") or "unknown")
+            if not item.get("serial"):
+                item["serial"] = donor.get("serial")
+            donor_conf = float(donor.get("confidence") or 0.0)
+            item["confidence"] = _clamp_confidence(
+                min(0.78, max(float(item.get("confidence") or 0.0), donor_conf * 0.84))
+            )
+            base_notes = str(item.get("notes") or "").strip()
+            donor_file = str(donor.get("filename") or "")
+            tail = f"series_neighbor_recover:{donor_file}" if donor_file else "series_neighbor_recover"
+            item["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+    return out
+
+
+def _water_context_candidates(candidates: list[dict]) -> list[dict]:
+    out: list[dict] = []
+    for c in candidates:
+        t = str(c.get("type") or "unknown")
+        if t not in ("ХВС", "ГВС", "unknown"):
+            continue
+        if c.get("reading") is None:
+            continue
+        out.append(c)
+    return out
+
+
+def _pick_water_candidate_with_context(
+    candidates: list[dict],
+    *,
+    prev_values: list[float],
+    serial_hints: list[str],
+) -> Optional[dict]:
+    pool = _water_context_candidates(candidates)
+    if not pool or not prev_values:
+        return None
+
+    ranked: list[tuple[float, float, int, dict]] = []
+    for c in pool:
+        r = _normalize_reading(c.get("reading"))
+        if r is None:
+            continue
+        dist = _nearest_prev_distance(r, prev_values)
+        # Too far from any historical context -> likely wrong window/serial read.
+        if dist > 1300.0:
+            continue
+        conf = float(c.get("confidence") or 0.0)
+        serial_tail = _best_serial_tail_match(c.get("serial"), serial_hints) if serial_hints else 0
+        score = dist - (conf * 45.0)
+        if _is_suspicious_water_digits(c):
+            if dist <= 1.5:
+                score += 25.0
+            elif dist <= 8.0:
+                score += 90.0
+            else:
+                score += 260.0
+        if _looks_like_serial_candidate(r, c.get("serial")):
+            score += 220.0
+        if serial_hints:
+            if serial_tail >= 4:
+                score -= 120.0 + (18.0 * float(serial_tail))
+            else:
+                cand_serial_norm = _normalize_digits_string(c.get("serial"))
+                if cand_serial_norm:
+                    score += 130.0
+                else:
+                    score += 140.0
+            if any(_digits_overlap_serial(c.get("black_digits"), sh) for sh in serial_hints):
+                if (serial_tail >= 4) and (dist <= 2.0):
+                    score += 0.0
+                else:
+                    score += 220.0
+        if not _normalize_digits_string(c.get("black_digits")):
+            score += 70.0
+        ranked.append((score, dist, serial_tail, c))
+
+    if not ranked:
+        return None
+    if serial_hints:
+        matched = [x for x in ranked if x[2] >= 4]
+        if matched:
+            best_matched_dist = min(x[1] for x in matched)
+            if best_matched_dist <= 25.0:
+                ranked = [x for x in ranked if x[2] >= 4]
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][3]
+
+
+def _pick_water_candidate_by_serial(candidates: list[dict], *, serial_hints: list[str]) -> Optional[dict]:
+    pool = _water_context_candidates(candidates)
+    if not pool or not serial_hints:
+        return None
+
+    ranked: list[tuple[float, dict]] = []
+    for c in pool:
+        r = _normalize_reading(c.get("reading"))
+        if r is None:
+            continue
+        tail = _best_serial_tail_match(c.get("serial"), serial_hints)
+        if tail < 4:
+            continue
+        conf = float(c.get("confidence") or 0.0)
+        score = -(180.0 * float(tail)) - (35.0 * conf)
+        if _is_suspicious_water_digits(c):
+            score += 160.0
+        if _looks_like_serial_candidate(r, c.get("serial")):
+            score += 220.0
+        if any(_digits_overlap_serial(c.get("black_digits"), sh) for sh in serial_hints):
+            score += 220.0
+        if not _normalize_digits_string(c.get("black_digits")):
+            score += 60.0
+        ranked.append((score, c))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda x: x[0])
+    return ranked[0][1]
+
+
+def _water_hypothesis_candidates_from_response(
+    resp: dict,
+    *,
+    variant_prefix: str,
+    provider: str,
+) -> list[dict]:
+    if not isinstance(resp, dict):
+        return []
+    root_type = _sanitize_type(resp.get("type", "unknown"))
+    root_serial = resp.get("serial")
+    if isinstance(root_serial, str):
+        root_serial = root_serial.strip() or None
+    root_conf = _clamp_confidence(resp.get("confidence", 0.0))
+    raw_hyp = resp.get("hypotheses")
+    hyp_list = raw_hyp if isinstance(raw_hyp, list) else []
+    if not hyp_list:
+        hyp_list = [resp]
+
+    out: list[dict] = []
+    for idx, item in enumerate(hyp_list[:OCR_WATER_HYPOTHESIS_MAX_PER_CALL], start=1):
+        if not isinstance(item, dict):
+            continue
+        t = _sanitize_type(item.get("type", root_type))
+        serial = item.get("serial", root_serial)
+        if isinstance(serial, str):
+            serial = serial.strip() or None
+        conf = _clamp_confidence(item.get("confidence", root_conf))
+        black = _normalize_digits_string(item.get("black_digits"))
+        red = _normalized_red_digits(item.get("red_digits"), min_len=2, max_len=3)
+        reading = _reading_from_digits(black, red)
+        if reading is None:
+            reading = _normalize_reading(item.get("reading", None))
+        reading, conf, note2 = _plausibility_filter(t, reading, conf)
+        if reading is None:
+            continue
+        notes = str(item.get("notes", "") or item.get("reason", "") or resp.get("notes", "") or "")
+        out.append(
+            {
+                "type": t,
+                "reading": reading,
+                "serial": serial,
+                "confidence": conf,
+                "notes": notes,
+                "note2": note2,
+                "variant": f"{variant_prefix}_h{idx}",
+                "provider": provider,
+                "black_digits": black,
+                "red_digits": red,
+            }
+        )
+    return out
+
+
+def _pick_best_water_candidate_adaptive(
+    candidates: list[dict],
+    *,
+    prev_values: list[float],
+    serial_hints: list[str],
+) -> Optional[dict]:
+    if not candidates:
+        return None
+    if prev_values:
+        by_prev = _pick_water_candidate_with_context(
+            candidates,
+            prev_values=prev_values,
+            serial_hints=serial_hints,
+        )
+        if by_prev is not None:
+            return by_prev
+    if serial_hints:
+        by_serial = _pick_water_candidate_by_serial(candidates, serial_hints=serial_hints)
+        if by_serial is not None:
+            return by_serial
+    return max(candidates, key=lambda x: _candidate_score(x, candidates))
+
+
+def _pick_water_integer_consensus_candidate(
+    candidates: list[dict],
+    *,
+    prev_values: list[float],
+) -> Optional[dict]:
+    """
+    Pick a stable candidate by integer-part consensus across several variants.
+    Useful when one serial-target read is context-trimmed but multiple independent
+    odometer variants agree on another integer part (e.g., 00999.xxx).
+    """
+    if not candidates:
+        return None
+    votes: dict[int, float] = {}
+    counts: dict[int, int] = {}
+    best_by_int: dict[int, dict] = {}
+
+    for c in candidates:
+        r = _normalize_reading(c.get("reading"))
+        if r is None:
+            continue
+        t = str(c.get("type") or "unknown")
+        if t not in ("ХВС", "ГВС", "unknown"):
+            continue
+        if _is_suspicious_water_digits(c):
+            continue
+        dist = _nearest_prev_distance(r, prev_values) if prev_values else float("inf")
+        if prev_values and dist > 40.0:
+            continue
+        int_part = int(float(r))
+        conf = float(c.get("confidence") or 0.0)
+        w = conf + (0.20 if _is_ok_water_digits(c) else 0.0)
+        votes[int_part] = votes.get(int_part, 0.0) + max(0.10, w)
+        counts[int_part] = counts.get(int_part, 0) + 1
+        cur_best = best_by_int.get(int_part)
+        if (cur_best is None) or (float(cur_best.get("confidence") or 0.0) < conf):
+            best_by_int[int_part] = c
+
+    if not votes:
+        return None
+    ranked = sorted(
+        votes.items(),
+        key=lambda kv: (kv[1], counts.get(kv[0], 0)),
+        reverse=True,
+    )
+    best_int, _ = ranked[0]
+    if counts.get(best_int, 0) < 2:
+        return None
+    return best_by_int.get(best_int)
+
+
+def _reading_integer_part(value) -> Optional[int]:
+    v = _normalize_reading(value)
+    if v is None:
+        return None
+    try:
+        return int(float(v))
+    except Exception:
+        return None
+
+
+def _collect_red_votes_for_integer(
+    candidates: list[dict],
+    *,
+    target_int: Optional[int],
+) -> tuple[dict[str, float], dict[str, int], dict[str, float]]:
+    votes: dict[str, float] = {}
+    counts: dict[str, int] = {}
+    best_conf: dict[str, float] = {}
+    for c in candidates:
+        if target_int is not None:
+            ci = _reading_integer_part(c.get("reading"))
+            if ci is None or ci != target_int:
+                continue
+        red = _normalized_red_digits(c.get("red_digits"), min_len=2, max_len=3)
+        if not red or _is_weak_red_digits(red):
+            continue
+        conf = _clamp_confidence(c.get("confidence", 0.0))
+        if conf < 0.40:
+            continue
+        w = conf + (0.14 if len(red) >= 3 else 0.03)
+        votes[red] = votes.get(red, 0.0) + w
+        counts[red] = counts.get(red, 0) + 1
+        best_conf[red] = max(best_conf.get(red, 0.0), conf)
+    return votes, counts, best_conf
+
+
+def _pick_red_digits_by_vote(
+    votes: dict[str, float],
+    counts: dict[str, int],
+    best_conf: dict[str, float],
+) -> Optional[str]:
+    if not votes:
+        return None
+    ranked = sorted(
+        votes.items(),
+        key=lambda kv: (kv[1], counts.get(kv[0], 0), best_conf.get(kv[0], 0.0), len(kv[0])),
+        reverse=True,
+    )
+    red, score = ranked[0]
+    cnt = counts.get(red, 0)
+    conf = best_conf.get(red, 0.0)
+    if score < 0.78:
+        return None
+    if cnt >= 2:
+        return red
+    if len(red) >= 3 and conf >= 0.78 and score >= 0.80:
+        return red
+    if conf >= 0.93 and score >= 0.92:
+        return red
+    return None
+
+
+def _has_red_disagreement_for_integer(candidates: list[dict], target_int: Optional[int]) -> bool:
+    votes, counts, _ = _collect_red_votes_for_integer(candidates, target_int=target_int)
+    if not votes:
+        return False
+    strong = [
+        r for r, sc in votes.items()
+        if sc >= 0.70 and counts.get(r, 0) >= 1
+    ]
+    return len(strong) >= 2
+
+
+def _water_leading_trim_context_fixes(item: dict, *, prev_values: list[float]) -> list[dict]:
+    """
+    Build corrected candidates for common water OCR failure:
+    extra leading digit in black drums (e.g., 4871.52 instead of 871.52).
+    Apply only when correction is much closer to historical context.
+    """
+    if not prev_values:
+        return []
+    black = _normalize_digits_string(item.get("black_digits"))
+    if not black or len(black) < 4:
+        return []
+    red = _normalized_red_digits(item.get("red_digits"), min_len=2, max_len=3)
+    raw_reading = _normalize_reading(item.get("reading"))
+    if raw_reading is None:
+        raw_reading = _reading_from_digits(black, red)
+    raw_dist = _nearest_prev_distance(raw_reading, prev_values)
+    if raw_dist <= 350.0:
+        return []
+
+    # Candidate digit layouts:
+    # 1) as-is,
+    # 2) shift one trailing black digit into red (common split error on drum border).
+    layouts: list[tuple[str, Optional[str], str]] = [(black, red, "base")]
+    if red and len(black) >= 5:
+        shifted_black = black[:-1]
+        shifted_red_raw = f"{black[-1]}{red}"
+        shifted_red = _normalized_red_digits(shifted_red_raw, min_len=2, max_len=3)
+        if shifted_black and shifted_red:
+            layouts.append((shifted_black, shifted_red, "shiftbr"))
+
+    out: list[dict] = []
+    for src_black, src_red, layout_tag in layouts:
+        max_trim = min(3, len(src_black) - 3)
+        for trim in range(1, max_trim + 1):
+            b2 = src_black[trim:]
+            if len(b2) < 3:
+                continue
+            fixed = _reading_from_digits(b2, src_red)
+            if fixed is None:
+                continue
+            fixed_dist = _nearest_prev_distance(fixed, prev_values)
+            if fixed_dist > 180.0:
+                continue
+            if fixed_dist + 220.0 >= raw_dist:
+                continue
+            conf = _clamp_confidence(item.get("confidence", 0.0))
+            notes = str(item.get("notes", "") or "")
+            out.append(
+                {
+                    "type": _sanitize_type(item.get("type", "unknown")),
+                    "reading": fixed,
+                    "serial": item.get("serial"),
+                    "confidence": _clamp_confidence(max(0.55, min(0.88, conf))),
+                    "notes": (f"{notes}; context_trim_leading_{trim}".strip("; ").strip()),
+                    "note2": "context_trim_leading_digit",
+                    "variant": f"{item.get('variant')}_ctxtrim{trim}_{layout_tag}",
+                    "provider": str(item.get("provider") or "openai-odo") + ":ctxtrim",
+                    "black_digits": b2,
+                    "red_digits": src_red,
+                }
+            )
+    return out
+
+
+def _water_substring_context_fixes(
+    item: dict,
+    *,
+    prev_values: list[float],
+    serial_hints: list[str],
+) -> list[dict]:
+    """
+    Recover from overlong/misaligned black drums by testing inner substrings
+    against historical context.
+    """
+    if not prev_values:
+        return []
+    black = _normalize_digits_string(item.get("black_digits"))
+    if not black or len(black) < 5:
+        return []
+    red = _normalized_red_digits(item.get("red_digits"), min_len=2, max_len=3)
+    raw_reading = _normalize_reading(item.get("reading"))
+    if raw_reading is None:
+        raw_reading = _reading_from_digits(black, red)
+    raw_dist = _nearest_prev_distance(raw_reading, prev_values)
+    if raw_dist <= 140.0:
+        return []
+
+    out: list[dict] = []
+    max_len = min(5, len(black))
+    for width in range(3, max_len + 1):
+        for start in range(0, len(black) - width + 1):
+            sub = black[start : start + width]
+            if (not sub) or (sub == black):
+                continue
+            if serial_hints and any(_digits_overlap_serial(sub, sh) for sh in serial_hints):
+                continue
+            cand_reading = _reading_from_digits(sub, red)
+            if cand_reading is None:
+                try:
+                    cand_reading = float(int(sub))
+                except Exception:
+                    continue
+            cand_dist = _nearest_prev_distance(cand_reading, prev_values)
+            if cand_dist > 180.0:
+                continue
+            if cand_dist + 18.0 >= raw_dist:
+                continue
+            base_conf = float(item.get("confidence") or 0.0)
+            out.append(
+                {
+                    "type": _sanitize_type(item.get("type", "unknown")),
+                    "reading": cand_reading,
+                    "serial": item.get("serial"),
+                    "confidence": _clamp_confidence(max(0.42, min(0.84, base_conf - 0.04))),
+                    "notes": str(item.get("notes", "") or ""),
+                    "note2": "context_substring_digits",
+                    "variant": f"{item.get('variant')}_ctxsub{start}_{width}",
+                    "provider": str(item.get("provider") or "openai-odo") + ":ctxsub",
+                    "black_digits": sub,
+                    "red_digits": red,
+                }
+            )
+    return out
+
+
+def _water_suspicious_layout_fixes(item: dict) -> list[dict]:
+    """
+    Context-free structural fixes for shifted odometer splits:
+    - rightmost black digit belongs to red drums;
+    - leading-zero drift on overlong black part.
+    """
+    black = _normalize_digits_string(item.get("black_digits"))
+    red_raw = _normalize_digits_string(item.get("red_digits"))
+    if not black or len(black) < 5:
+        return []
+    serial = item.get("serial")
+    base_conf = _clamp_confidence(item.get("confidence", 0.0))
+    base_notes = str(item.get("notes", "") or "")
+    base_variant = str(item.get("variant") or "orig")
+    base_provider = str(item.get("provider") or "openai-odo")
+    out: list[dict] = []
+
+    suspicious = _is_suspicious_water_digits(item)
+    if not suspicious and not (len(black) >= 6 and black.startswith("0")):
+        return []
+
+    def _append_fix(tag: str, b2_raw: Optional[str], r2_raw: Optional[str], conf_boost: float = 0.0) -> None:
+        b2 = _normalize_digits_string(b2_raw)
+        if not b2 or len(b2) < 3:
+            return
+        r2 = _normalized_red_digits(r2_raw, min_len=2, max_len=3)
+        reading = _reading_from_digits(b2, r2)
+        if reading is None:
+            try:
+                reading = float(int(b2))
+            except Exception:
+                return
+        if _digits_overlap_serial(b2, serial):
+            return
+        if str(item.get("type") or "unknown") not in ("ХВС", "ГВС", "unknown"):
+            return
+        out.append(
+            {
+                "type": _sanitize_type(item.get("type", "unknown")),
+                "reading": reading,
+                "serial": serial,
+                "confidence": _clamp_confidence(max(0.52, min(0.92, base_conf - 0.02 + conf_boost))),
+                "notes": (f"{base_notes}; layout_fix_{tag}".strip("; ").strip()),
+                "note2": "layout_fix_shifted_digits",
+                "variant": f"{base_variant}_layout_{tag}",
+                "provider": base_provider + ":layout",
+                "black_digits": b2,
+                "red_digits": r2,
+            }
+        )
+
+    if red_raw and len(red_raw) >= 2 and len(black) >= 6:
+        _append_fix("shiftbr", black[:-1], f"{black[-1]}{red_raw}", conf_boost=0.08)
+    if red_raw and len(red_raw) >= 2 and len(black) >= 5 and black.startswith("0"):
+        _append_fix("trim1_shiftbr", black[1:-1], f"{black[-1]}{red_raw}", conf_boost=0.10)
+    if red_raw and len(red_raw) >= 2 and len(black) == 5 and black.startswith("0"):
+        try:
+            if int(black) >= 3000 and black[2] == black[3]:
+                # Heuristic for dark shots like 04887 -> 00878 (spurious second digit + shifted tail).
+                b3 = f"00{black[2]}{black[4]}{black[3]}"
+                _append_fix("dup_shift", b3, red_raw, conf_boost=0.06)
+        except Exception:
+            pass
+    return out
+
+
 @app.post("/recognize")
-async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form(None)):
+async def recognize(
+    file: UploadFile = File(...),
+    trace_id: Optional[str] = Form(None),
+    context_prev_water: Optional[str] = Form(None),
+    context_serial_hint: Optional[str] = Form(None),
+):
     started_at = time.monotonic()
     req_trace_id = (str(trace_id or "").strip() or f"ocr-{uuid.uuid4().hex[:12]}")
+    context_prev_values = _parse_context_prev_water(context_prev_water)
+    context_serial_hints = _parse_context_serial_hints(context_serial_hint)
+    # Quick mode is safe only when we target a single known serial.
+    # With 2+ serial hints we need full pass to avoid early lock on wrong meter.
+    quick_serial_mode = bool(OCR_WATER_DIGIT_FIRST and len(context_serial_hints) == 1)
+    vision_calls = 0
     stage_ms: dict[str, int] = {}
 
     def _mark_stage(name: str) -> None:
         stage_ms[name] = int((time.monotonic() - started_at) * 1000)
 
-    # Keep part of time budget for dedicated odometer passes on water meters.
-    odo_reserve_sec = 16.0 if OCR_WATER_DIGIT_FIRST else 0.0
+    # Keep a small reserve for late odometer/cells stages on hard photos.
+    odo_reserve_sec = 4.0 if OCR_WATER_DIGIT_FIRST else 0.0
 
     def _time_budget_left(min_remaining_sec: float = 0.0) -> bool:
         budget = max(1.0, OCR_MAX_RUNTIME_SEC - max(0.0, min_remaining_sec))
         return (time.monotonic() - started_at) < budget
+
+    def _vision(
+        image_bytes: bytes,
+        *,
+        mime: str,
+        model: str,
+        system_prompt: str = SYSTEM_PROMPT,
+        user_text: str = "Определи тип счётчика и показание. Верни JSON строго по схеме.",
+        detail: str = "high",
+        max_call_timeout_sec: Optional[float] = None,
+    ) -> dict:
+        nonlocal vision_calls
+        max_calls = OCR_MAX_OPENAI_CALLS_QUICK if quick_serial_mode else OCR_MAX_OPENAI_CALLS
+        if vision_calls >= max_calls:
+            raise TimeoutError("ocr_openai_call_budget_exceeded")
+        # Hard per-call guard: never start a long provider call near request deadline.
+        remaining = OCR_MAX_RUNTIME_SEC - (time.monotonic() - started_at)
+        if remaining <= 0.9:
+            raise TimeoutError("ocr_runtime_budget_exceeded")
+        vision_calls += 1
+        call_timeout = max(1.0, min(float(OPENAI_TIMEOUT_SEC), remaining - 0.4))
+        if max_call_timeout_sec is not None:
+            call_timeout = max(1.0, min(call_timeout, float(max_call_timeout_sec)))
+        return _call_openai_vision(
+            image_bytes,
+            mime=mime,
+            model=model,
+            system_prompt=system_prompt,
+            user_text=user_text,
+            detail=detail,
+            timeout_sec=call_timeout,
+        )
 
     img = await file.read()
     if not img:
@@ -2056,19 +3490,151 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
     variant_image_map: dict[str, bytes] = {}
 
     candidates: list[dict] = []
+    serial_target_hit = False
+    quick_bootstrap_deferred = False
+
+    # Serial-targeted pass for scenes with multiple water meters in one photo.
+    # Try to read only the meter whose serial tail matches context hint.
+    serial_target_tails = _serial_hint_tails(context_serial_hints, max_tails=3)
+    serial_target_enabled = bool(
+        OCR_WATER_DIGIT_FIRST
+        and serial_target_tails
+        and len(context_serial_hints) == 1
+    )
+    if serial_target_enabled:
+        target_sources: list[tuple[str, bytes, str]] = []
+        seen_target_labels: set[str] = set()
+
+        def _push_target_source(lbl: str, src_bytes: bytes, src_mime: str) -> None:
+            if (not lbl) or (lbl in seen_target_labels):
+                return
+            seen_target_labels.add(lbl)
+            target_sources.append((lbl, src_bytes, src_mime))
+
+        if variants:
+            preferred_variant_order = (
+                "orig",
+                "focused_crop",
+                "center_crop_strong",
+                "middle_band",
+                "lowlight_enhanced",
+                "contrast",
+            )
+            by_label: dict[str, bytes] = {str(lbl): vb for lbl, vb in variants}
+            for pv in preferred_variant_order:
+                vb = by_label.get(pv)
+                if vb is not None:
+                    _push_target_source(f"st_{pv}", vb, mime)
+            for lbl, vb in variants:
+                _push_target_source(f"st_{lbl}", vb, mime)
+
+        # Add deterministic row crops for serial-target pass.
+        # In quick mode keep just one source to limit latency.
+        try:
+            det_limit = 1 if quick_serial_mode else 2
+            det_target_sources = make_water_deterministic_row_variants(img, max_variants=det_limit)
+            for lbl, vb in det_target_sources:
+                _push_target_source(f"st_{lbl}", vb, "image/jpeg")
+        except Exception:
+            pass
+
+        target_calls = 0
+        target_calls_cap = int(OCR_SERIAL_TARGET_MAX_CALLS)
+        if len(context_serial_hints) >= 2:
+            # Keep budget for non-serial odometer passes on multi-meter scenes.
+            target_calls_cap = min(target_calls_cap, 4 if not quick_serial_mode else 2)
+        # Probe each serial tail separately when several meters are present.
+        # This prevents the model from locking onto one serial and ignoring the other meter.
+        tail_attempts = serial_target_tails[:2] if quick_serial_mode else list(serial_target_tails)
+        for src_label, src_bytes, src_mime in target_sources:
+            if target_calls >= target_calls_cap:
+                break
+            if not _time_budget_left(odo_reserve_sec):
+                break
+            for target_tail in (tail_attempts or serial_target_tails):
+                if target_calls >= target_calls_cap:
+                    break
+                if not _time_budget_left(odo_reserve_sec):
+                    break
+                try:
+                    user_text = (
+                        "Целевой хвост serial: "
+                        + str(target_tail)
+                        + ". Считай только соответствующий счетчик. "
+                        + "Если этот хвост serial не виден, верни reading=null."
+                    )
+                    sr = _vision(
+                        src_bytes,
+                        mime=src_mime,
+                        model=OCR_MODEL_ODOMETER,
+                        system_prompt=WATER_SERIAL_TARGET_PROMPT,
+                        user_text=user_text,
+                        detail="high",
+                        max_call_timeout_sec=(6.0 if len(context_serial_hints) >= 2 else None),
+                    )
+                except Exception:
+                    continue
+                target_calls += 1
+                st_t = _sanitize_type(sr.get("type", "unknown"))
+                st_serial = sr.get("serial", None)
+                if isinstance(st_serial, str):
+                    st_serial = st_serial.strip() or None
+                st_conf = _clamp_confidence(sr.get("confidence", 0.0))
+                st_black = _normalize_digits_string(sr.get("black_digits"))
+                st_red = _normalize_digits_string(sr.get("red_digits"))
+                st_reading = _reading_from_digits(st_black, st_red)
+                if st_reading is None:
+                    st_reading = _normalize_reading(sr.get("reading", None))
+                st_reading, st_conf, st_note2 = _plausibility_filter(st_t, st_reading, st_conf)
+                if st_reading is None:
+                    st_conf = min(st_conf, 0.20)
+                variant_image_map.setdefault(src_label, src_bytes)
+                cand = {
+                    "type": st_t,
+                    "reading": st_reading,
+                    "serial": st_serial,
+                    "confidence": st_conf,
+                    "notes": str(sr.get("notes", "") or ""),
+                    "note2": st_note2,
+                    "variant": src_label,
+                    "provider": f"openai-odo-serial-target:{OCR_MODEL_ODOMETER}",
+                    "black_digits": st_black,
+                    "red_digits": st_red,
+                }
+                candidates.append(cand)
+                if (
+                    cand.get("reading") is not None
+                    and _best_serial_tail_match(cand.get("serial"), context_serial_hints) >= 4
+                ):
+                    if context_prev_values:
+                        st_dist = _nearest_prev_distance(_normalize_reading(cand.get("reading")), context_prev_values)
+                        if st_dist <= 40.0:
+                            serial_target_hit = True
+                    else:
+                        serial_target_hit = True
+        _mark_stage("serial_target")
 
     # Digit-first bootstrap for water counters:
-    # run one strict odometer pass on original frame before generic pipeline.
-    if OCR_WATER_DIGIT_FIRST and variants:
-        pre_label, pre_bytes = variants[0]
+    # prefer a deterministic row crop over full-frame to avoid serial/scene overfit.
+    if OCR_WATER_DIGIT_FIRST and variants and (not serial_target_hit):
+        pre_sources: list[tuple[str, bytes]] = []
+        if not quick_serial_mode:
+            pre_sources = make_water_deterministic_row_variants(img, max_variants=1)
+        if pre_sources:
+            pre_label, pre_bytes = pre_sources[0]
+            pre_mime = "image/jpeg"
+        else:
+            pre_label, pre_bytes = variants[0]
+            pre_mime = mime
         variant_image_map.setdefault(f"odo_pre_{pre_label}", pre_bytes)
         if _time_budget_left(odo_reserve_sec):
             try:
-                pre = _call_openai_vision(
+                pre = _vision(
                     pre_bytes,
-                    mime=mime,
+                    mime=pre_mime,
                     model=OCR_MODEL_ODOMETER,
                     system_prompt=WATER_ODOMETER_SYSTEM_PROMPT,
+                    max_call_timeout_sec=(8.0 if len(context_serial_hints) >= 2 else None),
                 )
                 pre_t = _sanitize_type(pre.get("type", "unknown"))
                 pre_serial = pre.get("serial", None)
@@ -2098,13 +3664,217 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             except Exception:
                 pass
     _mark_stage("bootstrap_passes")
-    initial_variant_limit = 1 if OCR_WATER_DIGIT_FIRST else 2
+    if quick_serial_mode:
+        quick_pool: list[dict] = []
+        if candidates:
+            quick_pool = list(candidates)
+            if context_serial_hints:
+                filtered_pool: list[dict] = []
+                for c in quick_pool:
+                    rr = _normalize_reading(c.get("reading"))
+                    if rr is None:
+                        filtered_pool.append(c)
+                        continue
+                    if _looks_like_serial_candidate(rr, c.get("serial")):
+                        continue
+                    bdig = _normalize_digits_string(c.get("black_digits"))
+                    overlaps_serial = bool(
+                        bdig and any(_digits_overlap_serial(bdig, sh) for sh in context_serial_hints)
+                    )
+                    if overlaps_serial and context_prev_values:
+                        if _nearest_prev_distance(rr, context_prev_values) > 12.0:
+                            continue
+                    filtered_pool.append(c)
+                if filtered_pool:
+                    quick_pool = filtered_pool
+
+            extra_fixes: list[dict] = []
+            if context_prev_values:
+                for c in quick_pool:
+                    extra_fixes.extend(_water_leading_trim_context_fixes(c, prev_values=context_prev_values))
+                    extra_fixes.extend(
+                        _water_substring_context_fixes(
+                            c,
+                            prev_values=context_prev_values,
+                            serial_hints=context_serial_hints,
+                        )
+                    )
+            for c in quick_pool:
+                extra_fixes.extend(_water_suspicious_layout_fixes(c))
+            quick_pool.extend(extra_fixes)
+            dedup_pool: list[dict] = []
+            for c in quick_pool:
+                if any(_same_candidate(c, e) for e in dedup_pool):
+                    continue
+                dedup_pool.append(c)
+            quick_pool = dedup_pool or quick_pool
+
+            q_best = _pick_best_water_candidate_adaptive(
+                quick_pool,
+                prev_values=context_prev_values,
+                serial_hints=context_serial_hints,
+            )
+            if q_best is None:
+                q_best = max(quick_pool, key=lambda x: _candidate_score(x, quick_pool))
+            q_label = str(q_best.get("variant") or "orig")
+            q_agree = 0
+            for c in quick_pool:
+                if c is q_best:
+                    continue
+                if _same_candidate(q_best, c):
+                    q_agree += 1
+            q_provider = str(q_best.get("provider") or "")
+            q_reading = _normalize_reading(q_best.get("reading"))
+            q_out = {
+                "type": str(q_best.get("type") or "unknown"),
+                "reading": q_reading,
+                "serial": q_best.get("serial"),
+                "confidence": _clamp_confidence(float(q_best.get("confidence") or 0.0) + min(0.10, 0.04 * q_agree)),
+                "notes": (
+                    f"{str(q_best.get('notes') or '').strip()}; "
+                    f"provider={q_provider or 'openai'}; "
+                    f"variant={q_label}; agree={q_agree+1}/{len(quick_pool)}; quick_serial_bootstrap"
+                ).strip("; ").strip()[:240],
+                "trace_id": req_trace_id,
+            }
+            if context_prev_values and (q_out.get("reading") is not None):
+                q_cur = _normalize_reading(q_out.get("reading"))
+                q_black = _normalize_digits_string(q_best.get("black_digits"))
+                q_red = _normalize_digits_string(q_best.get("red_digits"))
+                if q_cur is not None and q_black:
+                    frac_fixed = _refine_fraction_from_prev(q_black, context_prev_values)
+                    q_delta = abs(float(frac_fixed) - float(q_cur)) if frac_fixed is not None else 9999.0
+                    q_max_delta = 1.2 if _is_weak_red_digits(q_red) else 0.35
+                    if frac_fixed is not None and q_delta <= q_max_delta:
+                        if _is_weak_red_digits(q_red) or q_delta <= 0.12:
+                            q_out["reading"] = float(frac_fixed)
+                            q_out["notes"] = (
+                                f"{str(q_out.get('notes') or '').strip()}; context_frac_refine={float(frac_fixed):.{OCR_WATER_DECIMALS}f}"
+                            ).strip("; ").strip()
+                            q_cur = float(frac_fixed)
+                if q_cur is not None:
+                    snapped = _snap_to_same_integer_context(q_cur, context_prev_values, tolerance=0.25)
+                    if snapped is not None and abs(float(snapped) - float(q_cur)) <= 0.25:
+                        q_out["reading"] = float(snapped)
+                        q_out["notes"] = (
+                            f"{str(q_out.get('notes') or '').strip()}; context_same_int_snap={float(snapped):.{OCR_WATER_DECIMALS}f}"
+                        ).strip("; ").strip()
+            q_reading = _normalize_reading(q_out.get("reading"))
+            if OCR_WATER_DIGIT_FIRST and (not _is_ok_water_digits(q_best)):
+                q_dist = _nearest_prev_distance(q_reading, context_prev_values)
+                keep_by_context = bool((q_reading is not None) and context_prev_values and (q_dist <= 60.0))
+                if keep_by_context:
+                    q_out["confidence"] = min(float(q_out.get("confidence") or 0.0), 0.62)
+                    q_out["notes"] = (
+                        f"{str(q_out.get('notes') or '').strip()}; water_context_keep_quick_no_ok(dist={q_dist:.2f})"
+                    ).strip("; ").strip()
+                else:
+                    q_out["type"] = "unknown"
+                    q_out["reading"] = None
+                    q_out["confidence"] = min(float(q_out.get("confidence") or 0.0), 0.45)
+                    q_out["notes"] = (
+                        f"{str(q_out.get('notes') or '').strip()}; water_no_ok_odometer_winner"
+                    ).strip("; ").strip()
+            if context_prev_values and (q_out.get("reading") is not None):
+                q_dist = _nearest_prev_distance(_normalize_reading(q_out.get("reading")), context_prev_values)
+                if (q_dist > 140.0) and (q_agree == 0):
+                    q_out["type"] = "unknown"
+                    q_out["reading"] = None
+                    q_out["confidence"] = min(float(q_out.get("confidence") or 0.0), 0.45)
+                    q_out["notes"] = (
+                        f"{str(q_out.get('notes') or '').strip()}; water_context_far_singleton(dist={q_dist:.2f})"
+                    ).strip("; ").strip()
+            if (
+                q_provider.startswith("openai-odo-serial-target")
+                and len(context_serial_hints) >= 2
+                and (q_out.get("reading") is not None)
+                and context_prev_values
+            ):
+                q_dist = _nearest_prev_distance(_normalize_reading(q_out.get("reading")), context_prev_values)
+                if (q_agree == 0) and (q_dist > 90.0):
+                    q_out["type"] = "unknown"
+                    q_out["reading"] = None
+                    q_out["confidence"] = min(float(q_out.get("confidence") or 0.0), 0.45)
+                    q_out["notes"] = (
+                        f"{str(q_out.get('notes') or '').strip()}; serial_target_multi_hint_unconfirmed(dist={q_dist:.2f})"
+                    ).strip("; ").strip()
+        else:
+            q_out = {
+                "type": "unknown",
+                "reading": None,
+                "serial": None,
+                "confidence": 0.0,
+                "notes": "quick_serial_bootstrap_empty",
+                "trace_id": req_trace_id,
+            }
+        quick_can_return = bool(q_out.get("reading") is not None)
+        if quick_can_return and context_prev_values:
+            q_dist = _nearest_prev_distance(_normalize_reading(q_out.get("reading")), context_prev_values)
+            if q_dist > 25.0:
+                quick_can_return = False
+                q_out["notes"] = (
+                    f"{str(q_out.get('notes') or '').strip()}; quick_bootstrap_defer_ctx(dist={q_dist:.2f})"
+                ).strip("; ").strip()
+        _mark_stage("quick_bootstrap_finalize")
+        if quick_can_return:
+            if OCR_DEBUG:
+                ranked = sorted(quick_pool if candidates else [], key=lambda x: _candidate_score(x, quick_pool), reverse=True)[:20]
+                q_out["debug"] = [
+                    {
+                        "provider": str(c.get("provider") or "unknown"),
+                        "variant": str(c.get("variant") or "orig"),
+                        "type": str(c.get("type") or "unknown"),
+                        "reading": c.get("reading"),
+                        "confidence": float(c.get("confidence") or 0.0),
+                        "black_digits": c.get("black_digits"),
+                        "red_digits": c.get("red_digits"),
+                    }
+                    for c in ranked
+                ]
+                q_out["timings_ms"] = dict(stage_ms)
+                q_out["openai_calls"] = vision_calls
+            logger.info(
+                "ocr_recognize done trace_id=%s elapsed_ms=%s type=%s reading=%s confidence=%s quick=%s",
+                req_trace_id,
+                int((time.monotonic() - started_at) * 1000),
+                q_out.get("type"),
+                q_out.get("reading"),
+                q_out.get("confidence"),
+                True,
+            )
+            return q_out
+
+        quick_bootstrap_deferred = True
+        if quick_pool:
+            merged: list[dict] = []
+            for c in candidates + quick_pool:
+                if any(_same_candidate(c, e) for e in merged):
+                    continue
+                merged.append(c)
+            candidates = merged
+        if OCR_DEBUG:
+            ranked = sorted(quick_pool if candidates else [], key=lambda x: _candidate_score(x, quick_pool), reverse=True)[:20]
+            q_out["deferred_debug"] = [
+                {
+                    "provider": str(c.get("provider") or "unknown"),
+                    "variant": str(c.get("variant") or "orig"),
+                    "type": str(c.get("type") or "unknown"),
+                    "reading": c.get("reading"),
+                    "confidence": float(c.get("confidence") or 0.0),
+                    "black_digits": c.get("black_digits"),
+                    "red_digits": c.get("red_digits"),
+                }
+                for c in ranked
+            ]
+        logger.info("ocr_recognize quick bootstrap deferred trace_id=%s", req_trace_id)
+    # In digit-first mode skip generic bootstrap here to preserve budget for odometer-specific passes.
+    initial_variant_limit = 0 if OCR_WATER_DIGIT_FIRST else 2
     for label, b in variants[:initial_variant_limit]:
         variant_image_map.setdefault(label, b)
         if not _time_budget_left(odo_reserve_sec):
             break
         try:
-            resp = _call_openai_vision(b, mime=mime, model=OCR_MODEL_PRIMARY)
+            resp = _vision(b, mime=mime, model=OCR_MODEL_PRIMARY)
         except Exception:
             continue
 
@@ -2131,6 +3901,76 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             }
         )
 
+    # Safety fallback: ensure we have at least one candidate when bootstrap path failed.
+    if not candidates:
+        fallback_sources: list[tuple[str, bytes, str, str, str]] = []
+        if not quick_serial_mode:
+            det_fallback = make_water_deterministic_row_variants(img, max_variants=2)
+            for lbl, b in det_fallback:
+                fallback_sources.append(
+                    (
+                        f"fb_{lbl}",
+                        b,
+                        "image/jpeg",
+                        WATER_ODOMETER_SYSTEM_PROMPT,
+                        f"openai-odo:{OCR_MODEL_ODOMETER}",
+                    )
+                )
+        if variants:
+            f_label, f_bytes = variants[0]
+            fallback_sources.append(
+                (
+                    str(f_label),
+                    f_bytes,
+                    mime,
+                    SYSTEM_PROMPT,
+                    f"openai:{OCR_MODEL_PRIMARY}",
+                )
+            )
+        for f_label, f_bytes, f_mime, f_prompt, f_provider in fallback_sources[:3]:
+            if not _time_budget_left(odo_reserve_sec):
+                break
+            try:
+                variant_image_map.setdefault(f_label, f_bytes)
+                resp = _vision(
+                    f_bytes,
+                    mime=f_mime,
+                    model=OCR_MODEL_PRIMARY if f_provider.startswith("openai:") else OCR_MODEL_ODOMETER,
+                    system_prompt=f_prompt,
+                )
+                t = _sanitize_type(resp.get("type", "unknown"))
+                serial = resp.get("serial", None)
+                if isinstance(serial, str):
+                    serial = serial.strip() or None
+                conf = _clamp_confidence(resp.get("confidence", 0.0))
+                black = _normalize_digits_string(resp.get("black_digits"))
+                red = _normalize_digits_string(resp.get("red_digits"))
+                if f_provider.startswith("openai-odo:"):
+                    reading = _reading_from_digits(black, red)
+                else:
+                    reading = None
+                if reading is None:
+                    reading = _normalize_reading(resp.get("reading", None))
+                reading, conf, note2 = _plausibility_filter(t, reading, conf)
+                candidates.append(
+                    {
+                        "type": t,
+                        "reading": reading,
+                        "serial": serial,
+                        "confidence": conf,
+                        "notes": str(resp.get("notes", "") or ""),
+                        "note2": note2,
+                        "variant": f_label,
+                        "provider": f_provider,
+                        "black_digits": black,
+                        "red_digits": red,
+                    }
+                )
+                # Stop early on any plausible numeric candidate.
+                if reading is not None:
+                    break
+            except Exception:
+                continue
     if not candidates:
         raise HTTPException(status_code=500, detail="openai_empty_response")
     _mark_stage("primary_candidates")
@@ -2157,7 +3997,7 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             if not _time_budget_left(odo_reserve_sec):
                 break
             try:
-                resp = _call_openai_vision(b, mime=mime, model=OCR_MODEL_FALLBACK)
+                resp = _vision(b, mime=mime, model=OCR_MODEL_FALLBACK)
             except Exception:
                 continue
             t = _sanitize_type(resp.get("type", "unknown"))
@@ -2181,20 +4021,96 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             )
     _mark_stage("fallback_candidates")
 
-    # water-specific second stage: always try dial-focused OCR and let ranker decide
-    water_variants = _make_water_dial_variants(img)
-    if OCR_WATER_DIGIT_FIRST:
-        water_variants = sorted(
-            water_variants,
-            key=lambda x: 0 if str(x[0]).startswith("water_odometer_band_") else 1,
+    if quick_serial_mode and (not quick_bootstrap_deferred):
+        quick_best = _pick_best_water_candidate_adaptive(
+            candidates,
+            prev_values=context_prev_values,
+            serial_hints=context_serial_hints,
         )
+        if quick_best is None:
+            quick_best = max(candidates, key=lambda x: _candidate_score(x, candidates))
+        quick_label = str(quick_best.get("variant") or "orig")
+        quick_agree = 0
+        for c in candidates:
+            if c is quick_best:
+                continue
+            if _same_candidate(quick_best, c):
+                quick_agree += 1
+        quick_conf = _clamp_confidence(float(quick_best.get("confidence") or 0.0) + min(0.12, 0.04 * quick_agree))
+        quick_notes = str(quick_best.get("notes") or "").strip()
+        quick_provider = str(quick_best.get("provider") or "openai")
+        tail = f"provider={quick_provider}; variant={quick_label}; agree={quick_agree+1}/{len(candidates)}; quick_serial_mode"
+        quick_notes = f"{quick_notes}; {tail}".strip("; ").strip()[:240]
+        out = {
+            "type": str(quick_best.get("type") or "unknown"),
+            "reading": _normalize_reading(quick_best.get("reading")),
+            "serial": quick_best.get("serial") or global_serial,
+            "confidence": quick_conf,
+            "notes": quick_notes,
+            "trace_id": req_trace_id,
+        }
+        # keep strict guard against non-odometer winners
+        quick_provider_l = str(quick_best.get("provider") or "")
+        quick_is_water = (
+            out["type"] in ("ХВС", "ГВС", "unknown")
+            and (
+                quick_provider_l.startswith("openai-water")
+                or quick_provider_l.startswith("openai-odo")
+                or quick_provider_l.startswith("openai:")
+                or quick_provider_l.startswith("google_vision")
+            )
+        )
+        if OCR_WATER_DIGIT_FIRST and quick_is_water and (not _is_ok_water_digits(quick_best)):
+            out["type"] = "unknown"
+            out["reading"] = None
+            out["confidence"] = min(float(out.get("confidence") or 0.0), 0.45)
+            out["notes"] = f"{str(out.get('notes') or '').strip()}; water_no_ok_odometer_winner".strip("; ").strip()
+        _mark_stage("quick_finalize")
+        if OCR_DEBUG:
+            ranked = sorted(candidates, key=lambda x: _candidate_score(x, candidates), reverse=True)[:20]
+            out["debug"] = [
+                {
+                    "provider": str(c.get("provider") or "unknown"),
+                    "variant": str(c.get("variant") or "orig"),
+                    "type": str(c.get("type") or "unknown"),
+                    "reading": c.get("reading"),
+                    "confidence": float(c.get("confidence") or 0.0),
+                    "black_digits": c.get("black_digits"),
+                    "red_digits": c.get("red_digits"),
+                }
+                for c in ranked
+            ]
+            out["timings_ms"] = dict(stage_ms)
+        logger.info(
+            "ocr_recognize done trace_id=%s elapsed_ms=%s type=%s reading=%s confidence=%s variant=%s provider=%s quick=%s",
+            req_trace_id,
+            int((time.monotonic() - started_at) * 1000),
+            out.get("type"),
+            out.get("reading"),
+            out.get("confidence"),
+            quick_label,
+            quick_provider,
+            True,
+        )
+        return out
+
+    # water-specific second stage: always try dial-focused OCR and let ranker decide
+    # In digit-first mode skip this generic water prompt stage and spend budget on row/cells passes.
     water_variant_limit = 0 if OCR_WATER_DIGIT_FIRST else 2
+    water_variants: list[tuple[str, bytes]] = []
+    if water_variant_limit > 0:
+        water_variants = _make_water_dial_variants(img)
+        if OCR_WATER_DIGIT_FIRST:
+            water_variants = sorted(
+                water_variants,
+                key=lambda x: 0 if str(x[0]).startswith("water_odometer_band_") else 1,
+            )
     for label, wb in water_variants[:water_variant_limit]:
         variant_image_map.setdefault(label, wb)
         if not _time_budget_left(odo_reserve_sec):
             break
         try:
-            wr = _call_openai_vision(wb, mime="image/jpeg", model=OCR_MODEL_PRIMARY, system_prompt=WATER_SYSTEM_PROMPT)
+            wr = _vision(wb, mime="image/jpeg", model=OCR_MODEL_PRIMARY, system_prompt=WATER_SYSTEM_PROMPT)
         except Exception:
             continue
         t = _sanitize_type(wr.get("type", "unknown"))
@@ -2226,7 +4142,7 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         if not _time_budget_left(odo_reserve_sec):
             break
         try:
-            wr2 = _call_openai_vision(b, mime=mime, model=OCR_MODEL_PRIMARY, system_prompt=WATER_SYSTEM_PROMPT)
+            wr2 = _vision(b, mime=mime, model=OCR_MODEL_PRIMARY, system_prompt=WATER_SYSTEM_PROMPT)
         except Exception:
             continue
         t = _sanitize_type(wr2.get("type", "unknown"))
@@ -2250,16 +4166,23 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         )
 
     # dedicated odometer-window pass (digit-first extraction)
-    odo_variants = _make_water_odometer_window_variants(img)
+    odo_variants: list[tuple[str, bytes]] = []
+    if not OCR_WATER_DIGIT_FIRST:
+        odo_variants = _make_water_odometer_window_variants(img)
+    det_row_variants = make_water_deterministic_row_variants(img, max_variants=12)
     roi_row_variants = _make_water_roi_row_variants(img)
     global_variants = _make_water_global_strip_variants(img)
     box_variants = _make_water_counter_box_variants(img)
     row_variants = _make_water_counter_row_variants(img)
-    circle_row_variants = _make_water_circle_row_variants(img)
-    circle_odo_variants = _make_water_circle_odometer_strips(img)
-    meter_face_variants = _make_water_meter_face_variants(img)
+    circle_row_variants: list[tuple[str, bytes]] = []
+    circle_odo_variants: list[tuple[str, bytes]] = []
+    meter_face_variants: list[tuple[str, bytes]] = []
     blackhat_row_variants = _make_water_blackhat_row_variants(img)
     top_variants = _make_water_top_strip_variants(img)
+    if not OCR_WATER_DIGIT_FIRST:
+        circle_row_variants = _make_water_circle_row_variants(img)
+        circle_odo_variants = _make_water_circle_odometer_strips(img)
+        meter_face_variants = _make_water_meter_face_variants(img)
     face_row_variants: list[tuple[str, bytes]] = []
     for idx, (face_label, fb) in enumerate(meter_face_variants[:2], start=1):
         sub_rows = _make_water_counter_row_variants(fb)
@@ -2281,26 +4204,38 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         variant_image_map.setdefault(face_label, fb)
     # Use a broader but still bounded set of odometer-focused crops.
     # Previous narrow selection often missed the correct digit row on dark/angled shots.
+    # Keep this list compact in digit-first mode:
+    # we need to preserve time budget for the deterministic cells_sheet stage,
+    # otherwise we keep overfitting to one noisy row candidate (e.g. 01103).
     odometer_variants = (
-        roi_row_variants[:8]
-        + face_row_variants[:8]
-        + blackhat_row_variants[:4]
-        + circle_odo_variants[:4]
-        +
-        row_variants[:4]
-        + circle_row_variants[:2]
-        + box_variants[:1]
+        top_variants[:2]
+        + global_variants[:3]
+        + det_row_variants[:4]
+        + box_variants[:2]
+        + face_row_variants[:3]
+        + row_variants[:2]
+        + roi_row_variants[:3]
+        + blackhat_row_variants[:2]
+        + circle_odo_variants[:1]
+        + circle_row_variants[:1]
         + odo_variants[:1]
-        + top_variants[:1]
     )
     fast_water_hit = False
     strong_readings: list[float] = []
+    # In digit-first mode still probe several row-level variants:
+    # cells-sheet can fail on dark/occluded shots, and then we need backup candidates.
+    if OCR_WATER_DIGIT_FIRST:
+        max_odo_openai_variants = min((2 if quick_serial_mode else OCR_ODO_MAX_VARIANTS), len(odometer_variants))
+    else:
+        max_odo_openai_variants = len(odometer_variants)
     for idx, (label, b) in enumerate(odometer_variants, start=1):
         variant_image_map.setdefault(label, b)
+        if idx > max_odo_openai_variants:
+            break
         if not _time_budget_left():
             break
         try:
-            wr3 = _call_openai_vision(
+            wr3 = _vision(
                 b,
                 mime="image/jpeg",
                 model=OCR_MODEL_PRIMARY,
@@ -2352,14 +4287,232 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             # Keep bounded runtime even without consensus.
             if idx >= 14 and (not _time_budget_left(3.0)):
                 break
+
+    # deterministic cells-sheet pass: read drum windows by positions B1..B5 and R1..R2/3
+    if OCR_WATER_DIGIT_FIRST and _time_budget_left(3.0):
+        row_sources: list[tuple[str, bytes]] = []
+        seen_labels: set[str] = set()
+
+        def _push_sources(srcs: list[tuple[str, bytes]], limit: int) -> None:
+            for lbl, src in srcs[:limit]:
+                if (not lbl) or (lbl in seen_labels):
+                    continue
+                row_sources.append((lbl, src))
+                seen_labels.add(lbl)
+
+        # Geometry-first sources; do not depend on OCR confidence from previous passes.
+        _push_sources(top_variants, 2)
+        _push_sources(global_variants, 3)
+        _push_sources(face_row_variants, 4)
+        _push_sources(det_row_variants, 4)
+        _push_sources(row_variants, 3)
+        _push_sources(roi_row_variants, 3)
+        _push_sources(blackhat_row_variants, 2)
+        _push_sources(circle_odo_variants, 1)
+        _push_sources(circle_row_variants, 1)
+        _push_sources(box_variants, 1)
+        _push_sources(odo_variants, 1)
+        if len(row_sources) < 4:
+            _push_sources(global_variants, 2)
+        if len(row_sources) < 4 and variants:
+            generic_fallback = [(f"generic_{lbl}", b) for lbl, b in variants[:3]]
+            _push_sources(generic_fallback, 3)
+
+        row_sources = row_sources[: (2 if quick_serial_mode else OCR_CELLS_ROW_SOURCES_MAX)]
+        cells_valid: list[dict] = []
+
+        for src_label, src_bytes in row_sources:
+            if not _time_budget_left(4.0):
+                break
+            packed = _make_water_digit_cells_sheet_from_row(src_bytes)
+            if not packed:
+                packed = make_fixed_cells_sheet_from_row(src_bytes, black_len=5, red_len=3)
+            if not packed:
+                candidates.append(
+                    {
+                        "type": "unknown",
+                        "reading": None,
+                        "serial": None,
+                        "confidence": 0.0,
+                        "notes": "cells_sheet_pack_failed",
+                        "note2": "",
+                        "variant": f"cells_row_{src_label}_reject_pack",
+                        "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                        "black_digits": None,
+                        "red_digits": None,
+                    }
+                )
+                continue
+            sheet_bytes, red_len = packed
+            variant_image_map.setdefault(f"cells_row_{src_label}", sheet_bytes)
+            try:
+                cs = _vision(
+                    sheet_bytes,
+                    mime="image/jpeg",
+                    model=OCR_MODEL_ODOMETER,
+                    system_prompt=WATER_CELLS_SHEET_PROMPT,
+                    user_text=(
+                        "Прочитай цифры по ячейкам. B1..B5 = целая часть, R1..R2/R3 = дробная. "
+                        "Верни только JSON."
+                    ),
+                    detail="high",
+                )
+            except Exception:
+                candidates.append(
+                    {
+                        "type": "unknown",
+                        "reading": None,
+                        "serial": None,
+                        "confidence": 0.0,
+                        "notes": "cells_sheet_openai_error",
+                        "note2": "",
+                        "variant": f"cells_row_{src_label}_reject_openai",
+                        "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                        "black_digits": None,
+                        "red_digits": None,
+                    }
+                )
+                continue
+            black_digits, red_digits = _extract_digits_from_cell_sheet_resp(
+                cs,
+                black_len=5,
+                red_len=red_len,
+            )
+            conf = _clamp_confidence(cs.get("confidence", 0.0))
+            if not black_digits:
+                candidates.append(
+                    {
+                        "type": _sanitize_type(cs.get("type", "unknown")),
+                        "reading": None,
+                        "serial": cs.get("serial"),
+                        "confidence": conf,
+                        "notes": "cells_sheet_no_black_digits",
+                        "note2": "",
+                        "variant": f"cells_row_{src_label}_reject_digits",
+                        "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                        "black_digits": black_digits,
+                        "red_digits": red_digits,
+                    }
+                )
+                continue
+            if _digits_overlap_serial(black_digits, cs.get("serial")):
+                candidates.append(
+                    {
+                        "type": _sanitize_type(cs.get("type", "unknown")),
+                        "reading": None,
+                        "serial": cs.get("serial"),
+                        "confidence": conf,
+                        "notes": "cells_sheet_black_overlaps_serial",
+                        "note2": "",
+                        "variant": f"cells_row_{src_label}_reject_serial",
+                        "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                        "black_digits": black_digits,
+                        "red_digits": red_digits,
+                    }
+                )
+                continue
+            reading = _reading_from_digits(black_digits, red_digits)
+            t = _sanitize_type(cs.get("type", "unknown"))
+            reading, conf, note2 = _plausibility_filter(t, reading, conf)
+            if reading is None:
+                candidates.append(
+                    {
+                        "type": t,
+                        "reading": None,
+                        "serial": cs.get("serial"),
+                        "confidence": conf,
+                        "notes": "cells_sheet_reading_filtered",
+                        "note2": note2,
+                        "variant": f"cells_row_{src_label}_reject_filtered",
+                        "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                        "black_digits": black_digits,
+                        "red_digits": red_digits,
+                    }
+                )
+                continue
+            candidates.append(
+                {
+                    "type": t,
+                    "reading": reading,
+                    "serial": cs.get("serial"),
+                    "confidence": conf,
+                    "notes": str(cs.get("notes", "") or ""),
+                    "note2": note2,
+                    "variant": f"cells_row_{src_label}",
+                    "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                    "black_digits": black_digits,
+                    "red_digits": red_digits,
+                }
+            )
+            if _is_ok_water_digits(candidates[-1]):
+                cells_valid.append(candidates[-1])
+
+        # Build consensus only from per-cell reads.
+        if cells_valid:
+            by_black: dict[str, float] = {}
+            for c in cells_valid:
+                b = _normalize_digits_string(c.get("black_digits"))
+                if not b:
+                    continue
+                v = float(c.get("confidence") or 0.0)
+                if _is_strong_water_digits(c):
+                    v += 0.25
+                by_black[b] = by_black.get(b, 0.0) + max(0.15, v)
+
+            if by_black:
+                best_black = max(by_black.items(), key=lambda kv: kv[1])[0]
+                best_cells = sorted(
+                    [c for c in cells_valid if _normalize_digits_string(c.get("black_digits")) == best_black],
+                    key=lambda c: (
+                        1 if _is_strong_water_digits(c) else 0,
+                        float(c.get("confidence") or 0.0),
+                    ),
+                    reverse=True,
+                )[0]
+                # Synthetic consensus candidate to dominate noisy non-slot reads.
+                candidates.append(
+                    {
+                        "type": best_cells.get("type") or "unknown",
+                        "reading": best_cells.get("reading"),
+                        "serial": best_cells.get("serial"),
+                        "confidence": _clamp_confidence(max(float(best_cells.get("confidence") or 0.0), 0.80)),
+                        "notes": "cells_sheet_consensus",
+                        "note2": "",
+                        "variant": f"cells_row_consensus_{_normalize_digits_string(best_black) or 'unknown'}",
+                        "provider": f"openai-odo-cells:{OCR_MODEL_ODOMETER}",
+                        "black_digits": _normalize_digits_string(best_cells.get("black_digits")),
+                        "red_digits": _normalize_digits_string(best_cells.get("red_digits")),
+                    }
+                )
+                fast_water_hit = True
     _mark_stage("odometer_variants")
+    _mark_stage("cells_sheet")
 
     # full-image odometer pass (helps when circle/window crop misses the counter zone)
-    for label, b in ([] if fast_water_hit else variants[:1]):
+    full_pass_variants: list[tuple[str, bytes]] = []
+    if not fast_water_hit:
+        # Always test several generic views, not only orig.
+        preferred_order = ("focused_crop", "center_crop_strong", "lowlight_enhanced", "contrast", "middle_band")
+        by_label = {lbl: b for lbl, b in variants}
+        added: set[str] = set()
+        if variants:
+            full_pass_variants.append(variants[0])
+            added.add(str(variants[0][0]))
+        for lbl in preferred_order:
+            if lbl in by_label and lbl not in added:
+                full_pass_variants.append((lbl, by_label[lbl]))
+                added.add(lbl)
+        for lbl, b in variants[1:]:
+            if lbl in added:
+                continue
+            full_pass_variants.append((lbl, b))
+            added.add(lbl)
+
+    for label, b in full_pass_variants[: (2 if quick_serial_mode else 3)]:
         if not _time_budget_left():
             break
         try:
-            wr_full = _call_openai_vision(
+            wr_full = _vision(
                 b,
                 mime=mime,
                 model=OCR_MODEL_ODOMETER,
@@ -2396,10 +4549,12 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
     _mark_stage("full_image_odo")
 
     # single high-quality "sheet" pass over multiple odometer windows
-    sheet = _make_water_odometer_sheet(img)
-    if sheet and (not fast_water_hit) and _time_budget_left():
+    sheet = None
+    if (not OCR_WATER_DIGIT_FIRST) and (not fast_water_hit) and (not quick_serial_mode) and _time_budget_left():
+        sheet = _make_water_odometer_sheet(img)
+    if sheet and (not fast_water_hit) and (not quick_serial_mode) and _time_budget_left():
         try:
-            ws = _call_openai_vision(
+            ws = _vision(
                 sheet,
                 mime="image/jpeg",
                 model=OCR_MODEL_ODOMETER,
@@ -2464,6 +4619,21 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             pass
     _mark_stage("google_fallback")
 
+    # Contextual auto-fix for extra leading black digit on water drums.
+    if context_prev_values:
+        fixed_candidates: list[dict] = []
+        for c in candidates:
+            fixed_candidates.extend(
+                _water_leading_trim_context_fixes(c, prev_values=context_prev_values)
+            )
+        if fixed_candidates:
+            candidates.extend(fixed_candidates)
+    layout_fixed_candidates: list[dict] = []
+    for c in candidates:
+        layout_fixed_candidates.extend(_water_suspicious_layout_fixes(c))
+    if layout_fixed_candidates:
+        candidates.extend(layout_fixed_candidates)
+
     water_pool = _water_digit_candidates(candidates)
     # Main path for water: strict odometer digit-first pipeline (feature flag).
     # Fallback: previous mixed ranking across all candidates.
@@ -2495,14 +4665,160 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         elif safe_water_pool:
             pool = safe_water_pool
         elif has_water_odometer_candidates:
-            # Не смешиваем с full-frame кандидатами, если одометр-кандидаты есть,
-            # но пока не прошли строгую валидацию.
-            pool = water_pool
+            # If strict validation rejected all odometer candidates, keep only non-suspicious ones.
+            # If none left, fall back to mixed pool to avoid locking on obvious false positives.
+            non_susp_water_pool = [c for c in water_pool if not _is_suspicious_water_digits(c)]
+            pool = non_susp_water_pool if non_susp_water_pool else candidates
         else:
             pool = candidates
     else:
         pool = candidates
     best = max(pool, key=lambda x: _candidate_score(x, pool))
+    context_override_note = ""
+    if context_prev_values:
+        ctx_best = _pick_water_candidate_with_context(
+            candidates,
+            prev_values=context_prev_values,
+            serial_hints=context_serial_hints,
+        )
+        if ctx_best is not None:
+            best_dist = _nearest_prev_distance(_normalize_reading(best.get("reading")), context_prev_values)
+            ctx_dist = _nearest_prev_distance(_normalize_reading(ctx_best.get("reading")), context_prev_values)
+            best_tail = _best_serial_tail_match(best.get("serial"), context_serial_hints) if context_serial_hints else 0
+            ctx_tail = _best_serial_tail_match(ctx_best.get("serial"), context_serial_hints) if context_serial_hints else 0
+            best_conf = float(best.get("confidence") or 0.0)
+            ctx_conf = float(ctx_best.get("confidence") or 0.0)
+            # Override only when contextual candidate is materially closer to historical band.
+            should_override = (
+                (best_dist > 280.0 and ctx_dist <= 220.0)
+                or (ctx_dist + 15.0 < best_dist)
+            )
+            # If serial hint match is at least as strong, allow smaller context improvement.
+            if (not should_override) and (ctx_tail >= best_tail) and (ctx_conf + 0.03 >= best_conf):
+                should_override = (ctx_dist + 8.0 < best_dist)
+            if should_override:
+                best = ctx_best
+                context_override_note = (
+                    f"context_override prev={','.join(f'{v:.3f}' for v in context_prev_values[:3])}"
+                )
+    elif context_serial_hints:
+        serial_best = _pick_water_candidate_by_serial(candidates, serial_hints=context_serial_hints)
+        if serial_best is not None:
+            base_tail = _best_serial_tail_match(best.get("serial"), context_serial_hints)
+            serial_tail = _best_serial_tail_match(serial_best.get("serial"), context_serial_hints)
+            best_score = _candidate_score(best, candidates)
+            serial_score = _candidate_score(serial_best, candidates)
+            if serial_tail >= 4 and ((base_tail < 4) or (serial_score + 0.05 >= best_score)):
+                best = serial_best
+                context_override_note = "serial_hint_override"
+
+    # Hard-photo recovery: ask model for several alternative hypotheses from odometer-focused crops.
+    needs_hypothesis_recovery = bool(
+        OCR_WATER_DIGIT_FIRST
+        and OCR_WATER_HYPOTHESIS_PASS
+        and (not quick_serial_mode)
+        and (
+            best.get("reading") is None
+            or (not _is_ok_water_digits(best))
+            or _is_suspicious_water_digits(best)
+        )
+    )
+    if needs_hypothesis_recovery:
+        hyp_sources: list[tuple[str, bytes]] = []
+        seen_hyp_src: set[str] = set()
+
+        def _push_hyp_sources(srcs: list[tuple[str, bytes]], limit: int) -> None:
+            for lbl, src in srcs[:limit]:
+                if (not lbl) or (lbl in seen_hyp_src):
+                    continue
+                hyp_sources.append((lbl, src))
+                seen_hyp_src.add(lbl)
+
+        _push_hyp_sources(det_row_variants, 3)
+        _push_hyp_sources(face_row_variants, 3)
+        _push_hyp_sources(row_variants, 2)
+        _push_hyp_sources(roi_row_variants, 2)
+        _push_hyp_sources(top_variants, 1)
+        _push_hyp_sources([(str(lbl), b) for lbl, b in variants[:1]], 1)
+
+        hyp_added: list[dict] = []
+        hyp_calls = 0
+        for src_label, src_bytes in hyp_sources:
+            if hyp_calls >= OCR_WATER_HYPOTHESIS_MAX_CALLS:
+                break
+            if not _time_budget_left():
+                break
+            try:
+                hr = _vision(
+                    src_bytes,
+                    mime="image/jpeg",
+                    model=OCR_MODEL_ODOMETER,
+                    system_prompt=WATER_HYPOTHESES_PROMPT,
+                    user_text=(
+                        "Сформируй 3-5 гипотез чтения барабана. "
+                        "Укажи black_digits/red_digits/reading/confidence для каждой гипотезы."
+                    ),
+                    detail="high",
+                )
+            except Exception:
+                continue
+            hyp_calls += 1
+            built = _water_hypothesis_candidates_from_response(
+                hr,
+                variant_prefix=f"hyp_{src_label}",
+                provider=f"openai-odo-hyp:{OCR_MODEL_ODOMETER}",
+            )
+            if not built:
+                continue
+            candidates.extend(built)
+            hyp_added.extend(built)
+
+        if hyp_added:
+            hyp_best = _pick_best_water_candidate_adaptive(
+                hyp_added,
+                prev_values=context_prev_values,
+                serial_hints=context_serial_hints,
+            )
+            if hyp_best is not None:
+                curr_score = _candidate_score(best, candidates)
+                hyp_score = _candidate_score(hyp_best, candidates)
+                curr_ok = _is_ok_water_digits(best)
+                hyp_ok = _is_ok_water_digits(hyp_best)
+                should_override = bool(
+                    (hyp_ok and (not curr_ok))
+                    or (best.get("reading") is None and hyp_best.get("reading") is not None)
+                    or (hyp_score >= curr_score + 0.08)
+                )
+                if should_override:
+                    best = hyp_best
+                    context_override_note = (
+                        f"{context_override_note}; hypothesis_override".strip("; ")
+                        if context_override_note
+                        else "hypothesis_override"
+                    )
+
+    # If the winner came from aggressive context-trim fix, prefer integer-part
+    # consensus across variants when available.
+    if context_prev_values:
+        best_notes_now = str(best.get("notes") or "")
+        if "context_trim_leading_digit" in best_notes_now:
+            consensus_best = _pick_water_integer_consensus_candidate(
+                candidates,
+                prev_values=context_prev_values,
+            )
+            if consensus_best is not None:
+                curr_reading = _normalize_reading(best.get("reading"))
+                cons_reading = _normalize_reading(consensus_best.get("reading"))
+                if (curr_reading is None) or (
+                    cons_reading is not None and int(cons_reading) != int(curr_reading)
+                ):
+                    best = consensus_best
+                    context_override_note = (
+                        f"{context_override_note}; integer_consensus_override".strip("; ")
+                        if context_override_note
+                        else "integer_consensus_override"
+                    )
+
     chosen_label = str(best.get("variant") or "orig")
 
     # финальная confidence слегка повышается при согласии нескольких вариантов
@@ -2543,10 +4859,14 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             best_variant.startswith("counter_row_")
             or best_variant.startswith("counter_row_clahe_")
             or best_variant.startswith("counter_row_bw_")
+            or _is_suspicious_water_digits(best)
+            or best_variant.startswith("odo_global_")
+            or best_variant.startswith("odo_top_strip_")
+            or len(best_black) < 5
         )
     )
     if needs_black_refine and _time_budget_left():
-        winner_crop = variant_image_map.get(best_variant)
+        winner_crop = _variant_image_bytes(variant_image_map, best_variant)
         if winner_crop:
             black_votes: dict[str, float] = {}
             black_variants = _make_black_focus_variants_from_row(winner_crop)
@@ -2556,7 +4876,7 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
                 if not _time_budget_left():
                     break
                 try:
-                    br = _call_openai_vision(
+                    br = _vision(
                         src_bytes,
                         mime="image/jpeg",
                         model=OCR_MODEL_ODOMETER,
@@ -2582,7 +4902,7 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             black_sheet = _make_water_black_cells_sheet_from_row(winner_crop)
             if black_sheet and _time_budget_left():
                 try:
-                    brs = _call_openai_vision(
+                    brs = _vision(
                         black_sheet,
                         mime="image/jpeg",
                         model=OCR_MODEL_ODOMETER,
@@ -2601,7 +4921,13 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             if black_votes:
                 refined_black = max(black_votes.items(), key=lambda kv: kv[1])[0]
                 # Принимаем только умеренную правку (без радикальной смены числа).
-                if _digit_distance(best_black, refined_black) <= 2:
+                allow_refined_black = _digit_distance(best_black, refined_black) <= 2
+                if (not allow_refined_black) and context_prev_values and best_black:
+                    curr_ctx_dist = _nearest_prev_distance(_reading_from_digits(best_black, best_red), context_prev_values)
+                    ref_ctx_dist = _nearest_prev_distance(_reading_from_digits(refined_black, best_red), context_prev_values)
+                    if ref_ctx_dist + 1.0 < curr_ctx_dist:
+                        allow_refined_black = True
+                if allow_refined_black:
                     best_black = refined_black
                     best["black_digits"] = refined_black
                     reading = _reading_from_digits(best_black, best_red)
@@ -2609,62 +4935,174 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
                     conf = _clamp_confidence(max(conf, 0.72))
                     black_note = f"black_refine={refined_black}@vote"
 
-    # If integer part was detected but fractional red drums were missed,
-    # run one focused red-zone pass to recover decimals.
+    # If integer part was detected but fractional red drums are unstable,
+    # recover decimals from several focused crops with weighted voting.
     red_note = ""
+    target_int = _reading_integer_part(reading)
+    if target_int is None and best_black:
+        try:
+            target_int = int(best_black)
+        except Exception:
+            target_int = None
+    context_same_int_has_3dec = False
+    if (target_int is not None) and context_prev_values:
+        for pv in context_prev_values:
+            try:
+                fv = float(pv)
+            except Exception:
+                continue
+            if int(fv) != int(target_int):
+                continue
+            frac = abs(fv - float(int(fv)))
+            frac3 = int(round(frac * 1000))
+            if frac3 % 10 != 0:
+                context_same_int_has_3dec = True
+                break
+    has_red_disagreement = _has_red_disagreement_for_integer(candidates, target_int)
     needs_red_refine = (
         (not OCR_WATER_INTEGER_ONLY)
-        and
-        is_water_candidate
+        and is_water_candidate
         and bool(best_black)
         and (
-            not best_red
-            or len(best_red) < 2
+            _is_weak_red_digits(best_red)
             or _is_suspicious_water_digits(best)
+            or has_red_disagreement
+            or (bool(best_red) and len(str(best_red)) == 2 and context_same_int_has_3dec)
         )
     )
     if needs_red_refine and _time_budget_left():
-        red_zone_crops: list[tuple[str, bytes]] = []
-        winner_crop = variant_image_map.get(best_variant)
-        if winner_crop:
-            red_zone_crops.append((f"winner:{best_variant}", winner_crop))
-        red_zone_crops.extend(
-            [(lbl, b) for lbl, b in water_variants if lbl == "water_red_zone"]
+        red_votes, red_counts, red_best_conf = _collect_red_votes_for_integer(
+            candidates,
+            target_int=target_int,
         )
-        for src_label, rb in red_zone_crops[:2]:
+        red_zone_crops: list[tuple[str, bytes]] = []
+        seen_red_labels: set[str] = set()
+
+        def _push_red_source(lbl: str, blob: bytes) -> None:
+            if not lbl or lbl in seen_red_labels:
+                return
+            seen_red_labels.add(lbl)
+            red_zone_crops.append((lbl, blob))
+
+        winner_crop = _variant_image_bytes(variant_image_map, best_variant)
+        if winner_crop:
+            _push_red_source(f"winner:{best_variant}", winner_crop)
+            for rl, rb in _make_red_focus_variants_from_crop(winner_crop, prefix="winner_red"):
+                _push_red_source(rl, rb)
+        for lbl, b in top_variants[:2]:
+            _push_red_source(lbl, b)
+            for rl, rb in _make_red_focus_variants_from_crop(b, prefix=f"top_red_{lbl}"):
+                _push_red_source(rl, rb)
+        for lbl, b in global_variants[:3]:
+            _push_red_source(lbl, b)
+            for rl, rb in _make_red_focus_variants_from_crop(b, prefix=f"glob_red_{lbl}"):
+                _push_red_source(rl, rb)
+        for lbl, b in water_variants:
+            if ("water_red_zone" in str(lbl)) or ("water_odometer_band" in str(lbl)):
+                _push_red_source(lbl, b)
+        if target_int is not None:
+            for c in candidates:
+                if _reading_integer_part(c.get("reading")) != target_int:
+                    continue
+                src_lbl = str(c.get("variant") or "")
+                src_blob = _variant_image_bytes(variant_image_map, src_lbl)
+                if src_blob is not None:
+                    _push_red_source(f"cand:{src_lbl}", src_blob)
+                if len(red_zone_crops) >= OCR_RED_REFINE_MAX_SOURCES:
+                    break
+
+        for src_label, rb in red_zone_crops[:OCR_RED_REFINE_MAX_SOURCES]:
             if not _time_budget_left():
                 break
-            try:
-                rr = _call_openai_vision(
-                    rb,
-                    mime="image/jpeg",
-                    model=OCR_MODEL_ODOMETER,
-                    system_prompt=WATER_RED_DIGITS_PROMPT,
-                )
-            except Exception:
-                continue
-            rr_digits = _normalized_red_digits(
-                _extract_red_digits_only(rr),
-                min_len=2,
-                max_len=3,
-            )
-            rr_conf = _clamp_confidence(rr.get("confidence", 0.0))
-            if rr_digits and rr_conf >= 0.35:
-                should_override = (
-                    (not best_red)
-                    or (len(best_red) < 2)
-                    or (rr_conf >= max(0.6, float(conf) - 0.15))
-                    or _is_suspicious_water_digits(best)
-                )
-                if not should_override:
+            for _ in range(OCR_RED_REFINE_REPEATS):
+                if not _time_budget_left():
+                    break
+                try:
+                    rr = _vision(
+                        rb,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_ODOMETER,
+                        system_prompt=WATER_RED_DIGITS_PROMPT,
+                        user_text="Прочитай только красные окна справа. Верни 2-3 цифры.",
+                    )
+                except Exception:
                     continue
-                best["red_digits"] = rr_digits
-                reading = _reading_from_digits(best_black, rr_digits)
+                rr_digits = _normalized_red_digits(
+                    _extract_red_digits_only(rr),
+                    min_len=2,
+                    max_len=3,
+                )
+                rr_conf = _clamp_confidence(rr.get("confidence", 0.0))
+                if not rr_digits or rr_conf < 0.35:
+                    continue
+                w = rr_conf + (0.14 if len(rr_digits) >= 3 else 0.03)
+                red_votes[rr_digits] = red_votes.get(rr_digits, 0.0) + w
+                red_counts[rr_digits] = red_counts.get(rr_digits, 0) + 1
+                red_best_conf[rr_digits] = max(red_best_conf.get(rr_digits, 0.0), rr_conf)
+
+        voted_red = _pick_red_digits_by_vote(red_votes, red_counts, red_best_conf)
+        if voted_red:
+            should_override = (
+                _is_weak_red_digits(best_red)
+                or has_red_disagreement
+                or _is_suspicious_water_digits(best)
+                or voted_red != (best_red or "")
+            )
+            if should_override:
+                best["red_digits"] = voted_red
+                if context_same_int_has_3dec and len(voted_red) >= 3 and best_black:
+                    try:
+                        reading = float(f"{int(best_black)}.{voted_red[:3]}")
+                    except Exception:
+                        reading = _reading_from_digits(best_black, voted_red)
+                else:
+                    reading = _reading_from_digits(best_black, voted_red)
                 best["reading"] = reading
-                conf = _clamp_confidence(max(conf, min(0.99, rr_conf + 0.05)))
-                best_red = rr_digits
-                red_note = f"red_refine={rr_digits}@{src_label}"
-                break
+                conf = _clamp_confidence(max(conf, min(0.99, red_best_conf.get(voted_red, 0.0) + 0.05)))
+                best_red = voted_red
+                red_note = f"red_refine_vote={voted_red}"
+
+    # Contextual decimal recovery: when integer part is stable but red drums are weak,
+    # borrow fractional part from nearest historical value with the same integer band.
+    frac_ctx_note = ""
+    if (
+        (not OCR_WATER_INTEGER_ONLY)
+        and is_water_candidate
+        and context_prev_values
+        and bool(best_black)
+        and _is_weak_red_digits(best_red)
+    ):
+        frac_fixed = _refine_fraction_from_prev(best_black, context_prev_values)
+        if frac_fixed is not None:
+            curr_val = _normalize_reading(reading)
+            if (curr_val is None) or (abs(frac_fixed - curr_val) <= 0.25):
+                reading = frac_fixed
+                best["reading"] = frac_fixed
+                conf = _clamp_confidence(max(conf, 0.66))
+                frac_ctx_note = f"context_frac_refine={frac_fixed:.{OCR_WATER_DECIMALS}f}"
+
+    snap_ctx_note = ""
+    non_serial_numeric = sum(
+        1
+        for c in candidates
+        if (c.get("reading") is not None)
+        and (not str(c.get("provider") or "").startswith("openai-odo-serial-target"))
+    )
+    if (
+        (not OCR_WATER_INTEGER_ONLY)
+        and is_water_candidate
+        and context_prev_values
+        and str(best_provider).startswith("openai-odo-serial-target")
+        and (agree <= 1)
+        and (non_serial_numeric == 0)
+        and (reading is not None)
+    ):
+        snapped = _snap_to_same_integer_context(reading, context_prev_values, tolerance=0.25)
+        if (snapped is not None) and (abs(float(snapped) - float(reading)) >= 0.02):
+            reading = snapped
+            best["reading"] = snapped
+            conf = _clamp_confidence(max(conf, 0.72))
+            snap_ctx_note = f"context_same_int_snap={snapped:.{OCR_WATER_DECIMALS}f}"
 
     # notes
     notes = str(best.get("notes", "") or "")
@@ -2677,6 +5115,12 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         notes = f"{notes}; {red_note}" if notes else red_note
     if black_note:
         notes = f"{notes}; {black_note}" if notes else black_note
+    if frac_ctx_note:
+        notes = f"{notes}; {frac_ctx_note}" if notes else frac_ctx_note
+    if snap_ctx_note:
+        notes = f"{notes}; {snap_ctx_note}" if notes else snap_ctx_note
+    if context_override_note:
+        notes = f"{notes}; {context_override_note}" if notes else context_override_note
     notes = (notes.strip() or "")
     provider = str(best.get("provider") or "openai")
     notes = (
@@ -2706,6 +5150,7 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
             for c in ranked
         ]
         out["timings_ms"] = dict(stage_ms)
+        out["openai_calls"] = vision_calls
     out["trace_id"] = req_trace_id
 
     # Hard safety for water:
@@ -2726,12 +5171,25 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
     winner_is_ok_odo = _is_ok_water_digits(best)
     winner_is_strong_odo = _is_strong_water_digits(best)
     if OCR_WATER_DIGIT_FIRST and winner_is_water_family and not winner_is_ok_odo:
-        out["type"] = "unknown"
-        out["reading"] = None
-        out["confidence"] = min(float(out.get("confidence") or 0.0), 0.45)
-        base_notes = str(out.get("notes") or "").strip()
-        tail = "water_no_ok_odometer_winner"
-        out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+        ctx_dist = _nearest_prev_distance(_normalize_reading(out.get("reading")), context_prev_values)
+        allow_context_keep = bool(
+            context_override_note
+            and (out.get("reading") is not None)
+            and context_prev_values
+            and ctx_dist <= 240.0
+        )
+        if allow_context_keep:
+            out["confidence"] = min(float(out.get("confidence") or 0.0), 0.62)
+            base_notes = str(out.get("notes") or "").strip()
+            tail = f"water_context_keep_no_ok_odometer(dist={ctx_dist:.2f})"
+            out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+        else:
+            out["type"] = "unknown"
+            out["reading"] = None
+            out["confidence"] = min(float(out.get("confidence") or 0.0), 0.45)
+            base_notes = str(out.get("notes") or "").strip()
+            tail = "water_no_ok_odometer_winner"
+            out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
     elif OCR_WATER_DIGIT_FIRST and winner_is_water_family and winner_is_ok_odo and not winner_is_strong_odo:
         if out.get("reading") is None and winner_black:
             try:
@@ -2742,6 +5200,33 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         base_notes = str(out.get("notes") or "").strip()
         tail = "water_black_only_or_weak_red"
         out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+    # Additional safety: if contextual distance is too large and candidate has no corroboration,
+    # prefer null over a likely false positive from a single crop.
+    if OCR_WATER_DIGIT_FIRST and winner_is_water_family and context_prev_values and (out.get("reading") is not None):
+        ctx_dist = _nearest_prev_distance(_normalize_reading(out.get("reading")), context_prev_values)
+        if (ctx_dist > 140.0) and (agree == 0):
+            out["type"] = "unknown"
+            out["reading"] = None
+            out["confidence"] = min(float(out.get("confidence") or 0.0), 0.45)
+            base_notes = str(out.get("notes") or "").strip()
+            tail = f"water_context_far_singleton(dist={ctx_dist:.2f})"
+            out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
+    # Serial-target can overfit to a wrong meter when several serial hints are provided.
+    # If the winner is uncorroborated and far from context, prefer null over a confident false positive.
+    if (
+        OCR_WATER_DIGIT_FIRST
+        and winner_provider.startswith("openai-odo-serial-target")
+        and len(context_serial_hints) >= 2
+        and (out.get("reading") is not None)
+    ):
+        serial_ctx_dist = _nearest_prev_distance(_normalize_reading(out.get("reading")), context_prev_values)
+        if context_prev_values and (agree == 0) and (serial_ctx_dist > 90.0):
+            out["type"] = "unknown"
+            out["reading"] = None
+            out["confidence"] = min(float(out.get("confidence") or 0.0), 0.45)
+            base_notes = str(out.get("notes") or "").strip()
+            tail = f"serial_target_multi_hint_unconfirmed(dist={serial_ctx_dist:.2f})"
+            out["notes"] = f"{base_notes}; {tail}".strip("; ").strip()
     _mark_stage("finalize")
     if OCR_DEBUG:
         out["timings_ms"] = dict(stage_ms)
@@ -2755,4 +5240,84 @@ async def recognize(file: UploadFile = File(...), trace_id: Optional[str] = Form
         chosen_label,
         str(best.get("provider") or ""),
     )
+    return out
+
+
+@app.post("/recognize-series")
+async def recognize_series(
+    files: list[UploadFile] = File(...),
+    trace_id: Optional[str] = Form(None),
+    context_prev_water: Optional[str] = Form(None),
+    context_serial_hint: Optional[str] = Form(None),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="empty_files")
+    if len(files) > OCR_SERIES_MAX_FILES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"too_many_files_max_{OCR_SERIES_MAX_FILES}",
+        )
+
+    req_trace_id = (str(trace_id or "").strip() or f"ocrs-{uuid.uuid4().hex[:12]}")
+    prev_values = _parse_context_prev_water(context_prev_water)
+    series_items: list[dict] = []
+
+    for idx, upl in enumerate(files, start=1):
+        item_trace = f"{req_trace_id}-f{idx}"
+        name = str(upl.filename or f"file_{idx}").strip() or f"file_{idx}"
+        try:
+            item_res = await recognize(
+                file=upl,
+                trace_id=item_trace,
+                context_prev_water=context_prev_water,
+                context_serial_hint=context_serial_hint,
+            )
+            rec = dict(item_res or {})
+        except Exception as e:
+            rec = {
+                "type": "unknown",
+                "reading": None,
+                "serial": None,
+                "confidence": 0.0,
+                "notes": f"series_item_failed:{e}",
+                "trace_id": item_trace,
+            }
+        rec["filename"] = name
+        series_items.append(rec)
+
+    if OCR_SERIES_NEIGHBOR_RECOVERY:
+        series_items = _recover_series_missing_with_neighbors(series_items)
+    best_idx, best_item = _pick_best_series_result(series_items, prev_values=prev_values)
+    best_score = _series_result_score(best_item, series_items, prev_values=prev_values)
+
+    # Keep batch response compact; debug can still be inspected per item if OCR_DEBUG enabled.
+    compact_items: list[dict] = []
+    for r in series_items:
+        row = {
+            "filename": r.get("filename"),
+            "type": r.get("type"),
+            "reading": r.get("reading"),
+            "serial": r.get("serial"),
+            "confidence": r.get("confidence"),
+            "notes": r.get("notes"),
+            "trace_id": r.get("trace_id"),
+        }
+        compact_items.append(row)
+
+    out = {
+        "trace_id": req_trace_id,
+        "files_count": len(series_items),
+        "best_index": best_idx,
+        "best_score": round(float(best_score), 6),
+        "best": {
+            "filename": best_item.get("filename"),
+            "type": best_item.get("type"),
+            "reading": best_item.get("reading"),
+            "serial": best_item.get("serial"),
+            "confidence": best_item.get("confidence"),
+            "notes": best_item.get("notes"),
+            "trace_id": best_item.get("trace_id"),
+        },
+        "results": compact_items,
+    }
     return out
