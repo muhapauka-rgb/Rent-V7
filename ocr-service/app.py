@@ -79,7 +79,7 @@ try:
 except Exception:
     OCR_SERIES_MAX_FILES = 6
 OCR_SERIES_MAX_FILES = max(2, min(12, OCR_SERIES_MAX_FILES))
-OCR_SERIES_NEIGHBOR_RECOVERY = os.getenv("OCR_SERIES_NEIGHBOR_RECOVERY", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_SERIES_NEIGHBOR_RECOVERY = os.getenv("OCR_SERIES_NEIGHBOR_RECOVERY", "1").strip().lower() in ("1", "true", "yes", "on")
 try:
     OCR_MAX_OPENAI_CALLS = int(os.getenv("OCR_MAX_OPENAI_CALLS", "14"))
 except Exception:
