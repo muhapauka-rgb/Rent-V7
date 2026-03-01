@@ -1445,67 +1445,66 @@ def _extract_digit_boxes_from_bin(bin_img: np.ndarray) -> list[tuple[int, int]]:
     h, w = bin_img.shape[:2]
     if h < 16 or w < 16:
         return []
-    bw = (bin_img > 0).astype(np.uint8) * 255
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
-    if n <= 1:
+    bw = (bin_img > 0).astype(np.uint8)
+    # ignore left/right frame strips
+    margin = max(2, int(w * 0.03))
+    inner = bw[:, margin : max(margin + 1, w - margin)]
+    if inner.size == 0:
         return []
-    min_h = max(8, int(h * 0.18))
-    min_w = max(4, int(w * 0.012))
-    comps: list[tuple[int, int]] = []
-    for i in range(1, n):
-        x = int(stats[i, cv2.CC_STAT_LEFT])
-        y = int(stats[i, cv2.CC_STAT_TOP])
-        cw = int(stats[i, cv2.CC_STAT_WIDTH])
-        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if cw < min_w or ch < min_h:
-            continue
-        # Discard border/frame artifacts.
-        if x <= 1 or (x + cw) >= (w - 1):
-            continue
-        if y <= 1 or (y + ch) >= (h - 1):
-            continue
-        if ch > int(h * 0.93):
-            continue
-        ar = float(cw) / max(1.0, float(ch))
-        if ar < 0.06 or ar > 1.10:
-            continue
-        if area < max(12, int(cw * ch * 0.02)):
-            continue
-        comps.append((x, x + cw))
-    if not comps:
+    proj = np.sum(inner, axis=0).astype(np.float32)
+    mx = float(np.max(proj))
+    if mx <= 0.0:
         return []
-    comps = sorted(comps, key=lambda t: t[0])
-    merged: list[list[int]] = []
-    gap_thr = max(2, int(w * 0.010))
-    for a, b in comps:
-        if not merged or a - merged[-1][1] > gap_thr:
-            merged.append([a, b])
-        else:
-            # Merge tiny near fragments only.
-            if (b - a) <= max(6, int(w * 0.03)):
-                merged[-1][1] = max(merged[-1][1], b)
-            else:
-                merged.append([a, b])
-    out = [(a, b) for a, b in merged if (b - a) >= min_w]
-    if len(out) < 3:
-        # projection fallback inside non-border area
-        proj = np.sum((bw > 0).astype(np.uint8), axis=0).astype(np.float32)
-        if float(np.max(proj)) > 0:
-            thr = max(1.0, float(np.max(proj)) * 0.05)
-            runs: list[tuple[int, int]] = []
+    thr = max(1.0, mx * 0.08)
+    runs: list[tuple[int, int]] = []
+    s = -1
+    for i, v in enumerate(proj):
+        if v >= thr and s < 0:
+            s = i
+        elif v < thr and s >= 0:
+            if (i - s) >= max(4, int(w * 0.012)):
+                runs.append((s + margin, i + margin))
             s = -1
-            for i, v in enumerate(proj):
-                if v >= thr and s < 0:
-                    s = i
-                elif v < thr and s >= 0:
-                    if (i - s) >= min_w and s > 1 and i < (w - 1):
-                        runs.append((s, i))
-                    s = -1
-            if s >= 0 and (w - s) >= min_w and s > 1:
-                runs.append((s, w - 1))
-            if len(runs) >= 3:
-                out = runs
+    if s >= 0 and (len(proj) - s) >= max(4, int(w * 0.012)):
+        runs.append((s + margin, len(proj) + margin))
+    if not runs:
+        return []
+    inner_w = max(1, (w - 2 * margin))
+    if len(runs) == 1:
+        a0, b0 = runs[0]
+        if (b0 - a0) >= int(inner_w * 0.55):
+            parts = 5 if inner_w >= 240 else (4 if inner_w >= 170 else 3)
+            sw = (b0 - a0) / float(parts)
+            forced: list[tuple[int, int]] = []
+            for p in range(parts):
+                x1 = int(round(a0 + p * sw))
+                x2 = int(round(a0 + (p + 1) * sw))
+                if (x2 - x1) >= max(4, int(w * 0.010)):
+                    forced.append((x1, x2))
+            if len(forced) >= 3:
+                runs = forced
+    # split very wide runs (multiple digits glued together)
+    split_runs: list[tuple[int, int]] = []
+    medw = float(np.median([b - a for a, b in runs])) if runs else 0.0
+    if medw <= 0:
+        medw = max(8.0, float(w) * 0.08)
+    for a, b in runs:
+        rw = b - a
+        if rw > medw * 1.95:
+            parts = int(round(rw / medw))
+            parts = max(2, min(4, parts))
+            sw = rw / float(parts)
+            for p in range(parts):
+                x1 = int(round(a + p * sw))
+                x2 = int(round(a + (p + 1) * sw))
+                if (x2 - x1) >= max(4, int(w * 0.010)):
+                    split_runs.append((x1, x2))
+        else:
+            split_runs.append((a, b))
+    # keep plausible widths
+    min_w = max(4, int(w * 0.010))
+    max_w = max(12, int(w * 0.28))
+    out = [(a, b) for a, b in split_runs if min_w <= (b - a) <= max_w]
     return out[:8]
 
 
