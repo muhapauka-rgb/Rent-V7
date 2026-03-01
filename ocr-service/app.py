@@ -5584,6 +5584,7 @@ async def recognize_series(
 
     req_trace_id = (str(trace_id or "").strip() or f"ocrs-{uuid.uuid4().hex[:12]}")
     prev_values = _parse_context_prev_water(context_prev_water)
+    serial_hints = _parse_context_serial_hints(context_serial_hint)
     series_items: list[dict] = []
 
     for idx, upl in enumerate(files, start=1):
@@ -5609,7 +5610,9 @@ async def recognize_series(
         rec["filename"] = name
         series_items.append(rec)
 
-    if OCR_SERIES_NEIGHBOR_RECOVERY:
+    # Neighbor recovery is safe mainly for context-aware water batches.
+    # For generic/electric batches without context it can produce wrong carry-over values.
+    if OCR_SERIES_NEIGHBOR_RECOVERY and (bool(prev_values) or bool(serial_hints)):
         series_items = _recover_series_missing_with_neighbors(series_items)
     best_idx, best_item = _pick_best_series_result(series_items, prev_values=prev_values)
     best_score = _series_result_score(best_item, series_items, prev_values=prev_values)
