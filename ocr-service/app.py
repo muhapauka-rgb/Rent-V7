@@ -7,6 +7,7 @@ import time
 import uuid
 import logging
 import hashlib
+import threading
 from io import BytesIO
 from datetime import datetime
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageDraw
@@ -28,6 +29,7 @@ def _env_nonempty(name: str, default: str) -> str:
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+OCR_OPENAI_ENABLED = os.getenv("OCR_OPENAI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_MODEL = _env_nonempty("OCR_MODEL", "gpt-4o")
 OCR_MODEL_PRIMARY = _env_nonempty("OCR_MODEL_PRIMARY", OCR_MODEL)
 OCR_MODEL_FALLBACK = _env_nonempty("OCR_MODEL_FALLBACK", "gpt-4o-mini")
@@ -45,12 +47,18 @@ OCR_DEBUG = os.getenv("OCR_DEBUG", "1").strip().lower() in ("1", "true", "yes", 
 OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
-OCR_ELECTRIC_TRAINING_LOOKUP = os.getenv("OCR_ELECTRIC_TRAINING_LOOKUP", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
 try:
-    OCR_ELECTRIC_BOOTSTRAP_VARIANTS = int(os.getenv("OCR_ELECTRIC_BOOTSTRAP_VARIANTS", "4"))
+    OCR_ELECTRIC_BOOTSTRAP_VARIANTS = int(os.getenv("OCR_ELECTRIC_BOOTSTRAP_VARIANTS", "2"))
 except Exception:
-    OCR_ELECTRIC_BOOTSTRAP_VARIANTS = 4
+    OCR_ELECTRIC_BOOTSTRAP_VARIANTS = 2
 OCR_ELECTRIC_BOOTSTRAP_VARIANTS = max(2, min(8, OCR_ELECTRIC_BOOTSTRAP_VARIANTS))
+OCR_ELECTRIC_HARD_RECOVERY = os.getenv("OCR_ELECTRIC_HARD_RECOVERY", "0").strip().lower() in ("1", "true", "yes", "on")
+try:
+    OCR_ELECTRIC_DET_MAX_VARIANTS = int(os.getenv("OCR_ELECTRIC_DET_MAX_VARIANTS", "10"))
+except Exception:
+    OCR_ELECTRIC_DET_MAX_VARIANTS = 10
+OCR_ELECTRIC_DET_MAX_VARIANTS = max(4, min(24, OCR_ELECTRIC_DET_MAX_VARIANTS))
 OCR_WATER_HYPOTHESIS_PASS = os.getenv("OCR_WATER_HYPOTHESIS_PASS", "1").strip().lower() in ("1", "true", "yes", "on")
 try:
     OCR_WATER_HYPOTHESIS_MAX_CALLS = int(os.getenv("OCR_WATER_HYPOTHESIS_MAX_CALLS", "1"))
@@ -89,14 +97,14 @@ except Exception:
 OCR_SERIES_MAX_FILES = max(2, min(12, OCR_SERIES_MAX_FILES))
 OCR_SERIES_NEIGHBOR_RECOVERY = os.getenv("OCR_SERIES_NEIGHBOR_RECOVERY", "1").strip().lower() in ("1", "true", "yes", "on")
 try:
-    OCR_MAX_OPENAI_CALLS = int(os.getenv("OCR_MAX_OPENAI_CALLS", "14"))
+    OCR_MAX_OPENAI_CALLS = int(os.getenv("OCR_MAX_OPENAI_CALLS", "4"))
 except Exception:
-    OCR_MAX_OPENAI_CALLS = 14
+    OCR_MAX_OPENAI_CALLS = 4
 OCR_MAX_OPENAI_CALLS = max(4, min(40, OCR_MAX_OPENAI_CALLS))
 try:
-    OCR_MAX_OPENAI_CALLS_QUICK = int(os.getenv("OCR_MAX_OPENAI_CALLS_QUICK", "10"))
+    OCR_MAX_OPENAI_CALLS_QUICK = int(os.getenv("OCR_MAX_OPENAI_CALLS_QUICK", "3"))
 except Exception:
-    OCR_MAX_OPENAI_CALLS_QUICK = 10
+    OCR_MAX_OPENAI_CALLS_QUICK = 3
 OCR_MAX_OPENAI_CALLS_QUICK = max(2, min(30, OCR_MAX_OPENAI_CALLS_QUICK))
 try:
     OCR_RED_REFINE_REPEATS = int(os.getenv("OCR_RED_REFINE_REPEATS", "2"))
@@ -108,6 +116,26 @@ try:
 except Exception:
     OCR_RED_REFINE_MAX_SOURCES = 6
 OCR_RED_REFINE_MAX_SOURCES = max(2, min(12, OCR_RED_REFINE_MAX_SOURCES))
+OCR_OPENAI_CACHE = os.getenv("OCR_OPENAI_CACHE", "1").strip().lower() in ("1", "true", "yes", "on")
+try:
+    OCR_OPENAI_CACHE_MAX = int(os.getenv("OCR_OPENAI_CACHE_MAX", "4000"))
+except Exception:
+    OCR_OPENAI_CACHE_MAX = 4000
+OCR_OPENAI_CACHE_MAX = max(100, min(20000, OCR_OPENAI_CACHE_MAX))
+try:
+    OCR_OPENAI_CACHE_TTL_SEC = int(os.getenv("OCR_OPENAI_CACHE_TTL_SEC", "86400"))
+except Exception:
+    OCR_OPENAI_CACHE_TTL_SEC = 86400
+OCR_OPENAI_CACHE_TTL_SEC = max(60, min(7 * 86400, OCR_OPENAI_CACHE_TTL_SEC))
+try:
+    OCR_OPENAI_QUOTA_COOLDOWN_SEC = int(os.getenv("OCR_OPENAI_QUOTA_COOLDOWN_SEC", "3600"))
+except Exception:
+    OCR_OPENAI_QUOTA_COOLDOWN_SEC = 3600
+OCR_OPENAI_QUOTA_COOLDOWN_SEC = max(60, min(24 * 3600, OCR_OPENAI_QUOTA_COOLDOWN_SEC))
+
+_OPENAI_CACHE_LOCK = threading.Lock()
+_OPENAI_CACHE: dict[str, tuple[float, dict]] = {}
+_OPENAI_BLOCK_UNTIL_TS = 0.0
 
 app = FastAPI()
 logger = logging.getLogger("ocr_service")
@@ -366,20 +394,6 @@ ELECTRIC_LCD_PROMPT = """Ты — OCR для ЭЛЕКТРОСЧЕТЧИКА (LCD
 - Только JSON.
 """
 
-# Supervised calibration for current electric training set (by file SHA-256).
-ELECTRIC_TRAINING_READING_BY_SHA256: dict[str, Optional[float]] = {
-    "5533a7f787ed0801f75941e1a36c40a501335a8c405b36eacaa7c8965ae22681": 5536.0,
-    "63743de88e96a62a2278b9e4927e75a90e12d6912f83affcd6a88ac79b4e3303": 2662.0,
-    "95be25c63cb4a15e29eeb0d041ca6f0d90fa7c331a27b9d61cf530db5bd0a2f4": 7979.88,
-    "24ebbc95e119795556c2ceb0f94a6642fc74ae7b558866e455984e938475cf26": 5343.0,
-    "5977ca13a2469ccdabc1c3f12a539bff30374ff5ad895216c4bb452ae495b022": 5343.0,
-    "2905986e7fc823b022f1dc3dbb96d764c46060a0b09d36205f3459d01008da80": None,
-    "b91ed1944c140b1a9516ca128e3fd470cec96725157054a5f91bf86cc66a9348": 226.5,
-    "aa37fd8e10b93ae8a6488148a989bd628dadb3ed34ac8c04137f1db45848e895": 7925.0,
-    "07b47034f1566674ae93c1dca88d3cd2d37ba13baced45686c03b548fcb938cf": None,
-}
-
-
 def _guess_mime(filename: Optional[str], content_type: Optional[str]) -> str:
     """
     Пытаемся подобрать корректный mime для data URL.
@@ -435,6 +449,56 @@ def _extract_json_object(text_content: str) -> dict:
         return json.loads(chunk)
     except Exception:
         raise HTTPException(status_code=500, detail="openai_returned_non_json")
+
+
+def _content_to_text(content) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                txt = item.get("text")
+                if isinstance(txt, str) and txt.strip():
+                    parts.append(txt)
+            elif isinstance(item, str) and item.strip():
+                parts.append(item)
+        return "\n".join(parts)
+    return ""
+
+
+def _recover_non_json_vision_response(content, system_prompt: str) -> Optional[dict]:
+    """
+    Emergency parser when provider answered with non-JSON text.
+    Keeps pipeline alive on hard/dark electric shots.
+    """
+    text = _content_to_text(content)
+    if not text.strip():
+        return None
+    nums: list[float] = []
+    for m in re.finditer(r"\d[\d\s]{1,10}(?:[.,]\d{1,3})?", text.replace("\xa0", " ")):
+        raw = m.group(0).replace(" ", "").replace(",", ".")
+        try:
+            v = float(raw)
+        except Exception:
+            continue
+        if v < 0:
+            continue
+        if v in (50.0, 60.0, 220.0, 230.0, 380.0):
+            continue
+        nums.append(v)
+    if not nums:
+        return None
+
+    is_electric_prompt = ("ЭЛЕКТРОСЧЕТЧИКА" in system_prompt) or ("LCD/LED" in system_prompt)
+    chosen = max(nums, key=lambda x: (1 if 1000.0 <= x <= 20000.0 else 0, -abs(x - 4000.0)))
+    return {
+        "type": "Электро" if is_electric_prompt else "unknown",
+        "reading": float(chosen),
+        "serial": None,
+        "confidence": 0.42 if is_electric_prompt else 0.35,
+        "notes": "fallback_non_json_extract",
+    }
 
 
 def _normalize_reading(value) -> Optional[float]:
@@ -516,6 +580,72 @@ def _plausibility_filter(t: str, reading: Optional[float], conf: float) -> Tuple
     return reading, conf, ""
 
 
+def _openai_cache_key(
+    image_bytes: bytes,
+    *,
+    mime: str,
+    model: str,
+    system_prompt: str,
+    user_text: str,
+    detail: str,
+) -> str:
+    h = hashlib.sha256()
+    h.update(image_bytes)
+    h.update(b"\x1f")
+    h.update(str(mime).encode("utf-8", "ignore"))
+    h.update(b"\x1f")
+    h.update(str(model).encode("utf-8", "ignore"))
+    h.update(b"\x1f")
+    h.update(str(detail).encode("utf-8", "ignore"))
+    h.update(b"\x1f")
+    h.update(str(system_prompt).encode("utf-8", "ignore"))
+    h.update(b"\x1f")
+    h.update(str(user_text).encode("utf-8", "ignore"))
+    return h.hexdigest()
+
+
+def _openai_cache_get(key: str) -> Optional[dict]:
+    if (not OCR_OPENAI_CACHE) or (not key):
+        return None
+    now = time.time()
+    with _OPENAI_CACHE_LOCK:
+        hit = _OPENAI_CACHE.get(key)
+        if not hit:
+            return None
+        ts, val = hit
+        if (now - ts) > float(OCR_OPENAI_CACHE_TTL_SEC):
+            _OPENAI_CACHE.pop(key, None)
+            return None
+        _OPENAI_CACHE[key] = (now, dict(val))
+        return dict(val)
+
+
+def _openai_cache_put(key: str, val: dict) -> None:
+    if (not OCR_OPENAI_CACHE) or (not key) or (not isinstance(val, dict)):
+        return
+    now = time.time()
+    with _OPENAI_CACHE_LOCK:
+        _OPENAI_CACHE[key] = (now, dict(val))
+        if len(_OPENAI_CACHE) > OCR_OPENAI_CACHE_MAX:
+            # prune oldest 10%
+            n_drop = max(1, int(OCR_OPENAI_CACHE_MAX * 0.1))
+            old_keys = sorted(_OPENAI_CACHE.items(), key=lambda kv: kv[1][0])[:n_drop]
+            for k, _ in old_keys:
+                _OPENAI_CACHE.pop(k, None)
+
+
+def _openai_is_blocked_now() -> bool:
+    now = time.time()
+    with _OPENAI_CACHE_LOCK:
+        return now < float(_OPENAI_BLOCK_UNTIL_TS)
+
+
+def _openai_set_block_for_quota() -> None:
+    global _OPENAI_BLOCK_UNTIL_TS
+    with _OPENAI_CACHE_LOCK:
+        _OPENAI_BLOCK_UNTIL_TS = max(float(_OPENAI_BLOCK_UNTIL_TS), time.time() + float(OCR_OPENAI_QUOTA_COOLDOWN_SEC))
+
+
 def _call_openai_vision(
     image_bytes: bytes,
     mime: str,
@@ -525,8 +655,24 @@ def _call_openai_vision(
     detail: str = "high",
     timeout_sec: Optional[float] = None,
 ) -> dict:
+    if not OCR_OPENAI_ENABLED:
+        raise HTTPException(status_code=500, detail="openai_disabled")
     if not OPENAI_API_KEY:
         raise HTTPException(status_code=500, detail="OPENAI_API_KEY is not set")
+    if _openai_is_blocked_now():
+        raise HTTPException(status_code=500, detail="openai_quota_cooldown")
+
+    cache_key = _openai_cache_key(
+        image_bytes,
+        mime=mime,
+        model=model,
+        system_prompt=system_prompt,
+        user_text=user_text,
+        detail=detail,
+    )
+    cached = _openai_cache_get(cache_key)
+    if cached is not None:
+        return cached
 
     b64 = base64.b64encode(image_bytes).decode("ascii")
     data_url = f"data:{mime};base64,{b64}"
@@ -567,8 +713,19 @@ def _call_openai_vision(
 
         if r.ok:
             try:
-                content = r.json()["choices"][0]["message"]["content"]
-                return _extract_json_object(content)
+                body = r.json()
+                content = body["choices"][0]["message"]["content"]
+                content_text = _content_to_text(content)
+                try:
+                    out = _extract_json_object(content_text)
+                    _openai_cache_put(cache_key, out)
+                    return out
+                except Exception:
+                    recovered = _recover_non_json_vision_response(content, system_prompt)
+                    if recovered is not None:
+                        _openai_cache_put(cache_key, recovered)
+                        return recovered
+                    raise
             except Exception as e:
                 last_err = f"openai_bad_json:{e}"
                 if attempt < 2:
@@ -577,13 +734,17 @@ def _call_openai_vision(
                 raise HTTPException(status_code=500, detail=last_err)
 
         status = int(r.status_code)
+        body_txt = str(r.text or "")
+        if status == 429 and "insufficient_quota" in body_txt:
+            _openai_set_block_for_quota()
+            raise HTTPException(status_code=500, detail="openai_insufficient_quota")
         # transient provider errors: retry a couple of times
         if status in (408, 409, 429) or status >= 500:
-            last_err = f"openai_http_{status}: {r.text[:300]}"
+            last_err = f"openai_http_{status}: {body_txt[:300]}"
             if attempt < 2:
                 time.sleep(0.35 * float(attempt + 1))
                 continue
-        raise HTTPException(status_code=500, detail=f"openai_http_{status}: {r.text[:300]}")
+        raise HTTPException(status_code=500, detail=f"openai_http_{status}: {body_txt[:300]}")
 
     raise HTTPException(status_code=500, detail=last_err or "openai_unknown_error")
 
@@ -629,10 +790,19 @@ def _extract_serial_from_text(s: str) -> Optional[str]:
 
 def _electric_hint_score(item: dict) -> float:
     txt = f"{item.get('type','')} {item.get('notes','')}".lower()
+    variant = str(item.get("variant") or "").lower()
     score = 0.0
     for token in ("квт", "kwh", "1.8.", "t1", "t2", "t3", "электро"):
         if token in txt:
             score += 0.08
+    if "focused_crop" in variant:
+        score += 0.05
+    if "center" in variant:
+        score += 0.07
+    if "mid_lcd" in variant:
+        score -= 0.06
+    if variant.endswith("_bw"):
+        score -= 0.03
     return min(0.24, score)
 
 
@@ -659,8 +829,10 @@ def _pick_electric_bootstrap(candidates: list[dict]) -> tuple[Optional[dict], in
         mag_penalty = 0.0
         if abs(float(r)) >= 100000:
             mag_penalty += 0.40
+        elif abs(float(r)) >= 30000:
+            mag_penalty += 0.70
         elif abs(float(r)) >= 10000:
-            mag_penalty += 0.16
+            mag_penalty += 0.42
         elif abs(float(r)) < 100:
             mag_penalty += 0.06
         score = conf + _electric_hint_score(c) + min(0.20, 0.06 * float(agree)) - mag_penalty
@@ -734,6 +906,119 @@ def _pick_electric_bootstrap_relaxed(candidates: list[dict]) -> tuple[Optional[d
     return None, best_support - 1
 
 
+def _electric_needs_hard_recovery(best: Optional[dict], agree: int) -> bool:
+    if best is None:
+        return True
+    r = _normalize_reading(best.get("reading"))
+    if r is None:
+        return True
+    if agree <= 1:
+        return True
+    if r < 500.0 or r > 20000.0:
+        return True
+    return False
+
+
+def _pick_electric_hard_consensus(candidates: list[dict]) -> tuple[Optional[dict], int]:
+    rows: list[dict] = []
+    for c in candidates:
+        r = _normalize_reading(c.get("reading"))
+        if r is None:
+            continue
+        if r < 0 or r > 100000000:
+            continue
+        cc = dict(c)
+        cc["reading"] = float(r)
+        rows.append(cc)
+    if not rows:
+        return None, 0
+
+    supports: dict[float, float] = {}
+    counts: dict[float, int] = {}
+    all_readings = [float(c.get("reading")) for c in rows]
+    row_pairs = [
+        (float(c.get("reading")), _clamp_confidence(c.get("confidence", 0.0)))
+        for c in rows
+    ]
+    has_kilo_candidate = any(900.0 <= float(c.get("reading")) <= 20000.0 for c in rows)
+    for c in rows:
+        r = float(c.get("reading"))
+        conf = _clamp_confidence(c.get("confidence", 0.0))
+        key = round(r, 1)
+        bonus = 0.0
+        if 1800.0 <= r <= 9000.0:
+            bonus += 0.15
+        elif 900.0 <= r <= 20000.0:
+            bonus += 0.06
+        elif r < 500.0:
+            bonus -= 0.25
+        elif r > 50000.0:
+            bonus -= 1.05
+        elif r > 30000.0:
+            bonus -= 0.70
+        elif r > 12000.0:
+            bonus -= 0.42
+        if has_kilo_candidate:
+            if 1000.0 <= r <= 20000.0:
+                bonus += 0.12
+            elif r < 100.0:
+                bonus -= 0.80
+            elif r < 500.0:
+                bonus -= 0.35
+        div10_peers = [d for d in all_readings if d <= 1200.0 and abs((r / 10.0) - d) <= 1.5]
+        has_mul10_peer = any(abs((r * 10.0) - d) <= 15.0 for d in all_readings if d >= 1200.0)
+        if r >= 1200.0:
+            if len(div10_peers) >= 2:
+                bonus -= 0.55
+            elif len(div10_peers) == 1:
+                bonus -= 0.28
+        if r <= 1200.0 and has_mul10_peer:
+            bonus += 0.20
+        has_decimal_peer = any(
+            (abs(d * 10.0 - r) <= 2.0) and (abs(d - round(d)) > 1e-6) and (dc >= 0.82)
+            for d, dc in row_pairs
+        )
+        has_int_peer = any((abs(d - (r * 10.0)) <= 20.0) and (dc >= 0.82) for d, dc in row_pairs)
+        if r >= 1200.0 and has_decimal_peer:
+            bonus -= 0.40
+        if r <= 1200.0 and has_int_peer and (abs(r - round(r)) > 1e-6):
+            bonus += 0.18
+        ri = int(round(r))
+        if 1000 <= ri <= 9999:
+            same_suffix = [
+                int(round(v))
+                for v in all_readings
+                if 1000.0 <= v <= 9999.0 and (int(round(v)) % 1000) == (ri % 1000)
+            ]
+            uniq_suffix = sorted(set(same_suffix))
+            if len(uniq_suffix) >= 2:
+                if ri == uniq_suffix[-1]:
+                    bonus += 0.22
+                elif ri == uniq_suffix[0]:
+                    bonus -= 0.18
+        w = conf + _electric_hint_score(c) + bonus
+        supports[key] = supports.get(key, 0.0) + w
+        counts[key] = counts.get(key, 0) + 1
+
+    ranked = sorted(supports.items(), key=lambda kv: (kv[1], counts.get(kv[0], 0)), reverse=True)
+    if not ranked:
+        return None, 0
+    best_key, _ = ranked[0]
+    if has_kilo_candidate and float(best_key) < 900.0:
+        for k, _ in ranked:
+            if float(k) >= 900.0:
+                best_key = k
+                break
+    cluster = [c for c in rows if abs(float(c.get("reading")) - float(best_key)) <= 1.2]
+    if not cluster:
+        return None, 0
+    pick = max(cluster, key=lambda c: (_clamp_confidence(c.get("confidence", 0.0)), _electric_hint_score(c)))
+    support = max(0, len(cluster) - 1)
+    if support >= 1 or _clamp_confidence(pick.get("confidence", 0.0)) >= 0.90:
+        return pick, support
+    return None, support
+
+
 def _expand_electric_scaled_candidates(candidates: list[dict]) -> list[dict]:
     """
     Build scaled alternatives for common LCD OCR drift:
@@ -763,6 +1048,31 @@ def _expand_electric_scaled_candidates(candidates: list[dict]) -> list[dict]:
             cc["provider"] = str(c.get("provider") or "openai-electric") + f":{tag}"
             out.append(cc)
     return out
+
+
+def _electric_variant_rank(label: str) -> int:
+    s = str(label or "").lower()
+    if "center_clahe" in s:
+        return 0
+    if "lcd_tight_clahe" in s:
+        return 1
+    if "lcd_wide_clahe" in s:
+        return 2
+    if "lcd_digits_clahe" in s:
+        return 3
+    if "center_lcd" in s:
+        return 4
+    if "lcd_tight_lcd" in s:
+        return 5
+    if "mid_clahe" in s:
+        return 6
+    if "center_contrast" in s:
+        return 7
+    if "mid_contrast" in s:
+        return 8
+    if s.endswith("_bw"):
+        return 10
+    return 20
 
 
 def _looks_like_serial_candidate(reading: Optional[float], serial: Optional[str]) -> bool:
@@ -1014,6 +1324,11 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
             ("ed_mid", (0, int(h * 0.26), w, int(h * 0.72))),
             ("ed_center", (int(w * 0.08), int(h * 0.22), int(w * 0.92), int(h * 0.78))),
             ("ed_lower_mid", (0, int(h * 0.34), w, int(h * 0.82))),
+            # Tight LCD-first windows for Mercury-like meters:
+            # display is often on the left block, with strong glare/noise around.
+            ("ed_lcd_tight", (int(w * 0.10), int(h * 0.33), int(w * 0.78), int(h * 0.66))),
+            ("ed_lcd_wide", (int(w * 0.05), int(h * 0.30), int(w * 0.84), int(h * 0.70))),
+            ("ed_lcd_digits", (int(w * 0.14), int(h * 0.38), int(w * 0.70), int(h * 0.62))),
         ]
         for base_label, (x1, y1, x2, y2) in bands:
             x1 = max(0, min(w - 1, x1))
@@ -1045,9 +1360,262 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
             )
             rgb3 = Image.fromarray(cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB))
             out.append((f"{base_label}_bw", _encode_jpeg(rgb3, quality=94)))
+
+            # LCD-dark enhancement: brighten dark screen while suppressing dust texture.
+            g3 = cv2.GaussianBlur(g2, (0, 0), 1.0)
+            g3 = cv2.addWeighted(g2, 1.45, g3, -0.45, 0)
+            g3 = cv2.normalize(g3, None, 0, 255, cv2.NORM_MINMAX)
+            rgb4 = Image.fromarray(cv2.cvtColor(g3, cv2.COLOR_GRAY2RGB))
+            rgb4 = ImageEnhance.Contrast(rgb4).enhance(1.55)
+            out.append((f"{base_label}_lcd", _encode_jpeg(rgb4, quality=94)))
+
     except Exception:
-        return out[:8]
+        return out[:14]
+    return out[:14]
+
+
+_SEGMENT_DIGIT_BY_MASK: dict[int, int] = {
+    0b1110111: 0,
+    0b0010010: 1,
+    0b1011101: 2,
+    0b1011011: 3,
+    0b0111010: 4,
+    0b1101011: 5,
+    0b1101111: 6,
+    0b1010010: 7,
+    0b1111111: 8,
+    0b1111011: 9,
+}
+def _hamming_distance_bits(a: int, b: int) -> int:
+    return bin(a ^ b).count("1")
+
+
+def _decode_7seg_digit_from_bin(bin_digit: np.ndarray) -> tuple[Optional[int], float]:
+    h, w = bin_digit.shape[:2]
+    if h < 12 or w < 6:
+        return None, 0.0
+    # Normalized 7-seg probing windows:
+    #  000
+    # 1   2
+    #  333
+    # 4   5
+    #  666
+    windows = [
+        (0.22, 0.05, 0.78, 0.18),  # top
+        (0.08, 0.18, 0.28, 0.47),  # upper-left
+        (0.72, 0.18, 0.92, 0.47),  # upper-right
+        (0.22, 0.43, 0.78, 0.58),  # middle
+        (0.08, 0.54, 0.28, 0.84),  # lower-left
+        (0.72, 0.54, 0.92, 0.84),  # lower-right
+        (0.22, 0.80, 0.78, 0.95),  # bottom
+    ]
+    vals: list[float] = []
+    bits = 0
+    for idx, (x1f, y1f, x2f, y2f) in enumerate(windows):
+        x1 = max(0, min(w - 1, int(round(w * x1f))))
+        y1 = max(0, min(h - 1, int(round(h * y1f))))
+        x2 = max(x1 + 1, min(w, int(round(w * x2f))))
+        y2 = max(y1 + 1, min(h, int(round(h * y2f))))
+        cell = bin_digit[y1:y2, x1:x2]
+        if cell.size == 0:
+            vals.append(0.0)
+            continue
+        mean_on = float(np.mean(cell > 0))
+        vals.append(mean_on)
+        if mean_on >= 0.42:
+            bits |= (1 << idx)
+    if bits in _SEGMENT_DIGIT_BY_MASK:
+        conf = min(1.0, 0.72 + 0.28 * float(sum(vals) / 7.0))
+        return _SEGMENT_DIGIT_BY_MASK[bits], conf
+    # tolerate a single missed/extra segment
+    best_digit = None
+    best_dist = 99
+    for mask, digit in _SEGMENT_DIGIT_BY_MASK.items():
+        d = _hamming_distance_bits(bits, mask)
+        if d < best_dist:
+            best_dist = d
+            best_digit = digit
+    if best_digit is not None and best_dist <= 1:
+        conf = 0.58 - 0.12 * float(best_dist)
+        return int(best_digit), max(0.35, conf)
+    return None, 0.0
+
+
+def _extract_digit_boxes_from_bin(bin_img: np.ndarray) -> list[tuple[int, int]]:
+    h, w = bin_img.shape[:2]
+    if h < 16 or w < 16:
+        return []
+    bw = (bin_img > 0).astype(np.uint8) * 255
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(bw, connectivity=8)
+    if n <= 1:
+        return []
+    min_h = max(8, int(h * 0.18))
+    min_w = max(4, int(w * 0.012))
+    comps: list[tuple[int, int]] = []
+    for i in range(1, n):
+        x = int(stats[i, cv2.CC_STAT_LEFT])
+        y = int(stats[i, cv2.CC_STAT_TOP])
+        cw = int(stats[i, cv2.CC_STAT_WIDTH])
+        ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if cw < min_w or ch < min_h:
+            continue
+        # Discard border/frame artifacts.
+        if x <= 1 or (x + cw) >= (w - 1):
+            continue
+        if y <= 1 or (y + ch) >= (h - 1):
+            continue
+        if ch > int(h * 0.93):
+            continue
+        ar = float(cw) / max(1.0, float(ch))
+        if ar < 0.06 or ar > 1.10:
+            continue
+        if area < max(12, int(cw * ch * 0.02)):
+            continue
+        comps.append((x, x + cw))
+    if not comps:
+        return []
+    comps = sorted(comps, key=lambda t: t[0])
+    merged: list[list[int]] = []
+    gap_thr = max(2, int(w * 0.010))
+    for a, b in comps:
+        if not merged or a - merged[-1][1] > gap_thr:
+            merged.append([a, b])
+        else:
+            # Merge tiny near fragments only.
+            if (b - a) <= max(6, int(w * 0.03)):
+                merged[-1][1] = max(merged[-1][1], b)
+            else:
+                merged.append([a, b])
+    out = [(a, b) for a, b in merged if (b - a) >= min_w]
+    if len(out) < 3:
+        # projection fallback inside non-border area
+        proj = np.sum((bw > 0).astype(np.uint8), axis=0).astype(np.float32)
+        if float(np.max(proj)) > 0:
+            thr = max(1.0, float(np.max(proj)) * 0.05)
+            runs: list[tuple[int, int]] = []
+            s = -1
+            for i, v in enumerate(proj):
+                if v >= thr and s < 0:
+                    s = i
+                elif v < thr and s >= 0:
+                    if (i - s) >= min_w and s > 1 and i < (w - 1):
+                        runs.append((s, i))
+                    s = -1
+            if s >= 0 and (w - s) >= min_w and s > 1:
+                runs.append((s, w - 1))
+            if len(runs) >= 3:
+                out = runs
     return out[:8]
+
+
+def _decode_7seg_reading(gray: np.ndarray) -> tuple[Optional[float], float]:
+    if gray.size == 0:
+        return None, 0.0
+    # deterministic enhancement
+    g = cv2.GaussianBlur(gray, (3, 3), 0)
+    g = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8)).apply(g)
+    b1 = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 6)
+    b2 = cv2.adaptiveThreshold(g, 255, cv2.ADAPTIVE_THRESH_MEAN_C, cv2.THRESH_BINARY, 25, 4)
+    candidates = [b1, cv2.bitwise_not(b1), b2, cv2.bitwise_not(b2)]
+
+    best_read: Optional[float] = None
+    best_score = -1.0
+    for b in candidates:
+        fill = float(np.mean(b > 0))
+        if fill < 0.02 or fill > 0.62:
+            continue
+        boxes = _extract_digit_boxes_from_bin(b)
+        if len(boxes) < 3 or len(boxes) > 6:
+            continue
+        digits: list[str] = []
+        confs: list[float] = []
+        widths: list[int] = []
+        for x1, x2 in boxes:
+            roi = b[:, x1:x2]
+            d, dc = _decode_7seg_digit_from_bin(roi)
+            if d is None:
+                continue
+            digits.append(str(d))
+            confs.append(dc)
+            widths.append(max(1, x2 - x1))
+        if len(digits) < 3:
+            continue
+        s = "".join(digits)
+        if len(s) < 3 or len(s) > 6:
+            continue
+        # Reject degenerate runs (typical false positive on dusty LCD background).
+        if len(s) >= 3 and len(set(s)) <= 1:
+            continue
+        # Reject unlikely width distortion.
+        ww = float(np.mean(widths)) if widths else 0.0
+        if ww <= 0.0:
+            continue
+        if max(widths) > ww * 2.8:
+            continue
+        # integer-first policy for electric: decimals often unstable on these LCD shots
+        try:
+            reading = float(int(s))
+        except Exception:
+            continue
+        if reading < 0 or reading > 30000:
+            continue
+        mean_conf = float(sum(confs) / max(1, len(confs)))
+        uniq_bonus = 0.04 * min(4, len(set(s)))
+        len_bonus = 0.03 * min(5, len(s))
+        score = mean_conf + uniq_bonus + len_bonus
+        if len(s) >= 4 and reading >= 10000:
+            score -= 0.32
+        if reading >= 20000:
+            score -= 0.30
+        if score > best_score:
+            best_score = score
+            best_read = reading
+    if best_read is None:
+        return None, 0.0
+    return best_read, max(0.35, min(0.72, best_score))
+
+
+def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
+    if not OCR_ELECTRIC_DETERMINISTIC:
+        return []
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return []
+    w, h = img.size
+    roi_specs = [
+        ("det_lcd_digits", (0.14, 0.38, 0.70, 0.62)),
+        ("det_lcd_tight", (0.10, 0.33, 0.78, 0.66)),
+        ("det_lcd_wide", (0.05, 0.30, 0.84, 0.70)),
+        ("det_center", (0.08, 0.22, 0.92, 0.78)),
+        ("det_mid", (0.00, 0.26, 1.00, 0.72)),
+    ]
+    out: list[dict] = []
+    for label, (x1f, y1f, x2f, y2f) in roi_specs[:OCR_ELECTRIC_DET_MAX_VARIANTS]:
+        x1 = max(0, min(w - 1, int(round(w * x1f))))
+        y1 = max(0, min(h - 1, int(round(h * y1f))))
+        x2 = max(x1 + 1, min(w, int(round(w * x2f))))
+        y2 = max(y1 + 1, min(h, int(round(h * y2f))))
+        crop = img.crop((x1, y1, x2, y2))
+        arr = np.array(crop)
+        gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+        reading, conf = _decode_7seg_reading(gray)
+        if reading is None:
+            continue
+        out.append(
+            {
+                "type": "Электро",
+                "reading": float(reading),
+                "serial": None,
+                "confidence": float(conf),
+                "notes": "deterministic_7seg",
+                "note2": "",
+                "variant": f"electric_{label}",
+                "provider": "det-electric:7seg",
+            }
+        )
+    return out
 
 
 def _clamp_box(x1: int, y1: int, x2: int, y2: int, w: int, h: int) -> tuple[int, int, int, int]:
@@ -3700,7 +4268,61 @@ async def recognize(
     img = await file.read()
     if not img:
         raise HTTPException(status_code=400, detail="empty_file")
-    img_sha256 = hashlib.sha256(img).hexdigest()
+
+    if not OCR_OPENAI_ENABLED:
+        det_best = None
+        if OCR_ELECTRIC_DETERMINISTIC:
+            try:
+                det_rows = _electric_deterministic_candidates(img)
+                if det_rows:
+                    det_best = max(det_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            except Exception:
+                det_best = None
+        if det_best is not None:
+            return {
+                "type": "Электро",
+                "reading": _normalize_reading(det_best.get("reading")),
+                "serial": None,
+                "confidence": _clamp_confidence(det_best.get("confidence", 0.0)),
+                "notes": "openai_disabled; deterministic_fallback",
+                "trace_id": req_trace_id,
+            }
+        return {
+            "type": "unknown",
+            "reading": None,
+            "serial": None,
+            "confidence": 0.0,
+            "notes": "openai_disabled",
+            "trace_id": req_trace_id,
+        }
+
+    # Budget guard: when provider quota is exhausted, skip expensive OpenAI pipeline.
+    if _openai_is_blocked_now():
+        det_best = None
+        if OCR_ELECTRIC_DETERMINISTIC:
+            try:
+                det_rows = _electric_deterministic_candidates(img)
+                if det_rows:
+                    det_best = max(det_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            except Exception:
+                det_best = None
+        if det_best is not None:
+            return {
+                "type": "Электро",
+                "reading": _normalize_reading(det_best.get("reading")),
+                "serial": None,
+                "confidence": _clamp_confidence(det_best.get("confidence", 0.0)),
+                "notes": "openai_quota_cooldown; deterministic_fallback",
+                "trace_id": req_trace_id,
+            }
+        return {
+            "type": "unknown",
+            "reading": None,
+            "serial": None,
+            "confidence": 0.0,
+            "notes": "openai_quota_cooldown",
+            "trace_id": req_trace_id,
+        }
 
     mime = _guess_mime(file.filename, file.content_type)
     logger.info(
@@ -3711,16 +4333,6 @@ async def recognize(
         mime,
         len(img),
     )
-    if OCR_ELECTRIC_TRAINING_LOOKUP and img_sha256 in ELECTRIC_TRAINING_READING_BY_SHA256:
-        forced = ELECTRIC_TRAINING_READING_BY_SHA256.get(img_sha256)
-        return {
-            "type": ("Электро" if forced is not None else "unknown"),
-            "reading": (None if forced is None else float(forced)),
-            "serial": None,
-            "confidence": (0.98 if forced is not None else 0.0),
-            "notes": "electric_training_lookup",
-            "trace_id": req_trace_id,
-        }
     variants = _make_variants(img)
     _mark_stage("variants")
     variant_image_map: dict[str, bytes] = {}
@@ -3765,7 +4377,7 @@ async def recognize(
                         "Если это электросчётчик, верни type='Электро' и reading. "
                         "Игнорируй серийный номер, напряжение и служебные цифры."
                     ),
-                    max_call_timeout_sec=7.5,
+                    max_call_timeout_sec=11.0,
                 )
             except Exception:
                 continue
@@ -3802,6 +4414,13 @@ async def recognize(
                 }
             )
 
+        # Deterministic electric pass (7-segment CV decoder) for stability on dark LCD shots.
+        try:
+            det_candidates = _electric_deterministic_candidates(img)
+            electric_candidates.extend(det_candidates)
+        except Exception:
+            pass
+
         electric_candidates = _expand_electric_scaled_candidates(electric_candidates)
         electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
         if electric_best is None and _time_budget_left(odo_reserve_sec):
@@ -3822,7 +4441,7 @@ async def recognize(
                             "Если число не видно, верни reading=null."
                         ),
                         detail="high",
-                        max_call_timeout_sec=7.5,
+                        max_call_timeout_sec=11.0,
                     )
                 except Exception:
                     continue
@@ -3860,7 +4479,89 @@ async def recognize(
             electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
         if electric_best is None:
             electric_best, electric_agree = _pick_electric_bootstrap_relaxed(electric_candidates)
+        if OCR_ELECTRIC_HARD_RECOVERY and _electric_needs_hard_recovery(electric_best, electric_agree) and _time_budget_left(odo_reserve_sec):
+            hard_candidates: list[dict] = []
+            disp_variants = _make_electric_display_variants(img)
+            disp_variants = sorted(disp_variants, key=lambda t: _electric_variant_rank(str(t[0])))
+            for label, b in disp_variants[:8]:
+                if not _time_budget_left(odo_reserve_sec):
+                    break
+                if "mid_lcd" in label:
+                    continue
+                if ("center_clahe" in label or "lcd_tight_clahe" in label):
+                    reps = 2
+                else:
+                    reps = 1
+                for _ in range(reps):
+                    try:
+                        er3 = _vision(
+                            b,
+                            mime="image/jpeg",
+                            model=OCR_MODEL_PRIMARY,
+                            system_prompt=ELECTRIC_LCD_PROMPT,
+                            user_text=(
+                                "Это сложный кадр электросчетчика. "
+                                "Найди только число на LCD дисплее. "
+                                "Не используй серийник и служебные числа."
+                            ),
+                            detail="high",
+                            max_call_timeout_sec=11.0,
+                        )
+                    except Exception:
+                        continue
+                    t3 = _sanitize_type(er3.get("type", "unknown"))
+                    notes3 = str(er3.get("notes", "") or "")
+                    if t3 == "unknown":
+                        guess3 = _classify_meter_type_from_text(f"{er3.get('type','')} {notes3}")
+                        if guess3 == "Электро":
+                            t3 = "Электро"
+                    reading3 = _normalize_reading(er3.get("reading", None))
+                    conf3 = _clamp_confidence(er3.get("confidence", 0.0))
+                    reading3, conf3, note3b = _plausibility_filter(t3, reading3, conf3)
+                    if t3 != "Электро":
+                        if (reading3 is not None) and (conf3 >= 0.56):
+                            t3 = "Электро"
+                        else:
+                            continue
+                    hard_candidates.append(
+                        {
+                            "type": t3,
+                            "reading": reading3,
+                            "serial": None,
+                            "confidence": conf3,
+                            "notes": notes3,
+                            "note2": note3b,
+                            "variant": f"electric_hard_{label}",
+                            "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:hard",
+                        }
+                    )
+            merged_hard = _expand_electric_scaled_candidates(electric_candidates + hard_candidates)
+            hard_best, hard_agree = _pick_electric_hard_consensus(merged_hard)
+            if hard_best is not None:
+                electric_candidates = merged_hard
+                electric_best = hard_best
+                electric_agree = max(int(electric_agree), int(hard_agree))
         if electric_best is not None:
+            e_read = _normalize_reading(electric_best.get("reading"))
+            if e_read is not None and e_read >= 1000.0:
+                # Prefer decimal candidate when best integer likely has a lost decimal point (x10 drift).
+                target = float(e_read) / 10.0
+                dec_pool: list[dict] = []
+                for c in electric_candidates:
+                    rr = _normalize_reading(c.get("reading"))
+                    if rr is None:
+                        continue
+                    if abs(float(rr) - target) > 2.0:
+                        continue
+                    if abs(float(rr) - round(float(rr))) <= 1e-6:
+                        continue
+                    if _clamp_confidence(c.get("confidence", 0.0)) < 0.82:
+                        continue
+                    dec_pool.append(c)
+                if dec_pool:
+                    dec_best = max(dec_pool, key=lambda c: (_clamp_confidence(c.get("confidence", 0.0)), _electric_hint_score(c)))
+                    electric_best = dec_best
+
             e_label = str(electric_best.get("variant") or "electric")
             e_conf = _clamp_confidence(
                 float(electric_best.get("confidence") or 0.0) + min(0.12, 0.04 * float(electric_agree))
@@ -4390,7 +5091,14 @@ async def recognize(
             except Exception:
                 continue
     if not candidates:
-        raise HTTPException(status_code=500, detail="openai_empty_response")
+        return {
+            "type": "unknown",
+            "reading": None,
+            "serial": None,
+            "confidence": 0.0,
+            "notes": "openai_empty_response",
+            "trace_id": req_trace_id,
+        }
     _mark_stage("primary_candidates")
 
     # propagate best-known serial to candidates that returned none/"unknown"
