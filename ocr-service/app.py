@@ -48,6 +48,7 @@ OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() 
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_DRUM_ENABLED = os.getenv("OCR_ELECTRIC_DRUM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TEMPLATE_MATCH = os.getenv("OCR_ELECTRIC_TEMPLATE_MATCH", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TEMPLATE_DB = os.getenv("OCR_ELECTRIC_TEMPLATE_DB", "/tmp/electric_templates.json").strip()
 try:
@@ -1738,12 +1739,169 @@ def _electric_template_candidates(img_bytes: bytes) -> list[dict]:
     ]
 
 
+_DRUM_TEMPLATE_CACHE: Optional[dict[int, list[np.ndarray]]] = None
+
+
+def _build_drum_digit_templates() -> dict[int, list[np.ndarray]]:
+    global _DRUM_TEMPLATE_CACHE
+    if _DRUM_TEMPLATE_CACHE is not None:
+        return _DRUM_TEMPLATE_CACHE
+    templates: dict[int, list[np.ndarray]] = {d: [] for d in range(10)}
+    fonts = (
+        cv2.FONT_HERSHEY_SIMPLEX,
+        cv2.FONT_HERSHEY_DUPLEX,
+        cv2.FONT_HERSHEY_TRIPLEX,
+    )
+    w, h = 44, 72
+    for d in range(10):
+        txt = str(d)
+        for font in fonts:
+            for scale in (1.4, 1.6, 1.8, 2.0):
+                for thick in (2, 3, 4):
+                    img = np.zeros((h, w), dtype=np.uint8)
+                    (tw, th), _ = cv2.getTextSize(txt, font, scale, thick)
+                    x = max(0, (w - tw) // 2)
+                    y = max(th + 1, (h + th) // 2)
+                    cv2.putText(img, txt, (x, y), font, scale, 255, thick, cv2.LINE_AA)
+                    b = cv2.threshold(img, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+                    templates[d].append(b)
+                    templates[d].append(255 - b)
+    _DRUM_TEMPLATE_CACHE = templates
+    return templates
+
+
+def _drum_recognize_slot(slot_bgr: np.ndarray, templates: dict[int, list[np.ndarray]]) -> tuple[Optional[int], float, float]:
+    if slot_bgr.size == 0:
+        return None, 0.0, 0.0
+    g = cv2.cvtColor(slot_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.GaussianBlur(g, (3, 3), 0)
+    g = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(4, 4)).apply(g)
+    b = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+    probes = (
+        cv2.resize(b, (44, 72), interpolation=cv2.INTER_CUBIC),
+        cv2.resize(255 - b, (44, 72), interpolation=cv2.INTER_CUBIC),
+    )
+    best = (-2.0, None)
+    second = (-2.0, None)
+    for p in probes:
+        for digit, arr in templates.items():
+            for t in arr:
+                score = float(cv2.matchTemplate(p, t, cv2.TM_CCOEFF_NORMED)[0, 0])
+                if score > best[0]:
+                    second = best
+                    best = (score, digit)
+                elif score > second[0]:
+                    second = (score, digit)
+    if best[1] is None:
+        return None, 0.0, 0.0
+    # Map matcher score to practical confidence range.
+    conf = max(0.0, min(1.0, (best[0] - 0.12) / 0.55))
+    margin = max(0.0, best[0] - max(-1.0, second[0]))
+    return int(best[1]), float(conf), float(margin)
+
+
+def _electric_drum_candidates(img_bytes: bytes) -> list[dict]:
+    if not OCR_ELECTRIC_DRUM_ENABLED:
+        return []
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return []
+    if img is None:
+        return []
+    h, w = img.shape[:2]
+    if h < 120 or w < 120:
+        return []
+
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    red_mask = cv2.inRange(hsv, (0, 70, 55), (15, 255, 255)) | cv2.inRange(hsv, (160, 70, 55), (179, 255, 255))
+    red_mask = cv2.morphologyEx(red_mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8), iterations=1)
+    red_mask = cv2.medianBlur(red_mask, 5)
+    cnts, _ = cv2.findContours(red_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return []
+
+    templates = _build_drum_digit_templates()
+    out: list[dict] = []
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        area = float(bw * bh)
+        if area < (w * h * 0.0018) or area > (w * h * 0.08):
+            continue
+        cx = (x + bw * 0.5) / float(w)
+        cy = (y + bh * 0.5) / float(h)
+        ar = bw / float(max(1, bh))
+        # Red decimal wheel on drum meters is usually near right side of counter window.
+        if not (0.48 <= cx <= 0.82 and 0.20 <= cy <= 0.58 and 0.35 <= ar <= 1.45):
+            continue
+
+        slot_w = max(10, int(round(bw * 0.95)))
+        right = x + bw
+        left = max(0, right - slot_w * 6)
+        y1 = max(0, y - int(round(bh * 0.45)))
+        y2 = min(h, y + int(round(bh * 1.20)))
+        band = img[y1:y2, left:right]
+        if band.size == 0:
+            continue
+        band = cv2.resize(band, (slot_w * 6 * 3, max(20, (y2 - y1) * 3)), interpolation=cv2.INTER_CUBIC)
+        sw = max(8, band.shape[1] // 6)
+
+        digits: list[str] = []
+        confs: list[float] = []
+        margins: list[float] = []
+        for i in range(6):
+            slot = band[:, i * sw : (i + 1) * sw]
+            d, dc, dm = _drum_recognize_slot(slot, templates)
+            if d is None:
+                digits = []
+                break
+            digits.append(str(d))
+            confs.append(dc)
+            margins.append(dm)
+        if len(digits) != 6:
+            continue
+
+        int_part = "".join(digits[:5]).lstrip("0") or "0"
+        frac_digit = digits[5]
+        try:
+            reading = float(f"{int(int_part)}.{int(frac_digit)}")
+        except Exception:
+            continue
+        if reading < 0 or reading > 30000:
+            continue
+
+        mean_conf = float(sum(confs) / len(confs))
+        mean_margin = float(sum(margins) / len(margins))
+        # Guard against false positives on LCD shots with random red LEDs.
+        if mean_conf < 0.30 or mean_margin < 0.008:
+            continue
+        total_conf = _clamp_confidence(0.55 + 0.35 * mean_conf + 0.10 * min(1.0, mean_margin / 0.05))
+        out.append(
+            {
+                "type": "Электро",
+                "reading": reading,
+                "serial": None,
+                "confidence": float(total_conf),
+                "notes": "deterministic_drum",
+                "note2": "",
+                "variant": "electric_drum_red_anchor",
+                "provider": "det-electric:drum",
+            }
+        )
+    return out
+
+
 def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
     if not OCR_ELECTRIC_DETERMINISTIC and not OCR_ELECTRIC_TEMPLATE_MATCH:
         return []
     out: list[dict] = []
     try:
         out.extend(_electric_template_candidates(img_bytes))
+    except Exception:
+        pass
+    try:
+        out.extend(_electric_drum_candidates(img_bytes))
     except Exception:
         pass
     if not OCR_ELECTRIC_DETERMINISTIC:
@@ -1760,6 +1918,7 @@ def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
         ("det_center", (0.08, 0.22, 0.92, 0.78)),
         ("det_mid", (0.00, 0.26, 1.00, 0.72)),
     ]
+    seg_rows: list[dict] = []
     for label, (x1f, y1f, x2f, y2f) in roi_specs[:OCR_ELECTRIC_DET_MAX_VARIANTS]:
         x1 = max(0, min(w - 1, int(round(w * x1f))))
         y1 = max(0, min(h - 1, int(round(h * y1f))))
@@ -1772,7 +1931,7 @@ def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
             reading, conf = _decode_7seg_reading(gsrc)
             if reading is None:
                 continue
-            out.append(
+            seg_rows.append(
                 {
                     "type": "Электро",
                     "reading": float(reading),
@@ -1784,6 +1943,31 @@ def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
                     "provider": "det-electric:7seg",
                 }
             )
+    # Guard against random false-positive reads on noisy LCD photos:
+    # require repeated agreement across ROIs; otherwise confidence is downgraded.
+    if seg_rows:
+        freq: dict[int, int] = {}
+        for r in seg_rows:
+            rr = _normalize_reading(r.get("reading"))
+            if rr is None:
+                continue
+            key = int(round(float(rr)))
+            freq[key] = freq.get(key, 0) + 1
+        for r in seg_rows:
+            rr = _normalize_reading(r.get("reading"))
+            if rr is None:
+                continue
+            key = int(round(float(rr)))
+            agree = int(freq.get(key, 0))
+            c = float(r.get("confidence") or 0.0)
+            if agree >= 2:
+                r["confidence"] = _clamp_confidence(max(c, 0.66))
+                r["notes"] = (str(r.get("notes") or "") + "; 7seg_agree").strip("; ").strip()
+            else:
+                # Single-shot values are often unstable with reflections/stickers.
+                r["confidence"] = _clamp_confidence(min(c, 0.34))
+                r["notes"] = (str(r.get("notes") or "") + "; 7seg_low_agree").strip("; ").strip()
+        out.extend(seg_rows)
     return out
 
 
@@ -4447,7 +4631,7 @@ async def recognize(
                     det_best = max(det_rows, key=lambda x: float(x.get("confidence") or 0.0))
             except Exception:
                 det_best = None
-        if det_best is not None:
+        if det_best is not None and float(det_best.get("confidence") or 0.0) >= 0.5:
             return {
                 "type": "Электро",
                 "reading": _normalize_reading(det_best.get("reading")),
@@ -4475,7 +4659,7 @@ async def recognize(
                     det_best = max(det_rows, key=lambda x: float(x.get("confidence") or 0.0))
             except Exception:
                 det_best = None
-        if det_best is not None:
+        if det_best is not None and float(det_best.get("confidence") or 0.0) >= 0.5:
             return {
                 "type": "Электро",
                 "reading": _normalize_reading(det_best.get("reading")),
