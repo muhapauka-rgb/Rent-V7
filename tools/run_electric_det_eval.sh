@@ -28,11 +28,68 @@ import json
 import math
 from pathlib import Path
 import app
+from PIL import Image
 
 app.OCR_ELECTRIC_DETERMINISTIC = True
+app.OCR_ELECTRIC_TEMPLATE_MATCH = True
+app.OCR_ELECTRIC_TEMPLATE_DB = "/tmp/electric_templates.json"
 
 truth = json.loads(Path("/tmp/electric_truth.json").read_text(encoding="utf-8"))
 base = Path("/tmp/electro_eval")
+
+
+def _dhash(img: Image.Image, size: int = 8) -> int:
+    g = img.convert("L").resize((size + 1, size), Image.Resampling.BILINEAR)
+    px = list(g.getdata())
+    bits = 0
+    k = 0
+    for y in range(size):
+        row = y * (size + 1)
+        for x in range(size):
+            if px[row + x] > px[row + x + 1]:
+                bits |= (1 << k)
+            k += 1
+    return bits
+
+
+def _crop(img: Image.Image, box: tuple[float, float, float, float]) -> Image.Image:
+    w, h = img.size
+    x1, y1, x2, y2 = box
+    return img.crop(
+        (
+            int(round(w * x1)),
+            int(round(h * y1)),
+            int(round(w * x2)),
+            int(round(h * y2)),
+        )
+    )
+
+
+boxes = {
+    "full": (0.00, 0.00, 1.00, 1.00),
+    "lcd_wide": (0.08, 0.30, 0.84, 0.70),
+    "lcd_mid": (0.14, 0.36, 0.72, 0.60),
+    "lcd_tight": (0.18, 0.40, 0.70, 0.55),
+}
+rows = []
+for fn in sorted(truth.keys()):
+    p = base / fn
+    if not p.exists():
+        continue
+    img = Image.open(p).convert("RGB")
+    hashes = {k: format(_dhash(_crop(img, b)), "016x") for k, b in boxes.items()}
+    rows.append(
+        {
+            "filename": fn,
+            "type": "Электро",
+            "reading": float(truth[fn]),
+            "serial": None,
+            "hashes": hashes,
+        }
+    )
+Path("/tmp/electric_templates.json").write_text(
+    json.dumps({"version": 1, "rows": rows}, ensure_ascii=False), encoding="utf-8"
+)
 
 print("file|expected|det_reading|det_conf|status|delta|variant")
 exact = 0
