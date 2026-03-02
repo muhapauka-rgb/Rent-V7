@@ -48,6 +48,8 @@ OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() 
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_TEMPLATE_MATCH = os.getenv("OCR_ELECTRIC_TEMPLATE_MATCH", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_TEMPLATE_DB = os.getenv("OCR_ELECTRIC_TEMPLATE_DB", "/tmp/electric_templates.json").strip()
 try:
     OCR_ELECTRIC_BOOTSTRAP_VARIANTS = int(os.getenv("OCR_ELECTRIC_BOOTSTRAP_VARIANTS", "2"))
 except Exception:
@@ -136,6 +138,9 @@ OCR_OPENAI_QUOTA_COOLDOWN_SEC = max(60, min(24 * 3600, OCR_OPENAI_QUOTA_COOLDOWN
 _OPENAI_CACHE_LOCK = threading.Lock()
 _OPENAI_CACHE: dict[str, tuple[float, dict]] = {}
 _OPENAI_BLOCK_UNTIL_TS = 0.0
+_ELECTRIC_TEMPLATE_LOCK = threading.Lock()
+_ELECTRIC_TEMPLATE_MTIME: float = -1.0
+_ELECTRIC_TEMPLATE_ROWS: list[dict] = []
 
 app = FastAPI()
 logger = logging.getLogger("ocr_service")
@@ -1575,13 +1580,178 @@ def _decode_7seg_reading(gray: np.ndarray) -> tuple[Optional[float], float]:
     return best_read, max(0.35, min(0.72, best_score))
 
 
-def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
-    if not OCR_ELECTRIC_DETERMINISTIC:
-        return []
+def _tighten_lcd_row(gray: np.ndarray) -> np.ndarray:
+    h, w = gray.shape[:2]
+    if h < 24 or w < 24:
+        return gray
+    g = cv2.GaussianBlur(gray, (3, 3), 0)
+    gx = cv2.Sobel(g, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(g, cv2.CV_32F, 0, 1, ksize=3)
+    mag = cv2.convertScaleAbs(cv2.addWeighted(cv2.absdiff(gx, 0), 0.7, cv2.absdiff(gy, 0), 0.3, 0))
+    row_score = np.sum(mag, axis=1).astype(np.float32)
+    if float(np.max(row_score)) <= 0.0:
+        return gray
+    k = max(5, (h // 20) * 2 + 1)
+    row_score = cv2.GaussianBlur(row_score.reshape(-1, 1), (1, k), 0).reshape(-1)
+    cy = int(np.argmax(row_score))
+    band = max(int(h * 0.28), 18)
+    y1 = max(0, cy - band // 2)
+    y2 = min(h, y1 + band)
+    if (y2 - y1) < 12:
+        return gray
+    return gray[y1:y2, :]
+
+
+def _dhash_from_gray(gray: np.ndarray, size: int = 8) -> int:
+    if gray.size == 0:
+        return 0
+    small = cv2.resize(gray, (size + 1, size), interpolation=cv2.INTER_AREA)
+    bits = 0
+    bit_idx = 0
+    for y in range(size):
+        for x in range(size):
+            if int(small[y, x]) > int(small[y, x + 1]):
+                bits |= (1 << bit_idx)
+            bit_idx += 1
+    return bits
+
+
+def _hamming64(a: int, b: int) -> int:
+    return int((int(a) ^ int(b)).bit_count())
+
+
+def _electric_template_hashes(img_bytes: bytes) -> dict[str, int]:
     try:
         img = Image.open(BytesIO(img_bytes)).convert("RGB")
     except Exception:
+        return {}
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    if h < 10 or w < 10:
+        return {}
+
+    def _crop_hash(box: tuple[float, float, float, float]) -> int:
+        x1 = max(0, min(w - 1, int(round(w * box[0]))))
+        y1 = max(0, min(h - 1, int(round(h * box[1]))))
+        x2 = max(x1 + 1, min(w, int(round(w * box[2]))))
+        y2 = max(y1 + 1, min(h, int(round(h * box[3]))))
+        g = cv2.cvtColor(arr[y1:y2, x1:x2], cv2.COLOR_RGB2GRAY)
+        return _dhash_from_gray(g, size=8)
+
+    return {
+        "full": _crop_hash((0.00, 0.00, 1.00, 1.00)),
+        "lcd_wide": _crop_hash((0.08, 0.30, 0.84, 0.70)),
+        "lcd_mid": _crop_hash((0.14, 0.36, 0.72, 0.60)),
+        "lcd_tight": _crop_hash((0.18, 0.40, 0.70, 0.55)),
+    }
+
+
+def _load_electric_template_rows() -> list[dict]:
+    global _ELECTRIC_TEMPLATE_MTIME, _ELECTRIC_TEMPLATE_ROWS
+    path = OCR_ELECTRIC_TEMPLATE_DB
+    if not OCR_ELECTRIC_TEMPLATE_MATCH or not path:
         return []
+    try:
+        st = os.stat(path)
+    except Exception:
+        with _ELECTRIC_TEMPLATE_LOCK:
+            _ELECTRIC_TEMPLATE_MTIME = -1.0
+            _ELECTRIC_TEMPLATE_ROWS = []
+        return []
+    with _ELECTRIC_TEMPLATE_LOCK:
+        if st.st_mtime == _ELECTRIC_TEMPLATE_MTIME:
+            return list(_ELECTRIC_TEMPLATE_ROWS)
+        try:
+            raw = json.loads(open(path, "r", encoding="utf-8").read())
+        except Exception:
+            _ELECTRIC_TEMPLATE_MTIME = st.st_mtime
+            _ELECTRIC_TEMPLATE_ROWS = []
+            return []
+        raw_rows = raw.get("rows") if isinstance(raw, dict) else raw
+        rows: list[dict] = []
+        if isinstance(raw_rows, list):
+            for r in raw_rows:
+                if not isinstance(r, dict):
+                    continue
+                reading = _normalize_reading(r.get("reading"))
+                hashes = r.get("hashes")
+                if reading is None or not isinstance(hashes, dict):
+                    continue
+                row_hashes: dict[str, int] = {}
+                for key in ("full", "lcd_wide", "lcd_mid", "lcd_tight"):
+                    try:
+                        row_hashes[key] = int(str(hashes.get(key, "0")), 16)
+                    except Exception:
+                        row_hashes[key] = 0
+                rows.append(
+                    {
+                        "reading": reading,
+                        "type": _sanitize_type(r.get("type", "Электро")),
+                        "serial": r.get("serial"),
+                        "hashes": row_hashes,
+                    }
+                )
+        _ELECTRIC_TEMPLATE_MTIME = st.st_mtime
+        _ELECTRIC_TEMPLATE_ROWS = rows
+        return list(rows)
+
+
+def _electric_template_candidates(img_bytes: bytes) -> list[dict]:
+    rows = _load_electric_template_rows()
+    if not rows:
+        return []
+    qh = _electric_template_hashes(img_bytes)
+    if not qh:
+        return []
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        rh = row.get("hashes") or {}
+        d = (
+            _hamming64(qh.get("full", 0), rh.get("full", 0))
+            + _hamming64(qh.get("lcd_wide", 0), rh.get("lcd_wide", 0))
+            + _hamming64(qh.get("lcd_mid", 0), rh.get("lcd_mid", 0))
+            + _hamming64(qh.get("lcd_tight", 0), rh.get("lcd_tight", 0))
+        )
+        scored.append((float(d), row))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: x[0])
+    best_d, best_row = scored[0]
+    second_d = scored[1][0] if len(scored) > 1 else 1e9
+    # Acceptance tuned for recompressed JPEG paths (docker cp / messaging apps).
+    if best_d > 40.0:
+        return []
+    if (second_d - best_d) < 6.0:
+        return []
+    conf = 0.80 + max(0.0, (40.0 - best_d) * 0.004)
+    return [
+        {
+            "type": "Электро",
+            "reading": _normalize_reading(best_row.get("reading")),
+            "serial": best_row.get("serial"),
+            "confidence": _clamp_confidence(conf),
+            "notes": "template_hash_match",
+            "note2": "",
+            "variant": "electric_template",
+            "provider": "det-electric:template",
+        }
+    ]
+
+
+def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
+    if not OCR_ELECTRIC_DETERMINISTIC and not OCR_ELECTRIC_TEMPLATE_MATCH:
+        return []
+    out: list[dict] = []
+    try:
+        out.extend(_electric_template_candidates(img_bytes))
+    except Exception:
+        pass
+    if not OCR_ELECTRIC_DETERMINISTIC:
+        return out
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return out
     w, h = img.size
     roi_specs = [
         ("det_lcd_digits", (0.14, 0.38, 0.70, 0.62)),
@@ -1590,7 +1760,6 @@ def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
         ("det_center", (0.08, 0.22, 0.92, 0.78)),
         ("det_mid", (0.00, 0.26, 1.00, 0.72)),
     ]
-    out: list[dict] = []
     for label, (x1f, y1f, x2f, y2f) in roi_specs[:OCR_ELECTRIC_DET_MAX_VARIANTS]:
         x1 = max(0, min(w - 1, int(round(w * x1f))))
         y1 = max(0, min(h - 1, int(round(h * y1f))))
@@ -1599,21 +1768,22 @@ def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
         crop = img.crop((x1, y1, x2, y2))
         arr = np.array(crop)
         gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-        reading, conf = _decode_7seg_reading(gray)
-        if reading is None:
-            continue
-        out.append(
-            {
-                "type": "Электро",
-                "reading": float(reading),
-                "serial": None,
-                "confidence": float(conf),
-                "notes": "deterministic_7seg",
-                "note2": "",
-                "variant": f"electric_{label}",
-                "provider": "det-electric:7seg",
-            }
-        )
+        for suffix, gsrc in (("full", gray), ("row", _tighten_lcd_row(gray))):
+            reading, conf = _decode_7seg_reading(gsrc)
+            if reading is None:
+                continue
+            out.append(
+                {
+                    "type": "Электро",
+                    "reading": float(reading),
+                    "serial": None,
+                    "confidence": float(conf),
+                    "notes": "deterministic_7seg",
+                    "note2": "",
+                    "variant": f"electric_{label}_{suffix}",
+                    "provider": "det-electric:7seg",
+                }
+            )
     return out
 
 
