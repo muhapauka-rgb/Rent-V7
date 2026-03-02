@@ -1,0 +1,163 @@
+{
+  "version": 1,
+  "hash": "dhash64",
+  "count": 13,
+  "rows": [
+    {
+      "filename": "photo_2026-03-01 01.33.20.jpeg",
+      "type": "Электро",
+      "reading": 5536.0,
+      "serial": null,
+      "hashes": {
+        "full": "fd5fa1381c96d381",
+        "lcd_wide": "4040c8b03014070e",
+        "lcd_mid": "dc89c8f070241515",
+        "lcd_tight": "8888e47070252535"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.33.22.jpeg",
+      "type": "Электро",
+      "reading": 2662.0,
+      "serial": null,
+      "hashes": {
+        "full": "fd5fa0381c86d1e6",
+        "lcd_wide": "c0c8c8703005150f",
+        "lcd_mid": "9f08e8706d251525",
+        "lcd_tight": "84ec607025252416"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.33.58.jpeg",
+      "type": "Электро",
+      "reading": 7979.88,
+      "serial": null,
+      "hashes": {
+        "full": "5d4f73c9c1e7878f",
+        "lcd_wide": "f1fc96198684d4ef",
+        "lcd_mid": "8631180a0604a436",
+        "lcd_tight": "18182d07070701e5"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.34.12.jpeg",
+      "type": "Электро",
+      "reading": 5343.0,
+      "serial": null,
+      "hashes": {
+        "full": "4d6779c3e3a787e7",
+        "lcd_wide": "ae888a02d0da6767",
+        "lcd_mid": "090703813692f9a7",
+        "lcd_tight": "030181e43613c8f8"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.34.15.jpeg",
+      "type": "Электро",
+      "reading": 5343.0,
+      "serial": null,
+      "hashes": {
+        "full": "4d735d41f3c7c7d3",
+        "lcd_wide": "a20803c0caf76787",
+        "lcd_mid": "030381149bf9e7e3",
+        "lcd_tight": "01c0301b09e8fca7"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.34.20.jpeg",
+      "type": "Электро",
+      "reading": 2581.0,
+      "serial": null,
+      "hashes": {
+        "full": "4d7349c1f3c7c793",
+        "lcd_wide": "aa080240c8f7670f",
+        "lcd_mid": "0303e116c8ffa7c3",
+        "lcd_tight": "81e41213c8f8bfa7"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.34.27.jpeg",
+      "type": "Электро",
+      "reading": 226.5,
+      "serial": null,
+      "hashes": {
+        "full": "4f73494177c7c793",
+        "lcd_wide": "88080250e8e72797",
+        "lcd_mid": "03815492f8e7e347",
+        "lcd_tight": "e4101b89f8fda7e7"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.34.31.jpeg",
+      "type": "Электро",
+      "reading": 7925.0,
+      "serial": null,
+      "hashes": {
+        "full": "4d7349c1f3c7c7d3",
+        "lcd_wide": "ab0803c0c8f76787",
+        "lcd_mid": "0301e412c8ffe747",
+        "lcd_tight": "84f01a1bc8fc97a7"
+      }
+    },
+    {
+      "filename": "photo_2026-03-01 01.34.54.jpeg",
+      "type": "Электро",
+      "reading": 2562.0,
+      "serial": null,
+      "hashes": {
+        "full": "9df1b892f2e38185",
+        "lcd_wide": "63783131f492fdd1",
+        "lcd_mid": "c1616104e63798fc",
+        "lcd_tight": "606008c476333199"
+      }
+    },
+    {
+      "filename": "photo_2026-03-02 13.33.20.jpeg",
+      "type": "Электро",
+      "reading": 2838.3,
+      "serial": null,
+      "hashes": {
+        "full": "bfee168ccdc18c3e",
+        "lcd_wide": "06040c0c9d0f85c1",
+        "lcd_mid": "7c1e5d5d341f1e0c",
+        "lcd_tight": "07545c3e723e1f1e"
+      }
+    },
+    {
+      "filename": "photo_2026-03-02 13.33.30.jpeg",
+      "type": "Электро",
+      "reading": 4518.0,
+      "serial": null,
+      "hashes": {
+        "full": "9bd6060e320f0fe8",
+        "lcd_wide": "0f0e0e5e7b632f0d",
+        "lcd_mid": "079fff71f9e14f4f",
+        "lcd_tight": "1fff0179e9d9c18f"
+      }
+    },
+    {
+      "filename": "photo_2026-03-02 13.34.27.jpeg",
+      "type": "Электро",
+      "reading": 8741.2,
+      "serial": null,
+      "hashes": {
+        "full": "4968686069691112",
+        "lcd_wide": "c8d8d9c5c5cd8dc9",
+        "lcd_mid": "3c2c2c0c041c1c0c",
+        "lcd_tight": "2c6c644414140c1c"
+      }
+    },
+    {
+      "filename": "photo_2026-03-02 13.34.34.jpeg",
+      "type": "Электро",
+      "reading": 8690.5,
+      "serial": null,
+      "hashes": {
+        "full": "0938686861605074",
+        "lcd_wide": "d4dcf8c0c0c0ccc8",
+        "lcd_mid": "d01c24244404040c",
+        "lcd_tight": "3c04246444449488"
+      }
+    }
+  ]
+}

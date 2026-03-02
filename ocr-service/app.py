@@ -15,6 +15,10 @@ from typing import Optional, Tuple
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
 import cv2
+try:
+    import pytesseract  # type: ignore
+except Exception:  # pragma: no cover - optional runtime dependency
+    pytesseract = None
 from water_deterministic import (
     make_fixed_cells_sheet_from_row,
     make_water_deterministic_row_variants,
@@ -49,8 +53,9 @@ OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower(
 OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_DRUM_ENABLED = os.getenv("OCR_ELECTRIC_DRUM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_TESSERACT_ENABLED = os.getenv("OCR_ELECTRIC_TESSERACT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TEMPLATE_MATCH = os.getenv("OCR_ELECTRIC_TEMPLATE_MATCH", "1").strip().lower() in ("1", "true", "yes", "on")
-OCR_ELECTRIC_TEMPLATE_DB = os.getenv("OCR_ELECTRIC_TEMPLATE_DB", "/tmp/electric_templates.json").strip()
+OCR_ELECTRIC_TEMPLATE_DB = os.getenv("OCR_ELECTRIC_TEMPLATE_DB", "/app/electric_templates_seed.json").strip()
 try:
     OCR_ELECTRIC_BOOTSTRAP_VARIANTS = int(os.getenv("OCR_ELECTRIC_BOOTSTRAP_VARIANTS", "2"))
 except Exception:
@@ -1892,6 +1897,146 @@ def _electric_drum_candidates(img_bytes: bytes) -> list[dict]:
     return out
 
 
+def _electric_mask_sticker(img_bgr: np.ndarray) -> np.ndarray:
+    out = img_bgr.copy()
+    h, w = out.shape[:2]
+    hsv = cv2.cvtColor(out, cv2.COLOR_BGR2HSV)
+    # White sticker masks often occlude LCD digits on Mercury photos.
+    m = cv2.inRange(hsv, (0, 0, 150), (180, 65, 255))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8), iterations=1)
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    for c in cnts:
+        x, y, bw, bh = cv2.boundingRect(c)
+        area = bw * bh
+        if area < int(w * h * 0.02) or area > int(w * h * 0.45):
+            continue
+        ar = bw / float(max(1, bh))
+        if ar < 1.5 or ar > 8.0:
+            continue
+        cx = (x + bw * 0.5) / float(max(1, w))
+        cy = (y + bh * 0.5) / float(max(1, h))
+        if not (0.18 <= cx <= 0.82 and 0.30 <= cy <= 0.82):
+            continue
+        mm = np.zeros((h, w), dtype=np.uint8)
+        cv2.rectangle(mm, (x, y), (x + bw, y + bh), 255, -1)
+        out = cv2.inpaint(out, mm, 5, cv2.INPAINT_TELEA)
+    return out
+
+
+def _electric_parse_numeric_text(text: str) -> list[float]:
+    if not text:
+        return []
+    s = text.replace(",", ".")
+    chunks = re.findall(r"\d{3,6}(?:\.\d{1,2})?", s)
+    out: list[float] = []
+    for c in chunks:
+        try:
+            v = float(c)
+        except Exception:
+            continue
+        if 0.0 <= v <= 30000.0:
+            out.append(v)
+    # Also keep integer-only chunks when decimal dot was dropped by OCR.
+    for c in re.findall(r"\d{3,6}", s):
+        try:
+            v = float(int(c))
+        except Exception:
+            continue
+        if 0.0 <= v <= 30000.0:
+            out.append(v)
+    uniq: list[float] = []
+    seen: set[int] = set()
+    for v in out:
+        key = int(round(v * 100))
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(v)
+    return uniq
+
+
+def _electric_tesseract_candidates(img_bytes: bytes) -> list[dict]:
+    if not OCR_ELECTRIC_TESSERACT_ENABLED or pytesseract is None:
+        return []
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return []
+    if img is None:
+        return []
+    h, w = img.shape[:2]
+    if h < 100 or w < 100:
+        return []
+
+    # Wide coverage windows for LCD and drum counters.
+    rois = [
+        ("lcd_main", (0.10, 0.18, 0.88, 0.52)),
+        ("lcd_tight", (0.16, 0.22, 0.80, 0.46)),
+        ("drum_main", (0.32, 0.18, 0.72, 0.45)),
+    ]
+    out: list[dict] = []
+    for tag, (x1f, y1f, x2f, y2f) in rois:
+        x1 = max(0, min(w - 1, int(round(w * x1f))))
+        y1 = max(0, min(h - 1, int(round(h * y1f))))
+        x2 = max(x1 + 1, min(w, int(round(w * x2f))))
+        y2 = max(y1 + 1, min(h, int(round(h * y2f))))
+        crop = img[y1:y2, x1:x2]
+        if crop.size == 0:
+            continue
+        crop = _electric_mask_sticker(crop)
+        crop = cv2.resize(crop, (crop.shape[1] * 3, crop.shape[0] * 3), interpolation=cv2.INTER_CUBIC)
+        g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        cl = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(g)
+        th = cv2.adaptiveThreshold(cl, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5)
+        inv = cv2.bitwise_not(th)
+        variants = [
+            ("cl", cl),
+            ("th", th),
+            ("inv", inv),
+        ]
+        for vname, arr2d in variants:
+            try:
+                data = pytesseract.image_to_data(
+                    arr2d,
+                    output_type=pytesseract.Output.DICT,
+                    config="--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.,",
+                )
+            except Exception:
+                continue
+            txt = " ".join([str(t or "") for t in data.get("text", [])]).strip()
+            vals = _electric_parse_numeric_text(txt)
+            if not vals:
+                continue
+            confs: list[float] = []
+            for c in data.get("conf", []) or []:
+                try:
+                    cf = float(c)
+                except Exception:
+                    continue
+                if cf >= 0:
+                    confs.append(cf)
+            mean_conf = float(sum(confs) / max(1, len(confs))) if confs else 0.0
+            # Very conservative: accept only reasonably clean OCR words.
+            if mean_conf < 45.0:
+                continue
+            base_conf = _clamp_confidence(min(0.88, 0.42 + (mean_conf / 100.0) * 0.52))
+            for v in vals[:3]:
+                out.append(
+                    {
+                        "type": "Электро",
+                        "reading": float(v),
+                        "serial": None,
+                        "confidence": float(base_conf),
+                        "notes": "deterministic_tesseract",
+                        "note2": "",
+                        "variant": f"electric_tess_{tag}_{vname}",
+                        "provider": "det-electric:tesseract",
+                    }
+                )
+    return out
+
+
 def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
     if not OCR_ELECTRIC_DETERMINISTIC and not OCR_ELECTRIC_TEMPLATE_MATCH:
         return []
@@ -1902,6 +2047,10 @@ def _electric_deterministic_candidates(img_bytes: bytes) -> list[dict]:
         pass
     try:
         out.extend(_electric_drum_candidates(img_bytes))
+    except Exception:
+        pass
+    try:
+        out.extend(_electric_tesseract_candidates(img_bytes))
     except Exception:
         pass
     if not OCR_ELECTRIC_DETERMINISTIC:
