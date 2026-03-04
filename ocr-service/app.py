@@ -49,6 +49,7 @@ OCR_MAX_RUNTIME_SEC = float(os.getenv("OCR_MAX_RUNTIME_SEC", "55"))
 GOOGLE_VISION_API_KEY = os.getenv("GOOGLE_VISION_API_KEY", "").strip()
 OCR_DEBUG = os.getenv("OCR_DEBUG", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_WATER_ECO = os.getenv("OCR_WATER_ECO", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
@@ -3124,6 +3125,50 @@ def _read_water_cells_sheet_tesseract(sheet_bytes: bytes, *, red_len: int) -> Op
     }
 
 
+def _local_water_quick_candidate(
+    img_bytes: bytes,
+    *,
+    row_variants: Optional[list[tuple[str, bytes]]] = None,
+) -> Optional[dict]:
+    rows = row_variants
+    if rows is None:
+        rows = make_water_deterministic_row_variants(img_bytes, max_variants=4)
+    if not rows:
+        return None
+    best: Optional[dict] = None
+    for lbl, src in rows[:4]:
+        packed = _make_water_digit_cells_sheet_from_row(src)
+        if not packed:
+            packed = make_fixed_cells_sheet_from_row(src, black_len=5, red_len=3)
+        if not packed:
+            continue
+        sheet_bytes, red_len = packed
+        det = _read_water_cells_sheet_tesseract(sheet_bytes, red_len=red_len)
+        if det is None:
+            continue
+        b = _normalize_digits_string(det.get("black_digits"))
+        if not b:
+            continue
+        c = float(det.get("confidence") or 0.0)
+        item = {
+            "type": "unknown",
+            "reading": _normalize_reading(det.get("reading")),
+            "serial": None,
+            "confidence": _clamp_confidence(c),
+            "notes": str(det.get("notes") or "det_water_quick"),
+            "variant": f"det_quick_{lbl}",
+            "provider": "det-water-quick:tesseract",
+            "black_digits": b,
+            "red_digits": _normalize_digits_string(det.get("red_digits")),
+        }
+        if best is None:
+            best = item
+            continue
+        if float(item.get("confidence") or 0.0) > float(best.get("confidence") or 0.0):
+            best = item
+    return best
+
+
 def _normalized_red_digits(v: Optional[str], *, min_len: int = 2, max_len: int = 3) -> Optional[str]:
     d = _normalize_digits_string(v)
     if not d:
@@ -5037,8 +5082,49 @@ async def recognize(
     serial_target_hit = False
     quick_bootstrap_deferred = False
     water_face_hint = _looks_like_water_meter_face(img)
-    if skip_electric_bootstrap := bool(OCR_WATER_DIGIT_FIRST and water_face_hint):
-        logger.info("ocr_recognize trace_id=%s skip electric bootstrap by water_face_hint", req_trace_id)
+    pre_det_limit = 4 if OCR_WATER_ECO else 12
+    pre_det_row_variants: list[tuple[str, bytes]] = []
+    if OCR_WATER_DIGIT_FIRST and _time_budget_left(odo_reserve_sec):
+        try:
+            pre_det_row_variants = make_water_deterministic_row_variants(img, max_variants=pre_det_limit)
+        except Exception:
+            pre_det_row_variants = []
+    water_row_hint = len(pre_det_row_variants) > 0
+    if skip_electric_bootstrap := bool(
+        OCR_WATER_DIGIT_FIRST and (water_face_hint or (OCR_WATER_ECO and water_row_hint))
+    ):
+        logger.info(
+            "ocr_recognize trace_id=%s skip electric bootstrap water_face_hint=%s water_row_hint=%s",
+            req_trace_id,
+            water_face_hint,
+            water_row_hint,
+        )
+    if OCR_WATER_ECO and OCR_WATER_DIGIT_FIRST and water_row_hint and _time_budget_left(2.0):
+        quick_local = _local_water_quick_candidate(img, row_variants=pre_det_row_variants)
+        if quick_local is not None and _is_ok_water_digits(quick_local):
+            out = {
+                "type": str(quick_local.get("type") or "unknown"),
+                "reading": _normalize_reading(quick_local.get("reading")),
+                "serial": None,
+                "confidence": _clamp_confidence(float(quick_local.get("confidence") or 0.0)),
+                "notes": f"{str(quick_local.get('notes') or '').strip()}; eco_local_quick",
+                "trace_id": req_trace_id,
+            }
+            if OCR_DEBUG:
+                out["debug"] = [
+                    {
+                        "provider": str(quick_local.get("provider") or "unknown"),
+                        "variant": str(quick_local.get("variant") or "orig"),
+                        "type": str(quick_local.get("type") or "unknown"),
+                        "reading": quick_local.get("reading"),
+                        "confidence": float(quick_local.get("confidence") or 0.0),
+                        "black_digits": quick_local.get("black_digits"),
+                        "red_digits": quick_local.get("red_digits"),
+                    }
+                ]
+                out["timings_ms"] = dict(stage_ms)
+                out["openai_calls"] = 0
+            return out
 
     # Electric bootstrap:
     # When digit-first water mode is enabled, generic passes are mostly skipped.
@@ -5994,16 +6080,22 @@ async def recognize(
     odo_variants: list[tuple[str, bytes]] = []
     if not OCR_WATER_DIGIT_FIRST:
         odo_variants = _make_water_odometer_window_variants(img)
-    det_row_variants = make_water_deterministic_row_variants(img, max_variants=12)
-    roi_row_variants = _make_water_roi_row_variants(img)
-    global_variants = _make_water_global_strip_variants(img)
-    box_variants = _make_water_counter_box_variants(img)
-    row_variants = _make_water_counter_row_variants(img)
+    det_row_variants = pre_det_row_variants or make_water_deterministic_row_variants(img, max_variants=(4 if OCR_WATER_ECO else 12))
+    if OCR_WATER_ECO:
+        roi_row_variants = []
+        global_variants = _make_water_global_strip_variants(img)[:2]
+        box_variants = []
+        row_variants = []
+    else:
+        roi_row_variants = _make_water_roi_row_variants(img)
+        global_variants = _make_water_global_strip_variants(img)
+        box_variants = _make_water_counter_box_variants(img)
+        row_variants = _make_water_counter_row_variants(img)
     circle_row_variants: list[tuple[str, bytes]] = []
     circle_odo_variants: list[tuple[str, bytes]] = []
     meter_face_variants: list[tuple[str, bytes]] = []
-    blackhat_row_variants = _make_water_blackhat_row_variants(img)
-    top_variants = _make_water_top_strip_variants(img)
+    blackhat_row_variants = [] if OCR_WATER_ECO else _make_water_blackhat_row_variants(img)
+    top_variants = _make_water_top_strip_variants(img)[: (1 if OCR_WATER_ECO else 3)]
     if not OCR_WATER_DIGIT_FIRST:
         circle_row_variants = _make_water_circle_row_variants(img)
         circle_odo_variants = _make_water_circle_odometer_strips(img)
@@ -6032,25 +6124,41 @@ async def recognize(
     # Keep this list compact in digit-first mode:
     # we need to preserve time budget for the deterministic cells_sheet stage,
     # otherwise we keep overfitting to one noisy row candidate (e.g. 01103).
-    odometer_variants = (
-        top_variants[:2]
-        + global_variants[:3]
-        + det_row_variants[:4]
-        + box_variants[:2]
-        + face_row_variants[:3]
-        + row_variants[:2]
-        + roi_row_variants[:3]
-        + blackhat_row_variants[:2]
-        + circle_odo_variants[:1]
-        + circle_row_variants[:1]
-        + odo_variants[:1]
-    )
+    if OCR_WATER_ECO:
+        odometer_variants = (
+            top_variants[:1]
+            + global_variants[:2]
+            + det_row_variants[:3]
+            + box_variants[:1]
+            + face_row_variants[:1]
+            + row_variants[:1]
+            + roi_row_variants[:1]
+            + blackhat_row_variants[:1]
+            + circle_odo_variants[:1]
+        )
+    else:
+        odometer_variants = (
+            top_variants[:2]
+            + global_variants[:3]
+            + det_row_variants[:4]
+            + box_variants[:2]
+            + face_row_variants[:3]
+            + row_variants[:2]
+            + roi_row_variants[:3]
+            + blackhat_row_variants[:2]
+            + circle_odo_variants[:1]
+            + circle_row_variants[:1]
+            + odo_variants[:1]
+        )
     fast_water_hit = False
     strong_readings: list[float] = []
     # In digit-first mode still probe several row-level variants:
     # cells-sheet can fail on dark/occluded shots, and then we need backup candidates.
     if OCR_WATER_DIGIT_FIRST:
-        max_odo_openai_variants = min((2 if quick_serial_mode else OCR_ODO_MAX_VARIANTS), len(odometer_variants))
+        limit = 1 if quick_serial_mode else OCR_ODO_MAX_VARIANTS
+        if OCR_WATER_ECO:
+            limit = 0
+        max_odo_openai_variants = min(limit, len(odometer_variants))
     else:
         max_odo_openai_variants = len(odometer_variants)
     for idx, (label, b) in enumerate(odometer_variants, start=1):
@@ -6126,13 +6234,13 @@ async def recognize(
                 seen_labels.add(lbl)
 
         # Geometry-first sources; do not depend on OCR confidence from previous passes.
-        _push_sources(top_variants, 2)
-        _push_sources(global_variants, 3)
-        _push_sources(face_row_variants, 4)
-        _push_sources(det_row_variants, 4)
-        _push_sources(row_variants, 3)
-        _push_sources(roi_row_variants, 3)
-        _push_sources(blackhat_row_variants, 2)
+        _push_sources(top_variants, 1 if OCR_WATER_ECO else 2)
+        _push_sources(global_variants, 2 if OCR_WATER_ECO else 3)
+        _push_sources(face_row_variants, 2 if OCR_WATER_ECO else 4)
+        _push_sources(det_row_variants, 3 if OCR_WATER_ECO else 4)
+        _push_sources(row_variants, 2 if OCR_WATER_ECO else 3)
+        _push_sources(roi_row_variants, 1 if OCR_WATER_ECO else 3)
+        _push_sources(blackhat_row_variants, 1 if OCR_WATER_ECO else 2)
         _push_sources(circle_odo_variants, 1)
         _push_sources(circle_row_variants, 1)
         _push_sources(box_variants, 1)
@@ -6143,8 +6251,9 @@ async def recognize(
             generic_fallback = [(f"generic_{lbl}", b) for lbl, b in variants[:3]]
             _push_sources(generic_fallback, 3)
 
-        row_sources = row_sources[: (2 if quick_serial_mode else OCR_CELLS_ROW_SOURCES_MAX)]
+        row_sources = row_sources[: (2 if quick_serial_mode else (min(3, OCR_CELLS_ROW_SOURCES_MAX) if OCR_WATER_ECO else OCR_CELLS_ROW_SOURCES_MAX))]
         cells_valid: list[dict] = []
+        local_det_strong_hit = False
 
         for src_label, src_bytes in row_sources:
             if not _time_budget_left(4.0):
@@ -6198,7 +6307,14 @@ async def recognize(
                             cells_valid.append(lc_item)
                             # Strong local read: skip paid OpenAI call for this row source.
                             if float(lc_conf) >= 0.76:
+                                if OCR_WATER_ECO:
+                                    local_det_strong_hit = True
+                                    fast_water_hit = True
+                                    break
                                 continue
+            if OCR_WATER_ECO:
+                # In eco mode avoid paid per-sheet calls; rely on local cells OCR.
+                continue
             try:
                 cs = _vision(
                     sheet_bytes,
@@ -6339,6 +6455,8 @@ async def recognize(
                     }
                 )
                 fast_water_hit = True
+        if local_det_strong_hit:
+            fast_water_hit = True
     _mark_stage("odometer_variants")
     _mark_stage("cells_sheet")
 
