@@ -108,12 +108,12 @@ try:
     OCR_MAX_OPENAI_CALLS = int(os.getenv("OCR_MAX_OPENAI_CALLS", "4"))
 except Exception:
     OCR_MAX_OPENAI_CALLS = 4
-OCR_MAX_OPENAI_CALLS = max(4, min(40, OCR_MAX_OPENAI_CALLS))
+OCR_MAX_OPENAI_CALLS = max(1, min(40, OCR_MAX_OPENAI_CALLS))
 try:
     OCR_MAX_OPENAI_CALLS_QUICK = int(os.getenv("OCR_MAX_OPENAI_CALLS_QUICK", "3"))
 except Exception:
     OCR_MAX_OPENAI_CALLS_QUICK = 3
-OCR_MAX_OPENAI_CALLS_QUICK = max(2, min(30, OCR_MAX_OPENAI_CALLS_QUICK))
+OCR_MAX_OPENAI_CALLS_QUICK = max(1, min(30, OCR_MAX_OPENAI_CALLS_QUICK))
 try:
     OCR_RED_REFINE_REPEATS = int(os.getenv("OCR_RED_REFINE_REPEATS", "2"))
 except Exception:
@@ -140,6 +140,11 @@ try:
 except Exception:
     OCR_OPENAI_QUOTA_COOLDOWN_SEC = 3600
 OCR_OPENAI_QUOTA_COOLDOWN_SEC = max(60, min(24 * 3600, OCR_OPENAI_QUOTA_COOLDOWN_SEC))
+try:
+    OCR_TESSERACT_TIMEOUT_SEC = float(os.getenv("OCR_TESSERACT_TIMEOUT_SEC", "2.5"))
+except Exception:
+    OCR_TESSERACT_TIMEOUT_SEC = 2.5
+OCR_TESSERACT_TIMEOUT_SEC = max(0.5, min(8.0, OCR_TESSERACT_TIMEOUT_SEC))
 
 _OPENAI_CACHE_LOCK = threading.Lock()
 _OPENAI_CACHE: dict[str, tuple[float, dict]] = {}
@@ -431,6 +436,28 @@ def _guess_mime(filename: Optional[str], content_type: Optional[str]) -> str:
 
     # безопасный дефолт
     return "image/jpeg"
+
+
+def _prepare_input_image_for_ocr(img_bytes: bytes, *, max_dim: int = 1700) -> bytes:
+    """
+    Normalize huge mobile photos to bounded size.
+    This keeps OCR stable and prevents very expensive CV passes on 3k-4k frames.
+    """
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return img_bytes
+    w, h = img.size
+    if max(w, h) <= max_dim:
+        return img_bytes
+    scale = float(max_dim) / float(max(w, h))
+    nw = max(1, int(round(w * scale)))
+    nh = max(1, int(round(h * scale)))
+    try:
+        resized = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    except Exception:
+        resized = img.resize((nw, nh))
+    return _encode_jpeg(resized, quality=93)
 
 
 def _extract_json_object(text_content: str) -> dict:
@@ -1323,6 +1350,47 @@ def _make_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     return variants[:6]
 
 
+def _looks_like_water_meter_face(img_bytes: bytes) -> bool:
+    """
+    Cheap geometry heuristic to avoid running heavy electric bootstrap on water photos.
+    Water meters usually have a dominant circular dial in the frame.
+    """
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return False
+    if im is None:
+        return False
+    h, w = im.shape[:2]
+    if h < 120 or w < 120:
+        return False
+    max_dim = max(h, w)
+    if max_dim > 960:
+        scale = 960.0 / float(max_dim)
+        im = cv2.resize(im, (int(round(w * scale)), int(round(h * scale))), interpolation=cv2.INTER_AREA)
+        h, w = im.shape[:2]
+    gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(gray, (7, 7), 0)
+    min_side = max(1, min(h, w))
+    min_r = max(24, int(min_side * 0.12))
+    max_r = max(min_r + 2, int(min_side * 0.48))
+    try:
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=float(min_side * 0.35),
+            param1=110,
+            param2=24,
+            minRadius=min_r,
+            maxRadius=max_r,
+        )
+    except Exception:
+        return False
+    return circles is not None and len(circles[0]) > 0
+
+
 def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
     out: list[tuple[str, bytes]] = []
     try:
@@ -2001,6 +2069,7 @@ def _electric_tesseract_candidates(img_bytes: bytes) -> list[dict]:
                     arr2d,
                     output_type=pytesseract.Output.DICT,
                     config="--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789.,",
+                    timeout=OCR_TESSERACT_TIMEOUT_SEC,
                 )
             except Exception:
                 continue
@@ -4770,6 +4839,7 @@ async def recognize(
     img = await file.read()
     if not img:
         raise HTTPException(status_code=400, detail="empty_file")
+    img = _prepare_input_image_for_ocr(img)
 
     if not OCR_OPENAI_ENABLED:
         det_best = None
@@ -4842,11 +4912,14 @@ async def recognize(
     candidates: list[dict] = []
     serial_target_hit = False
     quick_bootstrap_deferred = False
+    water_face_hint = _looks_like_water_meter_face(img)
+    if skip_electric_bootstrap := bool(OCR_WATER_DIGIT_FIRST and water_face_hint):
+        logger.info("ocr_recognize trace_id=%s skip electric bootstrap by water_face_hint", req_trace_id)
 
     # Electric bootstrap:
     # When digit-first water mode is enabled, generic passes are mostly skipped.
     # Probe a few generic variants first and early-return on confident electric reads.
-    if OCR_ELECTRIC_BOOTSTRAP and variants and _time_budget_left(odo_reserve_sec):
+    if OCR_ELECTRIC_BOOTSTRAP and (not skip_electric_bootstrap) and variants and _time_budget_left(odo_reserve_sec):
         electric_variants: list[tuple[str, bytes]] = []
         preferred = ("middle_band", "focused_crop", "center_crop_strong", "orig", "contrast", "lowlight_enhanced")
         seen_ev: set[str] = set()
