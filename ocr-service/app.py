@@ -736,11 +736,12 @@ def _call_openai_vision(
         try:
             req_timeout = float(timeout_sec) if timeout_sec is not None else float(OPENAI_TIMEOUT_SEC)
             req_timeout = max(1.0, min(float(OPENAI_TIMEOUT_SEC), req_timeout))
+            connect_timeout = max(2.0, min(8.0, req_timeout))
             r = requests.post(
                 "https://api.openai.com/v1/chat/completions",
                 headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
                 json=payload,
-                timeout=(2, req_timeout),
+                timeout=(connect_timeout, req_timeout),
             )
         except requests.RequestException as e:
             last_err = f"openai_request_error:{e}"
