@@ -491,17 +491,29 @@ def _extract_json_object(text_content: str) -> dict:
 
 
 def _content_to_text(content) -> str:
+    def _grab(v) -> list[str]:
+        out: list[str] = []
+        if isinstance(v, str):
+            if v.strip():
+                out.append(v)
+            return out
+        if isinstance(v, list):
+            for it in v:
+                out.extend(_grab(it))
+            return out
+        if isinstance(v, dict):
+            for k in ("text", "value", "output_text", "content"):
+                out.extend(_grab(v.get(k)))
+            return out
+        return out
+
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts: list[str] = []
-        for item in content:
-            if isinstance(item, dict):
-                txt = item.get("text")
-                if isinstance(txt, str) and txt.strip():
-                    parts.append(txt)
-            elif isinstance(item, str) and item.strip():
-                parts.append(item)
+        parts = _grab(content)
+        return "\n".join(parts)
+    if isinstance(content, dict):
+        parts = _grab(content)
         return "\n".join(parts)
     return ""
 
@@ -3011,45 +3023,36 @@ def _tesseract_single_digit(tile_bgr: np.ndarray) -> tuple[Optional[str], float]
         gray = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2GRAY)
     except Exception:
         return None, 0.0
-    variants: list[np.ndarray] = []
     try:
-        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
-    except Exception:
-        clahe = gray
-    variants.append(clahe)
-    try:
-        bw = cv2.adaptiveThreshold(
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(gray)
+        arr2d = cv2.adaptiveThreshold(
             clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
         )
-        variants.append(bw)
-        variants.append(cv2.bitwise_not(bw))
     except Exception:
-        pass
-
-    for arr2d in variants:
-        try:
-            data = pytesseract.image_to_data(
-                arr2d,
-                output_type=pytesseract.Output.DICT,
-                config="--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789",
-                timeout=OCR_TESSERACT_TIMEOUT_SEC,
-            )
-        except Exception:
+        arr2d = gray
+    try:
+        data = pytesseract.image_to_data(
+            arr2d,
+            output_type=pytesseract.Output.DICT,
+            config="--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789",
+            timeout=min(0.8, OCR_TESSERACT_TIMEOUT_SEC),
+        )
+    except Exception:
+        return None, 0.0
+    txts = data.get("text", []) or []
+    confs = data.get("conf", []) or []
+    for t, c in zip(txts, confs):
+        s = "".join(ch for ch in str(t or "") if ch.isdigit())
+        if not s:
             continue
-        txts = data.get("text", []) or []
-        confs = data.get("conf", []) or []
-        for t, c in zip(txts, confs):
-            s = "".join(ch for ch in str(t or "") if ch.isdigit())
-            if not s:
-                continue
-            d = s[-1]
-            try:
-                cf = float(c)
-            except Exception:
-                cf = 0.0
-            if cf > best_conf:
-                best_conf = cf
-                best_digit = d
+        d = s[-1]
+        try:
+            cf = float(c)
+        except Exception:
+            cf = 0.0
+        if cf > best_conf:
+            best_conf = cf
+            best_digit = d
     # Normalize tesseract confidence range (0..100) to (0..1).
     return best_digit, _clamp_confidence(best_conf / 100.0)
 
@@ -3125,6 +3128,100 @@ def _read_water_cells_sheet_tesseract(sheet_bytes: bytes, *, red_len: int) -> Op
     }
 
 
+def _read_water_row_tesseract(row_bytes: bytes) -> Optional[dict]:
+    if pytesseract is None:
+        return None
+    try:
+        arr = np.frombuffer(row_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+    if im is None:
+        return None
+    h, w = im.shape[:2]
+    if h < 20 or w < 40:
+        return None
+
+    # Focus on central band where odometer windows are.
+    y1 = int(round(h * 0.12))
+    y2 = int(round(h * 0.92))
+    y1 = max(0, min(h - 1, y1))
+    y2 = max(y1 + 1, min(h, y2))
+    crop = im[y1:y2, :]
+    if crop.size == 0:
+        return None
+    crop = cv2.resize(crop, (max(1, crop.shape[1] * 4), max(1, crop.shape[0] * 4)), interpolation=cv2.INTER_CUBIC)
+    g = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    try:
+        g = cv2.createCLAHE(clipLimit=2.4, tileGridSize=(8, 8)).apply(g)
+    except Exception:
+        pass
+    variants: list[np.ndarray] = [g]
+    try:
+        bw = cv2.adaptiveThreshold(
+            g, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 35, 8
+        )
+        variants.append(bw)
+        variants.append(cv2.bitwise_not(bw))
+    except Exception:
+        pass
+
+    best: Optional[dict] = None
+    for arr2d in variants[:2]:
+        psm = 7
+        try:
+            data = pytesseract.image_to_data(
+                arr2d,
+                output_type=pytesseract.Output.DICT,
+                config=f"--oem 3 --psm {psm} -c tessedit_char_whitelist=0123456789",
+                timeout=min(1.0, OCR_TESSERACT_TIMEOUT_SEC),
+            )
+        except Exception:
+            continue
+        txt = "".join(str(t or "") for t in (data.get("text", []) or []))
+        digits = "".join(ch for ch in txt if ch.isdigit())
+        if len(digits) < 4:
+            continue
+        confs: list[float] = []
+        for c in data.get("conf", []) or []:
+            try:
+                cf = float(c)
+            except Exception:
+                continue
+            if cf >= 0:
+                confs.append(cf)
+        mean_conf = float(sum(confs) / max(1, len(confs))) if confs else 0.0
+        if mean_conf < 25.0:
+            continue
+        if len(digits) >= 8:
+            black = digits[:5]
+            red = digits[5:8]
+        elif len(digits) == 7:
+            black = digits[:5]
+            red = digits[5:7]
+        elif len(digits) >= 5:
+            black = digits[:5]
+            red = None
+        else:
+            black = digits.zfill(5)
+            red = None
+        reading = _reading_from_digits(black, red)
+        if reading is None:
+            continue
+        item = {
+            "type": "unknown",
+            "reading": reading,
+            "serial": None,
+            "confidence": _clamp_confidence(mean_conf / 100.0),
+            "notes": "det_water_row_tesseract",
+            "black_digits": black,
+            "red_digits": red,
+        }
+        if best is None or float(item["confidence"]) > float(best["confidence"]):
+            best = item
+    return best
+
+
 def _local_water_quick_candidate(
     img_bytes: bytes,
     *,
@@ -3145,7 +3242,9 @@ def _local_water_quick_candidate(
         sheet_bytes, red_len = packed
         det = _read_water_cells_sheet_tesseract(sheet_bytes, red_len=red_len)
         if det is None:
-            continue
+            det = _read_water_row_tesseract(src)
+            if det is None:
+                continue
         b = _normalize_digits_string(det.get("black_digits"))
         if not b:
             continue
