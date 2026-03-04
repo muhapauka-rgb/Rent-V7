@@ -3001,6 +3001,129 @@ def _reading_from_digits(black: Optional[str], red: Optional[str]) -> Optional[f
         return None
 
 
+def _tesseract_single_digit(tile_bgr: np.ndarray) -> tuple[Optional[str], float]:
+    if pytesseract is None or tile_bgr.size == 0:
+        return None, 0.0
+    best_digit: Optional[str] = None
+    best_conf = 0.0
+    try:
+        gray = cv2.cvtColor(tile_bgr, cv2.COLOR_BGR2GRAY)
+    except Exception:
+        return None, 0.0
+    variants: list[np.ndarray] = []
+    try:
+        clahe = cv2.createCLAHE(clipLimit=2.2, tileGridSize=(8, 8)).apply(gray)
+    except Exception:
+        clahe = gray
+    variants.append(clahe)
+    try:
+        bw = cv2.adaptiveThreshold(
+            clahe, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 7
+        )
+        variants.append(bw)
+        variants.append(cv2.bitwise_not(bw))
+    except Exception:
+        pass
+
+    for arr2d in variants:
+        try:
+            data = pytesseract.image_to_data(
+                arr2d,
+                output_type=pytesseract.Output.DICT,
+                config="--oem 3 --psm 10 -c tessedit_char_whitelist=0123456789",
+                timeout=OCR_TESSERACT_TIMEOUT_SEC,
+            )
+        except Exception:
+            continue
+        txts = data.get("text", []) or []
+        confs = data.get("conf", []) or []
+        for t, c in zip(txts, confs):
+            s = "".join(ch for ch in str(t or "") if ch.isdigit())
+            if not s:
+                continue
+            d = s[-1]
+            try:
+                cf = float(c)
+            except Exception:
+                cf = 0.0
+            if cf > best_conf:
+                best_conf = cf
+                best_digit = d
+    # Normalize tesseract confidence range (0..100) to (0..1).
+    return best_digit, _clamp_confidence(best_conf / 100.0)
+
+
+def _read_water_cells_sheet_tesseract(sheet_bytes: bytes, *, red_len: int) -> Optional[dict]:
+    if pytesseract is None:
+        return None
+    try:
+        arr = np.frombuffer(sheet_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    except Exception:
+        return None
+    if im is None:
+        return None
+    h, w = im.shape[:2]
+    if h < 200 or w < 300:
+        return None
+
+    tile_w = 180
+    tile_h = 220
+    gap = 16
+    margin = 18
+    y_black = margin + 24
+    y_red = margin + tile_h + 36
+    inset_x = 16
+    inset_y = 16
+
+    digits_b: list[str] = []
+    conf_b: list[float] = []
+    digits_r: list[str] = []
+    conf_r: list[float] = []
+
+    def _cell_box(i: int, y0: int) -> tuple[int, int, int, int]:
+        x0 = margin + i * (tile_w + gap)
+        x1 = max(0, x0 + inset_x)
+        y1 = max(0, y0 + inset_y)
+        x2 = min(w, x0 + tile_w - inset_x)
+        y2 = min(h, y0 + tile_h - inset_y)
+        return x1, y1, max(x1 + 1, x2), max(y1 + 1, y2)
+
+    for i in range(5):
+        x1, y1, x2, y2 = _cell_box(i, y_black)
+        d, c = _tesseract_single_digit(im[y1:y2, x1:x2])
+        if not d:
+            return None
+        digits_b.append(d)
+        conf_b.append(c)
+
+    for i in range(max(0, min(3, int(red_len)))):
+        x1, y1, x2, y2 = _cell_box(i, y_red)
+        d, c = _tesseract_single_digit(im[y1:y2, x1:x2])
+        if not d:
+            continue
+        digits_r.append(d)
+        conf_r.append(c)
+
+    black_digits = "".join(digits_b)
+    red_digits = "".join(digits_r) if len(digits_r) >= 2 else None
+    reading = _reading_from_digits(black_digits, red_digits)
+    if reading is None:
+        return None
+    mean_b = float(sum(conf_b) / max(1, len(conf_b)))
+    mean_r = float(sum(conf_r) / max(1, len(conf_r))) if conf_r else 0.0
+    conf = _clamp_confidence((mean_b * 0.82) + (mean_r * 0.18))
+    return {
+        "type": "unknown",
+        "reading": reading,
+        "serial": None,
+        "confidence": conf,
+        "notes": "det_water_cells_tesseract",
+        "black_digits": black_digits,
+        "red_digits": red_digits,
+    }
+
+
 def _normalized_red_digits(v: Optional[str], *, min_len: int = 2, max_len: int = 3) -> Optional[str]:
     d = _normalize_digits_string(v)
     if not d:
@@ -6047,6 +6170,35 @@ async def recognize(
                 continue
             sheet_bytes, red_len = packed
             variant_image_map.setdefault(f"cells_row_{src_label}", sheet_bytes)
+            # Local per-cell OCR first: cheap and often enough for clear drum windows.
+            local_cells = _read_water_cells_sheet_tesseract(sheet_bytes, red_len=red_len)
+            if local_cells is not None:
+                lc_type = _sanitize_type(local_cells.get("type", "unknown"))
+                lc_reading = _normalize_reading(local_cells.get("reading"))
+                lc_conf = _clamp_confidence(local_cells.get("confidence", 0.0))
+                lc_black = _normalize_digits_string(local_cells.get("black_digits"))
+                lc_red = _normalize_digits_string(local_cells.get("red_digits"))
+                if lc_black and lc_reading is not None:
+                    lc_reading, lc_conf, lc_note2 = _plausibility_filter(lc_type, lc_reading, lc_conf)
+                    if lc_reading is not None:
+                        lc_item = {
+                            "type": lc_type,
+                            "reading": lc_reading,
+                            "serial": None,
+                            "confidence": lc_conf,
+                            "notes": str(local_cells.get("notes", "") or ""),
+                            "note2": lc_note2,
+                            "variant": f"cells_row_{src_label}_det",
+                            "provider": "det-water-cells:tesseract",
+                            "black_digits": lc_black,
+                            "red_digits": lc_red,
+                        }
+                        candidates.append(lc_item)
+                        if _is_ok_water_digits(lc_item):
+                            cells_valid.append(lc_item)
+                            # Strong local read: skip paid OpenAI call for this row source.
+                            if float(lc_conf) >= 0.76:
+                                continue
             try:
                 cs = _vision(
                     sheet_bytes,
