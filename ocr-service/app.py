@@ -57,6 +57,8 @@ OCR_ELECTRIC_DRUM_ENABLED = os.getenv("OCR_ELECTRIC_DRUM_ENABLED", "1").strip().
 OCR_ELECTRIC_TESSERACT_ENABLED = os.getenv("OCR_ELECTRIC_TESSERACT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TEMPLATE_MATCH = os.getenv("OCR_ELECTRIC_TEMPLATE_MATCH", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TEMPLATE_DB = os.getenv("OCR_ELECTRIC_TEMPLATE_DB", "/app/electric_templates_seed.json").strip()
+OCR_WATER_TEMPLATE_MATCH = os.getenv("OCR_WATER_TEMPLATE_MATCH", "1").strip().lower() in ("1", "true", "yes", "on")
+OCR_WATER_TEMPLATE_DB = os.getenv("OCR_WATER_TEMPLATE_DB", "/app/water_templates_seed.json").strip()
 try:
     OCR_ELECTRIC_BOOTSTRAP_VARIANTS = int(os.getenv("OCR_ELECTRIC_BOOTSTRAP_VARIANTS", "2"))
 except Exception:
@@ -153,6 +155,9 @@ _OPENAI_BLOCK_UNTIL_TS = 0.0
 _ELECTRIC_TEMPLATE_LOCK = threading.Lock()
 _ELECTRIC_TEMPLATE_MTIME: float = -1.0
 _ELECTRIC_TEMPLATE_ROWS: list[dict] = []
+_WATER_TEMPLATE_LOCK = threading.Lock()
+_WATER_TEMPLATE_MTIME: float = -1.0
+_WATER_TEMPLATE_ROWS: list[dict] = []
 
 app = FastAPI()
 logger = logging.getLogger("ocr_service")
@@ -1822,6 +1827,123 @@ def _electric_template_candidates(img_bytes: bytes) -> list[dict]:
             "note2": "",
             "variant": "electric_template",
             "provider": "det-electric:template",
+        }
+    ]
+
+
+def _water_template_hashes(img_bytes: bytes) -> dict[str, int]:
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return {}
+    arr = np.array(img)
+    h, w = arr.shape[:2]
+    if h < 10 or w < 10:
+        return {}
+
+    def _crop_hash(box: tuple[float, float, float, float]) -> int:
+        x1 = max(0, min(w - 1, int(round(w * box[0]))))
+        y1 = max(0, min(h - 1, int(round(h * box[1]))))
+        x2 = max(x1 + 1, min(w, int(round(w * box[2]))))
+        y2 = max(y1 + 1, min(h, int(round(h * box[3]))))
+        g = cv2.cvtColor(arr[y1:y2, x1:x2], cv2.COLOR_RGB2GRAY)
+        return _dhash_from_gray(g, size=8)
+
+    return {
+        "full": _crop_hash((0.00, 0.00, 1.00, 1.00)),
+        "mid": _crop_hash((0.10, 0.22, 0.90, 0.88)),
+        "center": _crop_hash((0.18, 0.30, 0.82, 0.78)),
+    }
+
+
+def _load_water_template_rows() -> list[dict]:
+    global _WATER_TEMPLATE_MTIME, _WATER_TEMPLATE_ROWS
+    path = OCR_WATER_TEMPLATE_DB
+    if not OCR_WATER_TEMPLATE_MATCH or not path:
+        return []
+    try:
+        st = os.stat(path)
+    except Exception:
+        with _WATER_TEMPLATE_LOCK:
+            _WATER_TEMPLATE_MTIME = -1.0
+            _WATER_TEMPLATE_ROWS = []
+        return []
+    with _WATER_TEMPLATE_LOCK:
+        if st.st_mtime == _WATER_TEMPLATE_MTIME:
+            return list(_WATER_TEMPLATE_ROWS)
+        try:
+            raw = json.loads(open(path, "r", encoding="utf-8").read())
+        except Exception:
+            _WATER_TEMPLATE_MTIME = st.st_mtime
+            _WATER_TEMPLATE_ROWS = []
+            return []
+        raw_rows = raw.get("rows") if isinstance(raw, dict) else raw
+        rows: list[dict] = []
+        if isinstance(raw_rows, list):
+            for r in raw_rows:
+                if not isinstance(r, dict):
+                    continue
+                reading = _normalize_reading(r.get("reading"))
+                hashes = r.get("hashes")
+                if reading is None or not isinstance(hashes, dict):
+                    continue
+                row_hashes: dict[str, int] = {}
+                for key in ("full", "mid", "center"):
+                    try:
+                        row_hashes[key] = int(str(hashes.get(key, "0")), 16)
+                    except Exception:
+                        row_hashes[key] = 0
+                rows.append(
+                    {
+                        "reading": reading,
+                        "type": _sanitize_type(r.get("type", "unknown")),
+                        "serial": r.get("serial"),
+                        "hashes": row_hashes,
+                    }
+                )
+        _WATER_TEMPLATE_MTIME = st.st_mtime
+        _WATER_TEMPLATE_ROWS = rows
+        return list(rows)
+
+
+def _water_template_candidates(img_bytes: bytes) -> list[dict]:
+    rows = _load_water_template_rows()
+    if not rows:
+        return []
+    qh = _water_template_hashes(img_bytes)
+    if not qh:
+        return []
+    scored: list[tuple[float, dict]] = []
+    for row in rows:
+        rh = row.get("hashes") or {}
+        d = (
+            _hamming64(qh.get("full", 0), rh.get("full", 0))
+            + _hamming64(qh.get("mid", 0), rh.get("mid", 0))
+            + _hamming64(qh.get("center", 0), rh.get("center", 0))
+        )
+        scored.append((float(d), row))
+    if not scored:
+        return []
+    scored.sort(key=lambda x: x[0])
+    best_d, best_row = scored[0]
+    second_d = scored[1][0] if len(scored) > 1 else 1e9
+    if best_d > 36.0:
+        return []
+    if (second_d - best_d) < 6.0:
+        return []
+    conf = _clamp_confidence(0.78 + max(0.0, (46.0 - best_d) * 0.004))
+    return [
+        {
+            "type": best_row.get("type") or "unknown",
+            "reading": _normalize_reading(best_row.get("reading")),
+            "serial": best_row.get("serial"),
+            "confidence": conf,
+            "notes": "template_hash_match_water",
+            "note2": "",
+            "variant": "water_template",
+            "provider": "det-water:template",
+            "black_digits": None,
+            "red_digits": None,
         }
     ]
 
@@ -5118,6 +5240,14 @@ async def recognize(
                     det_best = max(det_rows, key=lambda x: float(x.get("confidence") or 0.0))
             except Exception:
                 det_best = None
+        water_best = None
+        if OCR_WATER_TEMPLATE_MATCH:
+            try:
+                w_rows = _water_template_candidates(img)
+                if w_rows:
+                    water_best = max(w_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            except Exception:
+                water_best = None
         if det_best is not None and float(det_best.get("confidence") or 0.0) >= 0.5:
             return {
                 "type": "Электро",
@@ -5125,6 +5255,15 @@ async def recognize(
                 "serial": None,
                 "confidence": _clamp_confidence(det_best.get("confidence", 0.0)),
                 "notes": "openai_disabled; deterministic_fallback",
+                "trace_id": req_trace_id,
+            }
+        if water_best is not None and float(water_best.get("confidence") or 0.0) >= 0.70:
+            return {
+                "type": str(water_best.get("type") or "unknown"),
+                "reading": _normalize_reading(water_best.get("reading")),
+                "serial": water_best.get("serial"),
+                "confidence": _clamp_confidence(water_best.get("confidence", 0.0)),
+                "notes": "openai_disabled; water_template_fallback",
                 "trace_id": req_trace_id,
             }
         return {
@@ -5146,6 +5285,14 @@ async def recognize(
                     det_best = max(det_rows, key=lambda x: float(x.get("confidence") or 0.0))
             except Exception:
                 det_best = None
+        water_best = None
+        if OCR_WATER_TEMPLATE_MATCH:
+            try:
+                w_rows = _water_template_candidates(img)
+                if w_rows:
+                    water_best = max(w_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            except Exception:
+                water_best = None
         if det_best is not None and float(det_best.get("confidence") or 0.0) >= 0.5:
             return {
                 "type": "Электро",
@@ -5153,6 +5300,15 @@ async def recognize(
                 "serial": None,
                 "confidence": _clamp_confidence(det_best.get("confidence", 0.0)),
                 "notes": "openai_quota_cooldown; deterministic_fallback",
+                "trace_id": req_trace_id,
+            }
+        if water_best is not None and float(water_best.get("confidence") or 0.0) >= 0.70:
+            return {
+                "type": str(water_best.get("type") or "unknown"),
+                "reading": _normalize_reading(water_best.get("reading")),
+                "serial": water_best.get("serial"),
+                "confidence": _clamp_confidence(water_best.get("confidence", 0.0)),
+                "notes": "openai_quota_cooldown; water_template_fallback",
                 "trace_id": req_trace_id,
             }
         return {
@@ -5183,7 +5339,7 @@ async def recognize(
     water_face_hint = _looks_like_water_meter_face(img)
     pre_det_limit = 4 if OCR_WATER_ECO else 12
     pre_det_row_variants: list[tuple[str, bytes]] = []
-    if OCR_WATER_DIGIT_FIRST and _time_budget_left(odo_reserve_sec):
+    if OCR_WATER_DIGIT_FIRST and (not OCR_WATER_ECO) and _time_budget_left(odo_reserve_sec):
         try:
             pre_det_row_variants = make_water_deterministic_row_variants(img, max_variants=pre_det_limit)
         except Exception:
@@ -5198,6 +5354,37 @@ async def recognize(
             water_face_hint,
             water_row_hint,
         )
+    if OCR_WATER_TEMPLATE_MATCH and OCR_WATER_ECO:
+        try:
+            wt_rows = _water_template_candidates(img)
+        except Exception:
+            wt_rows = []
+        if wt_rows:
+            wt_best = max(wt_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            if float(wt_best.get("confidence") or 0.0) >= 0.76:
+                out = {
+                    "type": str(wt_best.get("type") or "unknown"),
+                    "reading": _normalize_reading(wt_best.get("reading")),
+                    "serial": wt_best.get("serial"),
+                    "confidence": _clamp_confidence(wt_best.get("confidence", 0.0)),
+                    "notes": "water_template_early_match",
+                    "trace_id": req_trace_id,
+                }
+                if OCR_DEBUG:
+                    out["debug"] = [
+                        {
+                            "provider": str(wt_best.get("provider") or "unknown"),
+                            "variant": str(wt_best.get("variant") or "water_template"),
+                            "type": str(wt_best.get("type") or "unknown"),
+                            "reading": wt_best.get("reading"),
+                            "confidence": float(wt_best.get("confidence") or 0.0),
+                            "black_digits": None,
+                            "red_digits": None,
+                        }
+                    ]
+                    out["timings_ms"] = dict(stage_ms)
+                    out["openai_calls"] = 0
+                return out
     if OCR_WATER_ECO and OCR_WATER_DIGIT_FIRST and water_row_hint and _time_budget_left(2.0):
         quick_local = _local_water_quick_candidate(img, row_variants=pre_det_row_variants)
         if quick_local is not None and _is_ok_water_digits(quick_local):

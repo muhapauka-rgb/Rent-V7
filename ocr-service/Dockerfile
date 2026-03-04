@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY app.py /app/app.py
 COPY water_deterministic.py /app/water_deterministic.py
 COPY electric_templates_seed.json /app/electric_templates_seed.json
+COPY water_templates_seed.json /app/water_templates_seed.json
 COPY tests /app/tests
 
 ENV PYTHONUNBUFFERED=1
