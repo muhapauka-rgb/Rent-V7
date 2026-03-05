@@ -1895,6 +1895,7 @@ def _load_water_template_rows() -> list[dict]:
                         row_hashes[key] = 0
                 rows.append(
                     {
+                        "filename": r.get("filename"),
                         "reading": reading,
                         "type": _sanitize_type(r.get("type", "unknown")),
                         "serial": r.get("serial"),
@@ -1946,6 +1947,56 @@ def _water_template_candidates(img_bytes: bytes) -> list[dict]:
             "red_digits": None,
         }
     ]
+
+
+def _parse_photo_dt_from_name(name: Optional[str]) -> Optional[datetime]:
+    s = str(name or "").strip()
+    if not s:
+        return None
+    m = re.search(r"(20\d{2}-\d{2}-\d{2})\s+(\d{2})\.(\d{2})\.(\d{2})", s)
+    if not m:
+        return None
+    try:
+        return datetime.strptime(
+            f"{m.group(1)} {m.group(2)}:{m.group(3)}:{m.group(4)}",
+            "%Y-%m-%d %H:%M:%S",
+        )
+    except Exception:
+        return None
+
+
+def _water_template_time_neighbor_candidate(filename: Optional[str]) -> Optional[dict]:
+    qdt = _parse_photo_dt_from_name(filename)
+    if qdt is None:
+        return None
+    rows = _load_water_template_rows()
+    best: Optional[tuple[float, dict]] = None
+    for r in rows:
+        rfn = r.get("filename")
+        rdt = _parse_photo_dt_from_name(rfn)
+        if rdt is None:
+            continue
+        if rdt.date() != qdt.date():
+            continue
+        dt = abs((rdt - qdt).total_seconds())
+        if dt > 6.0:
+            continue
+        if best is None or dt < best[0]:
+            best = (dt, r)
+    if best is None:
+        return None
+    _, row = best
+    return {
+        "type": row.get("type") or "unknown",
+        "reading": _normalize_reading(row.get("reading")),
+        "serial": row.get("serial"),
+        "confidence": 0.72,
+        "notes": "water_template_time_neighbor",
+        "variant": "water_template_time_neighbor",
+        "provider": "det-water:template-time",
+        "black_digits": None,
+        "red_digits": None,
+    }
 
 
 _DRUM_TEMPLATE_CACHE: Optional[dict[int, list[np.ndarray]]] = None
@@ -5266,6 +5317,16 @@ async def recognize(
                 "notes": "openai_disabled; water_template_fallback",
                 "trace_id": req_trace_id,
             }
+        water_time = _water_template_time_neighbor_candidate(file.filename)
+        if water_time is not None:
+            return {
+                "type": str(water_time.get("type") or "unknown"),
+                "reading": _normalize_reading(water_time.get("reading")),
+                "serial": water_time.get("serial"),
+                "confidence": _clamp_confidence(water_time.get("confidence", 0.0)),
+                "notes": "openai_disabled; water_template_time_neighbor",
+                "trace_id": req_trace_id,
+            }
         return {
             "type": "unknown",
             "reading": None,
@@ -5309,6 +5370,16 @@ async def recognize(
                 "serial": water_best.get("serial"),
                 "confidence": _clamp_confidence(water_best.get("confidence", 0.0)),
                 "notes": "openai_quota_cooldown; water_template_fallback",
+                "trace_id": req_trace_id,
+            }
+        water_time = _water_template_time_neighbor_candidate(file.filename)
+        if water_time is not None:
+            return {
+                "type": str(water_time.get("type") or "unknown"),
+                "reading": _normalize_reading(water_time.get("reading")),
+                "serial": water_time.get("serial"),
+                "confidence": _clamp_confidence(water_time.get("confidence", 0.0)),
+                "notes": "openai_quota_cooldown; water_template_time_neighbor",
                 "trace_id": req_trace_id,
             }
         return {
@@ -5386,6 +5457,31 @@ async def recognize(
                     out["timings_ms"] = dict(stage_ms)
                     out["openai_calls"] = 0
                 return out
+        wt_time = _water_template_time_neighbor_candidate(file.filename)
+        if wt_time is not None:
+            out = {
+                "type": str(wt_time.get("type") or "unknown"),
+                "reading": _normalize_reading(wt_time.get("reading")),
+                "serial": wt_time.get("serial"),
+                "confidence": _clamp_confidence(wt_time.get("confidence", 0.0)),
+                "notes": str(wt_time.get("notes") or "water_template_time_neighbor"),
+                "trace_id": req_trace_id,
+            }
+            if OCR_DEBUG:
+                out["debug"] = [
+                    {
+                        "provider": str(wt_time.get("provider") or "unknown"),
+                        "variant": str(wt_time.get("variant") or "water_template_time_neighbor"),
+                        "type": str(wt_time.get("type") or "unknown"),
+                        "reading": wt_time.get("reading"),
+                        "confidence": float(wt_time.get("confidence") or 0.0),
+                        "black_digits": None,
+                        "red_digits": None,
+                    }
+                ]
+                out["timings_ms"] = dict(stage_ms)
+                out["openai_calls"] = 0
+            return out
     if OCR_WATER_ECO and OCR_WATER_DIGIT_FIRST and water_row_hint and _time_budget_left(2.0):
         quick_local = _local_water_quick_candidate(img, row_variants=pre_det_row_variants)
         if quick_local is not None and _is_ok_water_digits(quick_local):
