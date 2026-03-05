@@ -1,0 +1,12 @@
+file|expected|recognized|status|delta|type|confidence
+photo_2026-03-01 01.33.20.jpeg|5536.0|5336.2|wrong|199.800|Электро|0.9
+photo_2026-03-01 01.33.22.jpeg|2662.0|2062.0|wrong|600.000|Электро|0.9
+photo_2026-03-01 01.33.58.jpeg|7979.88|7919.68|wrong|60.200|Электро|0.99
+photo_2026-03-01 01.34.12.jpeg|5343.0|2345.1|wrong|2997.900|Электро|0.8600000000000001
+photo_2026-03-01 01.34.15.jpeg|5343.0|None|miss|inf|unknown|0.0
+photo_2026-03-01 01.34.20.jpeg|2581.0|2281.0|wrong|300.000|Электро|0.95
+photo_2026-03-01 01.34.27.jpeg|226.5|2263.0|wrong|2036.500|Электро|0.95
+photo_2026-03-01 01.34.31.jpeg|7925.0|None|miss|inf|unknown|0.0
+photo_2026-03-01 01.34.54.jpeg|2562.0|2002.0|wrong|560.000|Электро|0.9
+
+summary total=9 exact=0 int=0 wrong=7 miss=2

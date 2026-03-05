@@ -1860,7 +1860,7 @@ export default function App() {
     rubEnabled: boolean,
     highlightMode: "none" | "missing" | "review" = "none"
   ) {
-    const color = highlightMode === "review" ? "#b91c1c" : highlightMode === "missing" ? "#d97706" : "var(--text)";
+    const color = highlightMode === "review" ? "var(--warn-active)" : highlightMode === "missing" ? "#d97706" : "var(--text)";
     return (
       <div className="meter-triplet" style={{ display: "grid", gap: 2, lineHeight: 1.25 }}>
         <div className="meter-main" style={{ color, fontSize: 13, fontWeight: 400 }}>{fmtNum(current, 3)}</div>
