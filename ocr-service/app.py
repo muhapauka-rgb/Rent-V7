@@ -33,7 +33,16 @@ def _env_nonempty(name: str, default: str) -> str:
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OCR_OPENAI_ENABLED = os.getenv("OCR_OPENAI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_RUNTIME_MODE = _env_nonempty("OCR_RUNTIME_MODE", "strict-offline").strip().lower()
+if OCR_RUNTIME_MODE not in ("strict-offline", "hybrid", "openai-only"):
+    OCR_RUNTIME_MODE = "strict-offline"
+_OCR_OPENAI_ENV = os.getenv("OCR_OPENAI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+if OCR_RUNTIME_MODE == "openai-only":
+    OCR_OPENAI_ENABLED = True
+elif OCR_RUNTIME_MODE == "strict-offline":
+    OCR_OPENAI_ENABLED = False
+else:
+    OCR_OPENAI_ENABLED = _OCR_OPENAI_ENV
 OCR_MODEL = _env_nonempty("OCR_MODEL", "gpt-4o")
 OCR_MODEL_PRIMARY = _env_nonempty("OCR_MODEL_PRIMARY", OCR_MODEL)
 OCR_MODEL_FALLBACK = _env_nonempty("OCR_MODEL_FALLBACK", "gpt-4o-mini")
@@ -52,7 +61,7 @@ OCR_WATER_DIGIT_FIRST = os.getenv("OCR_WATER_DIGIT_FIRST", "1").strip().lower() 
 OCR_WATER_ECO = os.getenv("OCR_WATER_ECO", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_WATER_INTEGER_ONLY = os.getenv("OCR_WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_BOOTSTRAP = os.getenv("OCR_ELECTRIC_BOOTSTRAP", "1").strip().lower() in ("1", "true", "yes", "on")
-OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "0").strip().lower() in ("1", "true", "yes", "on")
+OCR_ELECTRIC_DETERMINISTIC = os.getenv("OCR_ELECTRIC_DETERMINISTIC", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_DRUM_ENABLED = os.getenv("OCR_ELECTRIC_DRUM_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TESSERACT_ENABLED = os.getenv("OCR_ELECTRIC_TESSERACT_ENABLED", "1").strip().lower() in ("1", "true", "yes", "on")
 OCR_ELECTRIC_TEMPLATE_MATCH = os.getenv("OCR_ELECTRIC_TEMPLATE_MATCH", "1").strip().lower() in ("1", "true", "yes", "on")
@@ -165,7 +174,11 @@ logger = logging.getLogger("ocr_service")
 
 @app.get("/health")
 def health() -> dict:
-    return {"ok": True}
+    return {
+        "ok": True,
+        "mode": OCR_RUNTIME_MODE,
+        "openai_enabled": bool(OCR_OPENAI_ENABLED),
+    }
 
 SYSTEM_PROMPT = """Ты — OCR-ассистент для коммунальных счётчиков (вода/электро).
 
