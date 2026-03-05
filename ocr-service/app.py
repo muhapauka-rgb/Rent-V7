@@ -5413,6 +5413,39 @@ async def recognize(
                 out["timings_ms"] = dict(stage_ms)
                 out["openai_calls"] = 0
             return out
+    # Cheap and stable early exit for previously seen electric displays.
+    # Prevents expensive OpenAI calls and avoids occasional decimal/scale drift.
+    if OCR_ELECTRIC_TEMPLATE_MATCH and (not skip_electric_bootstrap):
+        try:
+            et_rows = _electric_template_candidates(img)
+        except Exception:
+            et_rows = []
+        if et_rows:
+            et_best = max(et_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            if float(et_best.get("confidence") or 0.0) >= 0.81:
+                out = {
+                    "type": str(et_best.get("type") or "Электро"),
+                    "reading": _normalize_reading(et_best.get("reading")),
+                    "serial": et_best.get("serial"),
+                    "confidence": _clamp_confidence(et_best.get("confidence", 0.0)),
+                    "notes": "electric_template_early_match",
+                    "trace_id": req_trace_id,
+                }
+                if OCR_DEBUG:
+                    out["debug"] = [
+                        {
+                            "provider": str(et_best.get("provider") or "unknown"),
+                            "variant": str(et_best.get("variant") or "electric_template"),
+                            "type": str(et_best.get("type") or "Электро"),
+                            "reading": et_best.get("reading"),
+                            "confidence": float(et_best.get("confidence") or 0.0),
+                            "black_digits": None,
+                            "red_digits": None,
+                        }
+                    ]
+                    out["timings_ms"] = dict(stage_ms)
+                    out["openai_calls"] = 0
+                return out
 
     # Electric bootstrap:
     # When digit-first water mode is enabled, generic passes are mostly skipped.
