@@ -17,3 +17,7 @@ dist/
 
 # OS
 .DS_Store
+
+# local work dirs
+.worktrees/
+tmp/

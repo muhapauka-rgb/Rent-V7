@@ -162,6 +162,11 @@ _WATER_TEMPLATE_ROWS: list[dict] = []
 app = FastAPI()
 logger = logging.getLogger("ocr_service")
 
+
+@app.get("/health")
+def health() -> dict:
+    return {"ok": True}
+
 SYSTEM_PROMPT = """Ты — OCR-ассистент для коммунальных счётчиков (вода/электро).
 
 Твоя задача:
