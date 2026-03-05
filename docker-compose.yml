@@ -20,6 +20,8 @@ services:
     build: ./ocr-service
     container_name: rent_ocr
     env_file: .env
+    environment:
+      OCR_RUNTIME_MODE: ${OCR_RUNTIME_MODE:-auto}
     ports:
       - "8002:8000"
     healthcheck:

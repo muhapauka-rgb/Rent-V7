@@ -33,14 +33,18 @@ def _env_nonempty(name: str, default: str) -> str:
 
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
-OCR_RUNTIME_MODE = _env_nonempty("OCR_RUNTIME_MODE", "strict-offline").strip().lower()
-if OCR_RUNTIME_MODE not in ("strict-offline", "hybrid", "openai-only"):
-    OCR_RUNTIME_MODE = "strict-offline"
+OCR_RUNTIME_MODE = _env_nonempty("OCR_RUNTIME_MODE", "auto").strip().lower()
+if OCR_RUNTIME_MODE not in ("auto", "strict-offline", "hybrid", "openai-only"):
+    OCR_RUNTIME_MODE = "auto"
 _OCR_OPENAI_ENV = os.getenv("OCR_OPENAI_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 if OCR_RUNTIME_MODE == "openai-only":
     OCR_OPENAI_ENABLED = True
 elif OCR_RUNTIME_MODE == "strict-offline":
     OCR_OPENAI_ENABLED = False
+elif OCR_RUNTIME_MODE == "auto":
+    # Fully automatic mode: keep cheap deterministic paths first,
+    # and allow OpenAI fallback only when key is configured.
+    OCR_OPENAI_ENABLED = bool(OPENAI_API_KEY)
 else:
     OCR_OPENAI_ENABLED = _OCR_OPENAI_ENV
 OCR_MODEL = _env_nonempty("OCR_MODEL", "gpt-4o")
@@ -5459,6 +5463,38 @@ async def recognize(
                             "confidence": float(et_best.get("confidence") or 0.0),
                             "black_digits": None,
                             "red_digits": None,
+                        }
+                    ]
+                    out["timings_ms"] = dict(stage_ms)
+                    out["openai_calls"] = 0
+                return out
+    # AUTO mode: try deterministic electric path before expensive OpenAI bootstrap.
+    if OCR_RUNTIME_MODE == "auto" and OCR_ELECTRIC_DETERMINISTIC and (not skip_electric_bootstrap):
+        try:
+            auto_det_rows = _electric_deterministic_candidates(img)
+        except Exception:
+            auto_det_rows = []
+        if auto_det_rows:
+            auto_det_best = max(auto_det_rows, key=lambda x: float(x.get("confidence") or 0.0))
+            if float(auto_det_best.get("confidence") or 0.0) >= 0.86:
+                out = {
+                    "type": "Электро",
+                    "reading": _normalize_reading(auto_det_best.get("reading")),
+                    "serial": auto_det_best.get("serial"),
+                    "confidence": _clamp_confidence(float(auto_det_best.get("confidence") or 0.0)),
+                    "notes": "auto_mode; deterministic_electric_early_match",
+                    "trace_id": req_trace_id,
+                }
+                if OCR_DEBUG:
+                    out["debug"] = [
+                        {
+                            "provider": str(auto_det_best.get("provider") or "unknown"),
+                            "variant": str(auto_det_best.get("variant") or "electric_det"),
+                            "type": "Электро",
+                            "reading": auto_det_best.get("reading"),
+                            "confidence": float(auto_det_best.get("confidence") or 0.0),
+                            "black_digits": auto_det_best.get("black_digits"),
+                            "red_digits": auto_det_best.get("red_digits"),
                         }
                     ]
                     out["timings_ms"] = dict(stage_ms)
