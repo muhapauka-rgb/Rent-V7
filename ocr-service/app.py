@@ -5336,7 +5336,8 @@ async def recognize(
     candidates: list[dict] = []
     serial_target_hit = False
     quick_bootstrap_deferred = False
-    water_face_hint = _looks_like_water_meter_face(img)
+    # Hough-based circle hint is expensive on some dark photos; skip in eco mode.
+    water_face_hint = False if OCR_WATER_ECO else _looks_like_water_meter_face(img)
     pre_det_limit = 4 if OCR_WATER_ECO else 12
     pre_det_row_variants: list[tuple[str, bytes]] = []
     if OCR_WATER_DIGIT_FIRST and (not OCR_WATER_ECO) and _time_budget_left(odo_reserve_sec):
