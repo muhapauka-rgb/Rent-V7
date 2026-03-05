@@ -1,7 +1,7 @@
 {
   "version": 1,
   "hash": "dhash64",
-  "count": 4,
+  "count": 6,
   "rows": [
     {
       "filename": "photo_2026-02-05 14.24.38.jpeg",
@@ -12,6 +12,17 @@
         "full": "bcfc3810103aaa89",
         "mid": "f93c783030302869",
         "center": "3c78703030303869"
+      }
+    },
+    {
+      "filename": "photo_2026-02-05 14.24.41.jpeg",
+      "type": "unknown",
+      "reading": 999.67,
+      "serial": null,
+      "hashes": {
+        "full": "868625c101418949",
+        "mid": "932564e090008184",
+        "center": "2266e29881800082"
       }
     },
     {
@@ -34,6 +45,17 @@
         "full": "091133e206161617",
         "mid": "007a72c3c3831313",
         "center": "59d1c1c1c30b1313"
+      }
+    },
+    {
+      "filename": "photo_2026-02-17 18.16.15.jpeg",
+      "type": "unknown",
+      "reading": 1003.21,
+      "serial": null,
+      "hashes": {
+        "full": "0c4a73c3c38b0a8b",
+        "mid": "cb59d18183818909",
+        "center": "91d4308101050908"
       }
     },
     {
