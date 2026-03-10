@@ -197,9 +197,8 @@ def dashboard_apartment_meters(apartment_id: int):
         if cur is not None and prev_e3 is not None:
             d = cur - prev_e3
             entry["kinds"]["electric"]["t3"]["delta"] = d
-            t = entry["kinds"]["electric"]["t3"]["tariff"]
-            if t is not None:
-                entry["kinds"]["electric"]["t3"]["rub"] = float(d) * float(t)
+            # T3 is informational (sum T1+T2) and must not be billed separately.
+            entry["kinds"]["electric"]["t3"]["rub"] = None
         prev_e3 = cur
 
         # sewer
@@ -217,7 +216,6 @@ def dashboard_apartment_meters(apartment_id: int):
             entry["kinds"]["hot"]["rub"],
             entry["kinds"]["electric"]["t1"]["rub"],
             entry["kinds"]["electric"]["t2"]["rub"],
-            entry["kinds"]["electric"]["t3"]["rub"],
             entry["kinds"]["sewer"]["rub"],
         ]
         if all(x is not None for x in rubs):
