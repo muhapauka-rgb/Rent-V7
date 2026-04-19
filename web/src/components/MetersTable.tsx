@@ -331,7 +331,7 @@ export default function MetersTable(props: Props) {
                   {fCold ? (
                     <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <button onClick={() => onCellPhoto && onCellPhoto(h.month, "cold", 1, fCold.id)} style={reviewBtnStyle}>
-                        Проверить значение
+                        Проверить
                       </button>
                       <button onClick={() => onResolveReviewFlag(fCold.id)} style={resolveBtnStyle}>
                         Подтвердить
@@ -370,7 +370,7 @@ export default function MetersTable(props: Props) {
                   {fHot ? (
                     <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <button onClick={() => onCellPhoto && onCellPhoto(h.month, "hot", 1, fHot.id)} style={reviewBtnStyle}>
-                        Проверить значение
+                        Проверить
                       </button>
                       <button onClick={() => onResolveReviewFlag(fHot.id)} style={resolveBtnStyle}>
                         Подтвердить
@@ -384,7 +384,7 @@ export default function MetersTable(props: Props) {
                   {fSewer ? (
                     <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                       <button onClick={() => onCellPhoto && onCellPhoto(h.month, "sewer", 1, fSewer.id)} style={reviewBtnStyle}>
-                        Проверить значение
+                        Проверить
                       </button>
                       <button onClick={() => onResolveReviewFlag(fSewer.id)} style={resolveBtnStyle}>
                         Подтвердить
@@ -424,7 +424,7 @@ export default function MetersTable(props: Props) {
                     {fE1 ? (
                       <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                         <button onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 1, fE1.id)} style={reviewBtnStyle}>
-                          Проверить значение
+                          Проверить
                         </button>
                         <button onClick={() => onResolveReviewFlag(fE1.id)} style={resolveBtnStyle}>
                           Подтвердить
@@ -465,7 +465,7 @@ export default function MetersTable(props: Props) {
                     {fE2 ? (
                       <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                         <button onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 2, fE2.id)} style={reviewBtnStyle}>
-                          Проверить значение
+                          Проверить
                         </button>
                         <button onClick={() => onResolveReviewFlag(fE2.id)} style={resolveBtnStyle}>
                           Подтвердить
@@ -506,7 +506,7 @@ export default function MetersTable(props: Props) {
                     {fE3 ? (
                       <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
                         <button onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 3, fE3.id)} style={reviewBtnStyle}>
-                          Проверить значение
+                          Проверить
                         </button>
                         <button onClick={() => onResolveReviewFlag(fE3.id)} style={resolveBtnStyle}>
                           Подтвердить
