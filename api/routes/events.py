@@ -7,6 +7,7 @@ import os
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Optional
 
 from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.encoders import jsonable_encoder
@@ -1390,6 +1391,119 @@ def _flag_manual_overwrite(
         },
     )
 
+
+_API_REVIEW_TRACE_WARNING_PHASES: dict[str, str] = {
+    "water_prev_sanity_corrected": "water_prev_sanity",
+    "water_prev_sanity_blocked": "water_prev_sanity",
+    "water_prev_sanity_saved_with_review": "water_prev_sanity",
+    "water_prev_hard_block": "water_prev_sanity",
+    "water_debug_recovered": "water_debug_recovery",
+    "anomaly_jump": "anomaly_gate",
+    "anomaly_saved_with_review": "anomaly_gate",
+    "serial_mismatch": "serial_gate",
+    "water_serial_prev_corrected": "serial_history_gate",
+    "water_serial_prev_saved_with_review": "serial_history_gate",
+    "ocr_type_conflict": "type_resolution",
+    "water_type_uncertain": "type_resolution",
+    "retake_overwrite": "write_path",
+    "possible_duplicate": "write_path",
+}
+
+
+def _set_api_review_trace(
+    diag: dict[str, Any],
+    *,
+    ym: str,
+    apartment_id: Optional[int],
+    raw_ocr_type: Optional[str],
+    raw_ocr_reading: Optional[Any],
+    raw_ocr_serial: Optional[str],
+    resolved_meter_kind: Optional[str],
+    resolved_meter_label: Optional[str],
+    assigned_meter_index: int,
+    meter_written: bool,
+    event_status: Optional[str],
+    photo_event_id: Optional[int] = None,
+    ydisk_path: Optional[str] = None,
+    reason_override: Optional[str] = None,
+    serial_force_kind: Optional[str] = None,
+) -> None:
+    entries: list[dict[str, Any]] = []
+
+    def _append(phase: str, event: str, **details: Any) -> None:
+        payload = {
+            "phase": str(phase),
+            "event": str(event),
+            "details": jsonable_encoder(
+                {
+                    k: v
+                    for k, v in details.items()
+                    if v is not None and v != [] and v != {}
+                }
+            ),
+        }
+        entries.append(payload)
+
+    water_decision = diag.get("ocr_water_decision") if isinstance(diag.get("ocr_water_decision"), dict) else None
+    if water_decision:
+        winner = water_decision.get("winner") if isinstance(water_decision.get("winner"), dict) else None
+        _append(
+            "ocr_winner",
+            "water_candidate_selected",
+            source=(winner or {}).get("source"),
+            variant=(winner or {}).get("variant"),
+            reading=(winner or {}).get("reading"),
+            serial=(winner or {}).get("serial"),
+            candidate_score=(winner or {}).get("candidate_score"),
+            suspicious_flags=(winner or {}).get("suspicious_flags"),
+            override=water_decision.get("override"),
+            serial_tail_like=water_decision.get("serial_tail_like"),
+        )
+
+    _append(
+        "type_resolution",
+        "resolved_meter_type",
+        ym=str(ym),
+        apartment_id=int(apartment_id) if apartment_id is not None else None,
+        raw_ocr_type=(str(raw_ocr_type) if raw_ocr_type is not None else None),
+        raw_ocr_reading=raw_ocr_reading,
+        raw_ocr_serial=(str(raw_ocr_serial) if raw_ocr_serial is not None else None),
+        serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
+        resolved_meter_kind=(str(resolved_meter_kind) if resolved_meter_kind else None),
+        resolved_meter_label=(str(resolved_meter_label) if resolved_meter_label else None),
+        assigned_meter_index=int(assigned_meter_index),
+    )
+
+    seen_warning_events: set[str] = set()
+    for warning in list(diag.get("warnings") or []):
+        if not isinstance(warning, dict):
+            continue
+        for key, value in warning.items():
+            phase = _API_REVIEW_TRACE_WARNING_PHASES.get(str(key))
+            if not phase:
+                continue
+            fingerprint = f"{phase}:{key}:{json.dumps(jsonable_encoder(value), ensure_ascii=False, sort_keys=True)}"
+            if fingerprint in seen_warning_events:
+                continue
+            seen_warning_events.add(fingerprint)
+            _append(phase, str(key), payload=value)
+
+    _append(
+        "final_decision",
+        "meter_written" if meter_written else "needs_review",
+        reason=(str(reason_override) if reason_override else None),
+        meter_written=bool(meter_written),
+        event_status=(str(event_status) if event_status is not None else None),
+        resolved_meter_kind=(str(resolved_meter_kind) if resolved_meter_kind else None),
+        resolved_meter_label=(str(resolved_meter_label) if resolved_meter_label else None),
+        assigned_meter_index=int(assigned_meter_index),
+        photo_event_id=int(photo_event_id) if photo_event_id is not None else None,
+        ydisk_path=(str(ydisk_path) if ydisk_path else None),
+    )
+
+    diag["api_review_trace"] = entries
+
+
 @router.post("/events/photo")
 async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
@@ -2497,6 +2611,39 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     pass
 
                 if block_write_due_anomaly:
+                    _set_api_review_trace(
+                        diag,
+                        ym=str(ym),
+                        apartment_id=(int(apartment_id) if apartment_id is not None else None),
+                        raw_ocr_type=(str(ocr_type) if ocr_type is not None else None),
+                        raw_ocr_reading=ocr_reading,
+                        raw_ocr_serial=(str(ocr_serial) if ocr_serial is not None else None),
+                        resolved_meter_kind=(str(kind) if kind is not None else None),
+                        resolved_meter_label=_kind_to_label((str(kind) if kind is not None else None), assigned_meter_index),
+                        assigned_meter_index=int(assigned_meter_index),
+                        meter_written=False,
+                        event_status="needs_review",
+                        photo_event_id=(int(photo_event_id) if photo_event_id is not None else None),
+                        ydisk_path=ydisk_path,
+                        reason_override="block_write_due_anomaly",
+                        serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
+                    )
+                    if db_ready() and photo_event_id:
+                        try:
+                            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+                            with engine.begin() as conn:
+                                conn.execute(
+                                    text(
+                                        """
+                                        UPDATE photo_events
+                                        SET diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                                        WHERE id = :id
+                                        """
+                                    ),
+                                    {"id": int(photo_event_id), "diag_json": diag_json_str},
+                                )
+                        except Exception:
+                            pass
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -2880,6 +3027,39 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                             ),
                                             {"id": int(photo_event_id), "diag_json": diag_json_str},
                                         )
+                                    _set_api_review_trace(
+                                        diag,
+                                        ym=str(ym),
+                                        apartment_id=(int(apartment_id) if apartment_id is not None else None),
+                                        raw_ocr_type=(str(ocr_type) if ocr_type is not None else None),
+                                        raw_ocr_reading=ocr_reading,
+                                        raw_ocr_serial=(str(ocr_serial) if ocr_serial is not None else None),
+                                        resolved_meter_kind=(str(kind) if kind is not None else None),
+                                        resolved_meter_label=_kind_to_label((str(kind) if kind is not None else None), assigned_meter_index),
+                                        assigned_meter_index=int(assigned_meter_index),
+                                        meter_written=False,
+                                        event_status="needs_review",
+                                        photo_event_id=(int(photo_event_id) if photo_event_id is not None else None),
+                                        ydisk_path=ydisk_path,
+                                        reason_override="serial_mismatch",
+                                        serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
+                                    )
+                                    if db_ready() and photo_event_id:
+                                        try:
+                                            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+                                            with engine.begin() as conn:
+                                                conn.execute(
+                                                    text(
+                                                        """
+                                                        UPDATE photo_events
+                                                        SET diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                                                        WHERE id = :id
+                                                        """
+                                                    ),
+                                                    {"id": int(photo_event_id), "diag_json": diag_json_str},
+                                                )
+                                        except Exception:
+                                            pass
                                     return JSONResponse(
                                         status_code=200,
                                         content={
@@ -3537,6 +3717,23 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             ocr_data["resolved_kind"] = resolved_meter_kind
         if resolved_meter_label:
             ocr_data["resolved_type"] = resolved_meter_label
+
+    _set_api_review_trace(
+        diag,
+        ym=str(ym),
+        apartment_id=(int(apartment_id) if apartment_id is not None else None),
+        raw_ocr_type=(str(ocr_type) if ocr_type is not None else None),
+        raw_ocr_reading=ocr_reading,
+        raw_ocr_serial=(str(ocr_serial) if ocr_serial is not None else None),
+        resolved_meter_kind=resolved_meter_kind,
+        resolved_meter_label=resolved_meter_label,
+        assigned_meter_index=int(assigned_meter_index),
+        meter_written=bool(wrote_meter),
+        event_status=("meter_written" if wrote_meter else "needs_review"),
+        photo_event_id=(int(photo_event_id) if photo_event_id is not None else None),
+        ydisk_path=ydisk_path,
+        serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
+    )
 
     payload = {
         "trace_id": trace_id,
