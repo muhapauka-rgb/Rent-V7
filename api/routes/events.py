@@ -1410,6 +1410,70 @@ _API_REVIEW_TRACE_WARNING_PHASES: dict[str, str] = {
 }
 
 
+def _compact_water_candidate_for_diag(
+    candidate: Optional[dict[str, Any]],
+    *,
+    include_serial_metrics: bool = False,
+    include_odometer_metrics: bool = False,
+) -> Optional[dict[str, Any]]:
+    if not isinstance(candidate, dict):
+        return None
+    payload: dict[str, Any] = {
+        "source": candidate.get("source"),
+        "variant": candidate.get("variant"),
+        "provider": candidate.get("provider"),
+        "reading": candidate.get("reading"),
+        "serial": candidate.get("serial"),
+        "candidate_score": candidate.get("candidate_score"),
+        "suspicious_flags": list(candidate.get("suspicious_flags") or [])[:5],
+    }
+    if include_serial_metrics:
+        payload["serial_confidence"] = candidate.get("serial_confidence")
+        payload["tail_match"] = candidate.get("tail_match")
+    if include_odometer_metrics:
+        payload["integer_digits"] = candidate.get("integer_digits")
+        payload["decimal_digits"] = candidate.get("decimal_digits")
+        payload["odo_confidence"] = candidate.get("odo_confidence")
+        payload["geometry_confidence"] = candidate.get("geometry_confidence")
+    return jsonable_encoder({k: v for k, v in payload.items() if v is not None and v != []})
+
+
+def _summarize_water_decision_for_diag(water_decision: dict[str, Any]) -> dict[str, Any]:
+    winner = water_decision.get("winner") if isinstance(water_decision.get("winner"), dict) else None
+    serial_branch = water_decision.get("serial_branch") if isinstance(water_decision.get("serial_branch"), dict) else None
+    odometer_branch = water_decision.get("odometer_branch") if isinstance(water_decision.get("odometer_branch"), dict) else None
+    serial_winner = (serial_branch or {}).get("winner") if isinstance((serial_branch or {}).get("winner"), dict) else None
+    odometer_winner = (odometer_branch or {}).get("winner") if isinstance((odometer_branch or {}).get("winner"), dict) else None
+    ranked = [item for item in list(water_decision.get("ranked") or []) if isinstance(item, dict)]
+    return jsonable_encoder(
+        {
+            "model": water_decision.get("model"),
+            "pool_size": water_decision.get("pool_size"),
+            "strict_pool_size": water_decision.get("strict_pool_size"),
+            "strong_pool_size": water_decision.get("strong_pool_size"),
+            "override": water_decision.get("override"),
+            "context_override_applied": bool(water_decision.get("context_override_applied")),
+            "serial_tail_like": bool(water_decision.get("serial_tail_like")),
+            "winner": _compact_water_candidate_for_diag(winner, include_odometer_metrics=True),
+            "serial_branch_winner": _compact_water_candidate_for_diag(serial_winner, include_serial_metrics=True),
+            "odometer_branch_winner": _compact_water_candidate_for_diag(odometer_winner, include_odometer_metrics=True),
+            "top_sources": [
+                item
+                for item in [
+                    {
+                        "source": cand.get("source"),
+                        "variant": cand.get("variant"),
+                        "reading": cand.get("reading"),
+                        "candidate_score": cand.get("candidate_score"),
+                    }
+                    for cand in ranked[:3]
+                ]
+                if item.get("source")
+            ],
+        }
+    )
+
+
 def _set_api_review_trace(
     diag: dict[str, Any],
     *,
@@ -1984,6 +2048,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             serial_branch = water_decision.get("serial_branch") if isinstance(water_decision.get("serial_branch"), dict) else None
             odometer_branch = water_decision.get("odometer_branch") if isinstance(water_decision.get("odometer_branch"), dict) else None
             diag["ocr_water_decision"] = {
+                "summary": _summarize_water_decision_for_diag(water_decision),
                 "model": water_decision.get("model"),
                 "pool_size": water_decision.get("pool_size"),
                 "strict_pool_size": water_decision.get("strict_pool_size"),
