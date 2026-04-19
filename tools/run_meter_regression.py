@@ -1,10 +1,70 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import math
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import requests
+
+
+CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
+    "5.jpeg": {
+        "ocr": {
+            "type": "ГВС",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "winner_source": "face_top_strip",
+        },
+        "api": {
+            "meter_kind": "cold",
+            "meter_type_label": "ХВС",
+            "ocr_reading": 991.89,
+            "ocr_serial": "13 002714",
+            "winner_source": "face_top_strip",
+        },
+    },
+    "4.jpeg": {
+        "ocr": {
+            "type": "unknown",
+            "reading": 877.00,
+            "serial": "13076128",
+            "winner_source": "template",
+        },
+        "api": {
+            "meter_kind": "hot",
+            "meter_type_label": "ГВС",
+            "ocr_reading": 877.00,
+            "ocr_serial": "13076128",
+            "winner_source": "template",
+        },
+    },
+    "31.jpg": {
+        "ocr": {
+            "type": "Электро",
+            "reading": 4737.21,
+            "serial": "25564336",
+        },
+        "api": {
+            "meter_kind": "electric",
+            "ocr_reading": 4737.21,
+            "ocr_serial": "25564336",
+        },
+    },
+    "32.jpg": {
+        "ocr": {
+            "type": "Электро",
+            "reading": 5680.55,
+            "serial": "25564336",
+        },
+        "api": {
+            "meter_kind": "electric",
+            "ocr_reading": 5680.55,
+            "ocr_serial": "25564336",
+        },
+    },
+}
 
 
 def _top_candidates(water_decision: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -80,6 +140,26 @@ def _api_row(endpoint: str, path: Path, timeout_sec: float, chat_id: str, ym: st
     }
 
 
+def _same_value(actual: Any, expected: Any) -> bool:
+    if isinstance(expected, float):
+        try:
+            return math.isclose(float(actual), float(expected), rel_tol=0.0, abs_tol=0.01)
+        except Exception:
+            return False
+    return actual == expected
+
+
+def _check_golden_row(row: Dict[str, Any], golden_scope: Dict[str, Dict[str, Any]]) -> List[str]:
+    mode = str(row.get("mode") or "")
+    expected = golden_scope.get(mode) or {}
+    mismatches: List[str] = []
+    for key, expected_value in expected.items():
+        actual_value = row.get(key)
+        if not _same_value(actual_value, expected_value):
+            mismatches.append(f"{mode}:{key}: expected={expected_value!r} actual={actual_value!r}")
+    return mismatches
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run focused OCR/API regression checks for meter photos")
     ap.add_argument("paths", nargs="+", help="Absolute or relative image paths to test")
@@ -89,6 +169,7 @@ def main() -> int:
     ap.add_argument("--chat-id", default="206724330")
     ap.add_argument("--ym", default="2026-04")
     ap.add_argument("--timeout-sec", type=float, default=180.0)
+    ap.add_argument("--check-golden", choices=("current",), default=None)
     args = ap.parse_args()
 
     files = [Path(p).expanduser().resolve() for p in args.paths]
@@ -96,16 +177,28 @@ def main() -> int:
     if missing:
         raise SystemExit(f"missing files: {missing}")
 
+    all_mismatches: List[str] = []
     for path in files:
+        golden_scope = CURRENT_GOLDEN_SET.get(path.name, {}) if args.check_golden == "current" else {}
         if args.mode in ("ocr", "both"):
-            print(json.dumps(_ocr_row(args.ocr_endpoint, path, args.timeout_sec), ensure_ascii=False))
+            row = _ocr_row(args.ocr_endpoint, path, args.timeout_sec)
+            print(json.dumps(row, ensure_ascii=False))
+            if golden_scope:
+                all_mismatches.extend([f"{path.name}: {m}" for m in _check_golden_row(row, golden_scope)])
         if args.mode in ("api", "both"):
+            row = _api_row(args.api_endpoint, path, args.timeout_sec, args.chat_id, args.ym)
             print(
                 json.dumps(
-                    _api_row(args.api_endpoint, path, args.timeout_sec, args.chat_id, args.ym),
+                    row,
                     ensure_ascii=False,
                 )
             )
+            if golden_scope:
+                all_mismatches.extend([f"{path.name}: {m}" for m in _check_golden_row(row, golden_scope)])
+    if all_mismatches:
+        for mismatch in all_mismatches:
+            print(f"GOLDEN_MISMATCH: {mismatch}", file=sys.stderr)
+        return 1
     return 0
 
 
