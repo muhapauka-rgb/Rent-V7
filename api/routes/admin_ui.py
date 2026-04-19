@@ -201,6 +201,356 @@ def _start_ocr_dataset_job(force: bool = True) -> None:
     threading.Thread(target=_run, daemon=True).start()
 
 
+def _resolve_open_review_flags_after_manual_edit(conn, apartment_id: int, ym: str, kind: str, meter_index: int = 1) -> None:
+    """
+    Manual edit is treated as admin review decision.
+    Resolve related open review flags so UI doesn't keep showing
+    "Проверить значение / Подтвердить" for already-corrected meters.
+    """
+    k = str(kind or "").strip().lower()
+    mi = int(meter_index or 1)
+
+    if k == "electric":
+        conn.execute(
+            text(
+                """
+                UPDATE meter_review_flags
+                SET status='resolved', resolved_at=now(), resolved_by='admin_manual_edit'
+                WHERE apartment_id=:aid
+                  AND ym=:ym
+                  AND meter_type='electric'
+                  AND meter_index BETWEEN 1 AND 3
+                  AND status='open'
+                """
+            ),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        )
+        return
+
+    if k in {"cold", "hot"}:
+        conn.execute(
+            text(
+                """
+                UPDATE meter_review_flags
+                SET status='resolved', resolved_at=now(), resolved_by='admin_manual_edit'
+                WHERE apartment_id=:aid
+                  AND ym=:ym
+                  AND meter_type IN ('cold','hot')
+                  AND meter_index=1
+                  AND status='open'
+                """
+            ),
+            {"aid": int(apartment_id), "ym": str(ym)},
+        )
+        return
+
+    conn.execute(
+        text(
+            """
+            UPDATE meter_review_flags
+            SET status='resolved', resolved_at=now(), resolved_by='admin_manual_edit'
+            WHERE apartment_id=:aid
+              AND ym=:ym
+              AND meter_type=:mt
+              AND meter_index=:mi
+              AND status='open'
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": str(k), "mi": int(mi)},
+    )
+
+
+def _safe_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except Exception:
+        return None
+
+
+def _parse_json_dict_maybe(v: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(v, dict):
+        return v
+    if v is None:
+        return None
+    try:
+        parsed = json.loads(str(v))
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _photo_event_row_to_dict(row: Any) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    ydisk_path = row.get("ydisk_path")
+    if not ydisk_path:
+        return None
+    return {
+        "id": int(row["id"]),
+        "ydisk_path": str(ydisk_path),
+        "ym": str(row.get("ym") or ""),
+        "meter_kind": str(row.get("meter_kind") or ""),
+        "meter_index": int(row.get("meter_index") or 1),
+        "meter_value": _safe_float(row.get("meter_value")),
+        "ocr_reading": _safe_float(row.get("ocr_reading")),
+        "meter_written": bool(row.get("meter_written")),
+        "stage": str(row.get("stage") or ""),
+        "created_at": row.get("created_at"),
+    }
+
+
+def _query_photo_event_by_id(conn, apartment_id: int, photo_event_id: int) -> Optional[Dict[str, Any]]:
+    row = conn.execute(
+        text(
+            """
+            SELECT id, ydisk_path, ym, meter_kind, meter_index, meter_value, ocr_reading, meter_written, stage, created_at
+            FROM photo_events
+            WHERE id=:id AND apartment_id=:aid
+            LIMIT 1
+            """
+        ),
+        {"id": int(photo_event_id), "aid": int(apartment_id)},
+    ).mappings().first()
+    return _photo_event_row_to_dict(row)
+
+
+def _query_latest_photo_event(
+    conn,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    meter_index: int,
+    *,
+    where_extra_sql: str = "",
+    params_extra: Optional[Dict[str, Any]] = None,
+    order_sql: str = "created_at DESC",
+) -> Optional[Dict[str, Any]]:
+    params: Dict[str, Any] = {
+        "aid": int(apartment_id),
+        "ym": str(ym),
+        "mk": str(meter_type),
+        "mi": int(meter_index),
+    }
+    if params_extra:
+        params.update(params_extra)
+    row = conn.execute(
+        text(
+            f"""
+            SELECT id, ydisk_path, ym, meter_kind, meter_index, meter_value, ocr_reading, meter_written, stage, created_at
+            FROM photo_events
+            WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi
+            {where_extra_sql}
+            ORDER BY {order_sql}
+            LIMIT 1
+            """
+        ),
+        params,
+    ).mappings().first()
+    return _photo_event_row_to_dict(row)
+
+
+def _choose_meter_photo_event(conn, apartment_id: int, ym: str, meter_type: str, meter_index: int, flag_id: Optional[int] = None) -> Dict[str, Any]:
+    reading_row = conn.execute(
+        text(
+            """
+            SELECT value, source, ocr_value, updated_at
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+            LIMIT 1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_type), "mi": int(meter_index)},
+    ).mappings().first()
+    reading: Optional[Dict[str, Any]] = None
+    if reading_row:
+        reading = {
+            "value": _safe_float(reading_row.get("value")),
+            "source": (str(reading_row.get("source") or "") or None),
+            "ocr_value": _safe_float(reading_row.get("ocr_value")),
+            "updated_at": reading_row.get("updated_at"),
+        }
+
+    chosen: Optional[Dict[str, Any]] = None
+    chosen_by = "not_found"
+
+    # 1) explicit flag hint: comment may contain photo_event_id/ydisk_path
+    if flag_id is not None:
+        flag_row = conn.execute(
+            text(
+                """
+                SELECT comment
+                FROM meter_review_flags
+                WHERE id=:fid AND apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
+                LIMIT 1
+                """
+            ),
+            {"fid": int(flag_id), "aid": int(apartment_id), "ym": str(ym), "mt": str(meter_type), "mi": int(meter_index)},
+        ).mappings().first()
+        flag_comment = _parse_json_dict_maybe(flag_row.get("comment") if flag_row else None)
+        hinted_event_id = None
+        if flag_comment is not None:
+            hinted_event_id = flag_comment.get("photo_event_id") or flag_comment.get("event_id")
+        if hinted_event_id is not None:
+            try:
+                chosen = _query_photo_event_by_id(conn, int(apartment_id), int(hinted_event_id))
+                if chosen:
+                    chosen_by = "flag_photo_event_id"
+            except Exception:
+                chosen = None
+        if not chosen and flag_comment is not None:
+            hinted_path = flag_comment.get("ydisk_path")
+            if isinstance(hinted_path, str) and hinted_path.strip():
+                row = conn.execute(
+                    text(
+                        """
+                        SELECT id, ydisk_path, ym, meter_kind, meter_index, meter_value, ocr_reading, meter_written, stage, created_at
+                        FROM photo_events
+                        WHERE apartment_id=:aid AND ydisk_path=:path
+                        ORDER BY created_at DESC
+                        LIMIT 1
+                        """
+                    ),
+                    {"aid": int(apartment_id), "path": hinted_path.strip()},
+                ).mappings().first()
+                chosen = _photo_event_row_to_dict(row)
+                if chosen:
+                    chosen_by = "flag_ydisk_path"
+
+    # 2) for explicit "check flag", prefer newest incoming photo under review
+    if not chosen and flag_id is not None:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND (meter_written=false OR stage='needs_review')",
+        )
+        if chosen:
+            chosen_by = "flag_review_latest"
+
+    # 3) regular click: match current recorded value (+ocr if possible) to the exact written event
+    cur_val = reading.get("value") if reading else None
+    cur_ocr = reading.get("ocr_value") if reading else None
+    upd_ts = reading.get("updated_at") if reading else None
+
+    if not chosen and cur_val is not None and cur_ocr is not None and upd_ts is not None:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND meter_written=true AND meter_value=:val AND ocr_reading=:ocr",
+            params_extra={"val": float(cur_val), "ocr": float(cur_ocr), "upd_ts": upd_ts},
+            order_sql="ABS(EXTRACT(EPOCH FROM (created_at - :upd_ts))) ASC, created_at DESC",
+        )
+        if chosen:
+            chosen_by = "reading_value+ocr+time"
+
+    if not chosen and cur_val is not None and upd_ts is not None:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND meter_written=true AND meter_value=:val",
+            params_extra={"val": float(cur_val), "upd_ts": upd_ts},
+            order_sql="ABS(EXTRACT(EPOCH FROM (created_at - :upd_ts))) ASC, created_at DESC",
+        )
+        if chosen:
+            chosen_by = "reading_value+time"
+
+    if not chosen and cur_val is not None:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND meter_written=true AND meter_value=:val",
+            params_extra={"val": float(cur_val)},
+        )
+        if chosen:
+            chosen_by = "reading_value"
+
+    if not chosen and cur_ocr is not None and upd_ts is not None:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND meter_written=true AND ocr_reading=:ocr",
+            params_extra={"ocr": float(cur_ocr), "upd_ts": upd_ts},
+            order_sql="ABS(EXTRACT(EPOCH FROM (created_at - :upd_ts))) ASC, created_at DESC",
+        )
+        if chosen:
+            chosen_by = "reading_ocr+time"
+
+    if not chosen and cur_ocr is not None:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND meter_written=true AND ocr_reading=:ocr",
+            params_extra={"ocr": float(cur_ocr)},
+        )
+        if chosen:
+            chosen_by = "reading_ocr"
+
+    # 4) fallback to any latest written event; if none, show latest review photo
+    if not chosen:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND meter_written=true",
+        )
+        if chosen:
+            chosen_by = "written_latest"
+
+    if not chosen:
+        chosen = _query_latest_photo_event(
+            conn,
+            int(apartment_id),
+            str(ym),
+            str(meter_type),
+            int(meter_index),
+            where_extra_sql="AND (meter_written=false OR stage='needs_review')",
+        )
+        if chosen:
+            chosen_by = "review_latest"
+
+    open_flag_row = conn.execute(
+        text(
+            """
+            SELECT id
+            FROM meter_review_flags
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi AND status='open'
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_type), "mi": int(meter_index)},
+    ).mappings().first()
+    open_flag_id = int(open_flag_row["id"]) if open_flag_row else None
+
+    return {
+        "photo_event": chosen,
+        "photo_selected_by": chosen_by,
+        "reading": reading,
+        "open_flag_id": open_flag_id,
+    }
+
+
 @router.get("/admin/ui/apartments")
 def ui_list_apartments(ym: Optional[str] = None):
     if not db_ready():
@@ -654,8 +1004,8 @@ def ui_apartment_card(apartment_id: int):
     }
 
 
-@router.get("/admin/ui/apartments/{apartment_id}/photo")
-def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index: int = 1, flag_id: Optional[int] = None):
+@router.get("/admin/ui/apartments/{apartment_id}/photo-context")
+def ui_get_meter_photo_context(apartment_id: int, ym: str, meter_type: str, meter_index: int = 1, flag_id: Optional[int] = None):
     if not db_ready():
         raise HTTPException(status_code=503, detail="db_disabled")
     ensure_tables()
@@ -671,84 +1021,79 @@ def ui_get_meter_photo(apartment_id: int, ym: str, meter_type: str, meter_index:
     mi = max(1, min(3, mi))
 
     with engine.begin() as conn:
-        ydisk_path = None
-        # 1) If "Проверить значение" is pressed for a specific flag, prioritize the photo
-        # that caused that flag (new incoming photo), not the last written historical one.
-        if flag_id:
-            try:
-                fr = conn.execute(
-                    text(
-                        """
-                        SELECT comment
-                        FROM meter_review_flags
-                        WHERE id=:fid AND apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi
-                        LIMIT 1
-                        """
-                    ),
-                    {"fid": int(flag_id), "aid": int(apartment_id), "ym": str(ym), "mt": str(mt), "mi": int(mi)},
-                ).mappings().first()
-                if fr and fr.get("comment"):
-                    c = fr.get("comment")
-                    try:
-                        parsed = c if isinstance(c, dict) else json.loads(str(c))
-                    except Exception:
-                        parsed = None
-                    if isinstance(parsed, dict):
-                        p = parsed.get("ydisk_path")
-                        if isinstance(p, str) and p.strip():
-                            ydisk_path = p.strip()
-            except Exception:
-                ydisk_path = None
+        picked = _choose_meter_photo_event(conn, int(apartment_id), str(ym), str(mt), int(mi), flag_id=flag_id)
 
-        # 2) Then prefer newest "review" photo (incoming replacement that did not overwrite yet).
-        if not ydisk_path:
-            row = conn.execute(
-                text(
-                    "SELECT ydisk_path FROM photo_events "
-                    "WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi "
-                    "AND (meter_written=false OR stage='needs_review') "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"aid": int(apartment_id), "ym": str(ym), "mk": str(mt), "mi": int(mi)},
-            ).fetchone()
-            if row and row[0]:
-                ydisk_path = row[0]
+    event = picked.get("photo_event")
+    reading = picked.get("reading")
+    open_flag_id = picked.get("open_flag_id")
+    event_id = int(event["id"]) if event else None
+    image_url = (
+        f"/api/admin/ui/apartments/{int(apartment_id)}/photo"
+        f"?ym={str(ym)}&meter_type={str(mt)}&meter_index={int(mi)}&photo_event_id={int(event_id)}"
+        if event_id is not None
+        else None
+    )
+    return {
+        "ok": True,
+        "context": {
+            "apartment_id": int(apartment_id),
+            "ym": str(ym),
+            "meter_type": str(mt),
+            "meter_index": int(mi),
+            "requested_flag_id": (int(flag_id) if flag_id is not None else None),
+            "open_flag_id": (int(open_flag_id) if open_flag_id is not None else None),
+            "reading": {
+                "value": reading.get("value") if reading else None,
+                "source": reading.get("source") if reading else None,
+                "ocr_value": reading.get("ocr_value") if reading else None,
+                "updated_at": (reading.get("updated_at").isoformat() if (reading and reading.get("updated_at")) else None),
+            },
+            "photo": {
+                "event_id": int(event["id"]) if event else None,
+                "selected_by": picked.get("photo_selected_by"),
+                "ydisk_path": (event.get("ydisk_path") if event else None),
+                "created_at": (event.get("created_at").isoformat() if (event and event.get("created_at")) else None),
+                "meter_value": (event.get("meter_value") if event else None),
+                "ocr_reading": (event.get("ocr_reading") if event else None),
+                "meter_written": (event.get("meter_written") if event else None),
+                "stage": (event.get("stage") if event else None),
+                "image_url": image_url,
+            },
+        },
+    }
 
-        val_row = conn.execute(
-            text(
-                "SELECT value FROM meter_readings "
-                "WHERE apartment_id=:aid AND ym=:ym AND meter_type=:mt AND meter_index=:mi "
-                "LIMIT 1"
-            ),
-            {"aid": int(apartment_id), "ym": str(ym), "mt": str(mt), "mi": int(mi)},
-        ).fetchone()
-        cur_val = float(val_row[0]) if val_row and val_row[0] is not None else None
 
-        if cur_val is not None:
-            row = conn.execute(
-                text(
-                    "SELECT ydisk_path FROM photo_events "
-                    "WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi "
-                    "AND meter_written=true AND meter_value=:val "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"aid": int(apartment_id), "ym": str(ym), "mk": str(mt), "mi": int(mi), "val": float(cur_val)},
-            ).fetchone()
-            if row and row[0]:
-                ydisk_path = row[0]
+@router.get("/admin/ui/apartments/{apartment_id}/photo")
+def ui_get_meter_photo(
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    meter_index: int = 1,
+    flag_id: Optional[int] = None,
+    photo_event_id: Optional[int] = None,
+):
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+    mt = str(meter_type or "").strip().lower()
+    if mt not in {"cold", "hot", "electric", "sewer"}:
+        raise HTTPException(status_code=400, detail="invalid_meter_type")
+    if not is_ym(ym):
+        raise HTTPException(status_code=400, detail="invalid_ym")
+    try:
+        mi = int(meter_index)
+    except Exception:
+        mi = 1
+    mi = max(1, min(3, mi))
 
-        if not ydisk_path:
-            row = conn.execute(
-                text(
-                    "SELECT ydisk_path FROM photo_events "
-                    "WHERE apartment_id=:aid AND ym=:ym AND meter_kind=:mk AND meter_index=:mi "
-                    "AND meter_written=true "
-                    "ORDER BY created_at DESC LIMIT 1"
-                ),
-                {"aid": int(apartment_id), "ym": str(ym), "mk": str(mt), "mi": int(mi)},
-            ).fetchone()
-            if row and row[0]:
-                ydisk_path = row[0]
+    with engine.begin() as conn:
+        chosen_event: Optional[Dict[str, Any]] = None
+        if photo_event_id is not None:
+            chosen_event = _query_photo_event_by_id(conn, int(apartment_id), int(photo_event_id))
+        if not chosen_event:
+            picked = _choose_meter_photo_event(conn, int(apartment_id), str(ym), str(mt), int(mi), flag_id=flag_id)
+            chosen_event = picked.get("photo_event")
+        ydisk_path = chosen_event.get("ydisk_path") if chosen_event else None
 
     if not ydisk_path:
         raise HTTPException(status_code=404, detail="photo_not_found")
@@ -1442,6 +1787,7 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
                         )
                         if kind in ("cold", "hot"):
                             _normalize_water_after_manual(conn, int(apartment_id), str(ym))
+                    _resolve_open_review_flags_after_manual_edit(conn, int(apartment_id), str(ym), str(kind), int(mi))
 
                     try:
                         capture_training_sample(
@@ -1458,20 +1804,12 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
         except Exception:
             pass
 
-        # --- after manual edit: recompute bill and auto-send if allowed ---
+        # --- after manual edit: recompute bill only; sending is manual from UI ---
         try:
             with engine.begin() as conn:
                 bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(ym))
                 if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None):
                     _set_month_bill_state(conn, int(apartment_id), str(ym), pending={}, approved_at=True)
-                    st = _get_month_bill_state(conn, int(apartment_id), str(ym))
-                    from core.billing import _same_total  # local import to avoid cycles
-                    if not _same_total(st.get("sent_total"), bill.get("total_rub")):
-                        chat_id = _get_active_chat_id(conn, int(apartment_id))
-                        if chat_id:
-                            msg = f"Сумма оплаты по счётчикам за {ym}: {float(bill.get('total_rub')):.2f} ₽"
-                            if _tg_send_message(str(chat_id), msg):
-                                _set_month_bill_state(conn, int(apartment_id), str(ym), sent_at=True, sent_total=bill.get("total_rub"))
         except Exception:
             pass
 
@@ -1508,6 +1846,7 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
     if kind == "electric":
         with engine.begin() as conn:
             _write_electric_overwrite_then_sort(conn, int(apartment_id), str(month), int(meter_index), float(value_f), source="manual")
+            _resolve_open_review_flags_after_manual_edit(conn, int(apartment_id), str(month), str(kind), int(meter_index))
     else:
         with engine.begin() as conn:
             _add_meter_reading_db(
@@ -1520,6 +1859,7 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
             )
             if kind in ("cold", "hot"):
                 _normalize_water_after_manual(conn, int(apartment_id), str(month))
+            _resolve_open_review_flags_after_manual_edit(conn, int(apartment_id), str(month), str(kind), int(meter_index))
 
     try:
         with engine.begin() as conn:
@@ -1544,19 +1884,12 @@ async def admin_add_meter_reading(apartment_id: int, request: Request):
     except Exception:
         pass
 
-    # --- after manual edit: recompute bill and auto-send if allowed ---
+    # --- after manual edit: recompute bill only; sending is manual from UI ---
     try:
         with engine.begin() as conn:
             bill = _calc_month_bill(conn, apartment_id=int(apartment_id), ym=str(month))
             if (bill.get("reason") == "ok") and (bill.get("total_rub") is not None):
-                st = _get_month_bill_state(conn, int(apartment_id), str(month))
-                from core.billing import _same_total  # local import to avoid cycles
-                if not _same_total(st.get("sent_total"), bill.get("total_rub")):
-                    chat_id = _get_active_chat_id(conn, int(apartment_id))
-                    if chat_id:
-                        msg = f"Сумма оплаты по счётчикам за {month}: {float(bill.get('total_rub')):.2f} ₽"
-                        if _tg_send_message(str(chat_id), msg):
-                            _set_month_bill_state(conn, int(apartment_id), str(month), sent_at=True, sent_total=bill.get("total_rub"))
+                pass
     except Exception:
         pass
 
@@ -1697,4 +2030,15 @@ def ui_clear_read_notifications():
 
     with engine.begin() as conn:
         conn.execute(text("DELETE FROM notifications WHERE status='read'"))
+    return {"ok": True}
+
+
+@router.post("/admin/notifications/clear-all")
+def ui_clear_all_notifications():
+    if not db_ready():
+        raise HTTPException(status_code=503, detail="db_disabled")
+    ensure_tables()
+
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM notifications"))
     return {"ok": True}

@@ -1,7 +1,7 @@
 {
   "version": 1,
   "hash": "dhash64",
-  "count": 6,
+  "count": 7,
   "rows": [
     {
       "filename": "photo_2026-02-05 14.24.38.jpeg",
@@ -67,6 +67,17 @@
         "full": "2ffc7c60207150d4",
         "mid": "eee77ef0606060b0",
         "center": "e2fff8f0c0c0e0e0"
+      }
+    },
+    {
+      "filename": "user_test_4.jpeg",
+      "type": "unknown",
+      "reading": 877.0,
+      "serial": "13076128",
+      "hashes": {
+        "full": "7ce5716320545053",
+        "mid": "e6f8e0c1616171d0",
+        "center": "fce0e0c1c0e0e0b5"
       }
     }
   ]

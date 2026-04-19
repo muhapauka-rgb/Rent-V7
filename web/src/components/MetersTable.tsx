@@ -39,7 +39,7 @@ type Props = {
     rub: number | null,
     tariff: number | null,
     rubEnabled: boolean,
-    highlightMode?: "none" | "missing" | "review"
+    highlightMode?: "none" | "missing" | "review" | "anomaly"
   ) => React.ReactNode;
 
   fmtRub: (n: number | null | undefined) => string;
@@ -80,6 +80,8 @@ export default function MetersTable(props: Props) {
   const baseCols = n + 4; // month + cold + hot + sewer + electric(Tn)
   const totalCols = baseCols + (showRentColumn ? 1 : 0) + (showPolicyColumns ? 3 : 0) + summaryCols;
   const equalColWidth = `calc((100% - 56px) / ${totalCols})`;
+  const WATER_READING_THRESHOLD = 50;
+  const ELECTRIC_READING_THRESHOLD = 500;
 
   function ymRuLabel(ym: string): string {
     if (!/^\d{4}-\d{2}$/.test(ym || "")) return ym;
@@ -110,6 +112,13 @@ export default function MetersTable(props: Props) {
     const v = Number(t.replace(",", "."));
     if (!Number.isFinite(v)) return null;
     return v;
+  }
+
+  function isOcrOutOfRange(current: number | null, previous: number | null, meterType: "cold" | "hot" | "electric", source?: string | null) {
+    if (current == null || previous == null) return false;
+    if (String(source || "").toLowerCase() !== "ocr") return false;
+    const threshold = meterType === "electric" ? ELECTRIC_READING_THRESHOLD : WATER_READING_THRESHOLD;
+    return Math.abs(Number(current) - Number(previous)) > threshold;
   }
 
   async function commitInline(month: string, meterType: string, meterIndex: number) {
@@ -206,6 +215,15 @@ export default function MetersTable(props: Props) {
             const e1cur = h.meters?.electric?.t1?.current ?? null;
             const e2cur = h.meters?.electric?.t2?.current ?? null;
             const e3cur = h.meters?.electric?.t3?.current ?? null;
+            const cprev = h.meters?.cold?.previous ?? null;
+            const hprev = h.meters?.hot?.previous ?? null;
+            const e1prev = h.meters?.electric?.t1?.previous ?? null;
+            const e2prev = h.meters?.electric?.t2?.previous ?? null;
+            const e3prev = h.meters?.electric?.t3?.previous ?? null;
+            const csrc = String(h.meters?.cold?.source ?? "").toLowerCase();
+            const hsrc = String(h.meters?.hot?.source ?? "").toLowerCase();
+            const e1src = String(h.meters?.electric?.t1?.source ?? "").toLowerCase();
+            const e2src = String(h.meters?.electric?.t2?.source ?? "").toLowerCase();
             const e3src = String(h.meters?.electric?.t3?.source ?? "").toLowerCase();
 
             const missingCold = ccur == null;
@@ -213,6 +231,11 @@ export default function MetersTable(props: Props) {
             const missingE1 = n >= 1 && e1cur == null;
             const missingE2 = n >= 2 && e2cur == null;
             const missingE3 = n >= 3 && (e3cur == null || e3src !== "ocr");
+            const anomalyCold = isOcrOutOfRange(ccur, cprev, "cold", csrc);
+            const anomalyHot = isOcrOutOfRange(hcur, hprev, "hot", hsrc);
+            const anomalyE1 = n >= 1 && isOcrOutOfRange(e1cur, e1prev, "electric", e1src);
+            const anomalyE2 = n >= 2 && isOcrOutOfRange(e2cur, e2prev, "electric", e2src);
+            const anomalyE3 = n >= 3 && isOcrOutOfRange(e3cur, e3prev, "electric", e3src);
 
             const fCold = getReviewFlag(h.month, "cold", 1);
             const fHot = getReviewFlag(h.month, "hot", 1);
@@ -298,11 +321,11 @@ export default function MetersTable(props: Props) {
                     </div>
                   ) : (
                     <div
-                      onClick={() => onCellPhoto && onCellPhoto(h.month, "cold", 1)}
+                      onClick={() => onCellPhoto && onCellPhoto(h.month, "cold", 1, fCold?.id)}
                       onDoubleClick={() => startInlineEdit(h.month, "cold", 1, h.meters?.cold?.current ?? null)}
                       style={{ cursor: onCellPhoto ? "pointer" : "default", position: "relative" }}
                     >
-                      {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, nCold ? "review" : (fCold ? "review" : (missingCold ? "missing" : "none")))}
+                      {cellTriplet(h.meters?.cold?.current ?? null, dc, rc, t.cold, true, nCold ? "review" : (fCold ? "review" : (anomalyCold ? "anomaly" : (missingCold ? "missing" : "none"))))}
                     </div>
                   )}
                   {fCold ? (
@@ -337,11 +360,11 @@ export default function MetersTable(props: Props) {
                     </div>
                   ) : (
                     <div
-                      onClick={() => onCellPhoto && onCellPhoto(h.month, "hot", 1)}
+                      onClick={() => onCellPhoto && onCellPhoto(h.month, "hot", 1, fHot?.id)}
                       onDoubleClick={() => startInlineEdit(h.month, "hot", 1, h.meters?.hot?.current ?? null)}
                       style={{ cursor: onCellPhoto ? "pointer" : "default" }}
                     >
-                      {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, nHot ? "review" : (fHot ? "review" : (missingHot ? "missing" : "none")))}
+                      {cellTriplet(h.meters?.hot?.current ?? null, dh, rh, t.hot, true, nHot ? "review" : (fHot ? "review" : (anomalyHot ? "anomaly" : (missingHot ? "missing" : "none"))))}
                     </div>
                   )}
                   {fHot ? (
@@ -391,11 +414,11 @@ export default function MetersTable(props: Props) {
                       </div>
                     ) : (
                       <div
-                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 1)}
+                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 1, fE1?.id)}
                         onDoubleClick={() => startInlineEdit(h.month, "electric", 1, h.meters?.electric?.t1?.current ?? null)}
                         style={{ cursor: onCellPhoto ? "pointer" : "default" }}
                       >
-                        {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, nE1 ? "review" : (fE1 ? "review" : (missingE1 ? "missing" : "none")))}
+                        {cellTriplet(h.meters?.electric?.t1?.current ?? null, de1, re1, t.e1, true, nE1 ? "review" : (fE1 ? "review" : (anomalyE1 ? "anomaly" : (missingE1 ? "missing" : "none"))))}
                       </div>
                     )}
                     {fE1 ? (
@@ -432,11 +455,11 @@ export default function MetersTable(props: Props) {
                       </div>
                     ) : (
                       <div
-                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 2)}
+                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 2, fE2?.id)}
                         onDoubleClick={() => startInlineEdit(h.month, "electric", 2, h.meters?.electric?.t2?.current ?? null)}
                         style={{ cursor: onCellPhoto ? "pointer" : "default" }}
                       >
-                        {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, nE2 ? "review" : (fE2 ? "review" : (missingE2 ? "missing" : "none")))}
+                        {cellTriplet(h.meters?.electric?.t2?.current ?? null, de2, re2, t.e2, true, nE2 ? "review" : (fE2 ? "review" : (anomalyE2 ? "anomaly" : (missingE2 ? "missing" : "none"))))}
                       </div>
                     )}
                     {fE2 ? (
@@ -473,11 +496,11 @@ export default function MetersTable(props: Props) {
                       </div>
                     ) : (
                       <div
-                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 3)}
+                        onClick={() => onCellPhoto && onCellPhoto(h.month, "electric", 3, fE3?.id)}
                         onDoubleClick={() => startInlineEdit(h.month, "electric", 3, t3fb.current)}
                         style={{ cursor: onCellPhoto ? "pointer" : "default" }}
                       >
-                        {cellTriplet(t3fb.current, de3, null, null, false, nE3 ? "review" : (fE3 ? "review" : (missingE3 ? "missing" : "none")))}
+                        {cellTriplet(t3fb.current, de3, null, null, false, nE3 ? "review" : (fE3 ? "review" : (anomalyE3 ? "anomaly" : (missingE3 ? "missing" : "none"))))}
                       </div>
                     )}
                     {fE3 ? (

@@ -61,6 +61,21 @@ OCR_SERIES_SINGLE_REPEATS = max(1, min(5, int(os.getenv("OCR_SERIES_SINGLE_REPEA
 PHOTO_EVENT_MAX_FILES = int(os.getenv("PHOTO_EVENT_MAX_FILES", "6"))
 
 
+def _kind_to_label(kind: str | None, meter_index: int | None = None) -> str | None:
+    k = str(kind or "").strip().lower()
+    if k == "cold":
+        return "ХВС"
+    if k == "hot":
+        return "ГВС"
+    if k == "electric":
+        try:
+            mi = int(meter_index or 1)
+        except Exception:
+            mi = 1
+        return f"Электро T{mi}"
+    return None
+
+
 def _as_image_upload_tuple(blob: bytes, filename: str | None, mime_type: str | None):
     name = (filename or "").strip().lower()
     mime = (mime_type or "").strip().lower()
@@ -1647,6 +1662,120 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         diag["warnings"].append("ocr_unavailable")
         if ocr_exc is not None:
             diag["warnings"].append({"ocr_error": str(ocr_exc)})
+
+    # Before doing a second OCR pass, try to recover a strong water reading
+    # from odometer-style debug candidates already returned by OCR. This avoids
+    # a regression where a good drum-window candidate (e.g. ~991.89) gets
+    # overwritten by a weaker full-frame retry (e.g. ~998.88).
+    if len(photo_payloads) == 1 and isinstance(ocr_data, dict):
+        existing_type = str(ocr_data.get("type") or "").strip().lower()
+        existing_reading = _parse_reading_to_float(ocr_data.get("reading"))
+        if existing_reading is None and existing_type in ("", "unknown"):
+            dbg = _debug_candidates_from_ocr(ocr_data)
+            serial_norm_dbg = _normalize_serial(ocr_data.get("serial"))
+            promoted = None
+            promoted_prev = None
+            promoted_delta = None
+            if prev_vals:
+                for pv in prev_vals[:3]:
+                    try:
+                        pvf = float(pv)
+                    except Exception:
+                        continue
+                    cand = _choose_water_debug_candidate_with_prev(
+                        dbg,
+                        prev_value=pvf,
+                        serial_norm=serial_norm_dbg,
+                    )
+                    if not cand or cand.get("reading") is None:
+                        continue
+                    try:
+                        delta = abs(float(cand.get("reading")) - pvf)
+                    except Exception:
+                        continue
+                    if (
+                        promoted is None
+                        or promoted_delta is None
+                        or float(delta) < float(promoted_delta)
+                        or (
+                            abs(float(delta) - float(promoted_delta)) < 1e-9
+                            and float(cand.get("confidence") or 0.0) > float(promoted.get("confidence") or 0.0)
+                        )
+                    ):
+                        promoted = dict(cand)
+                        promoted_prev = pvf
+                        promoted_delta = float(delta)
+            if promoted is None:
+                odo_pool = [
+                    dict(c)
+                    for c in dbg
+                    if _is_odometer_debug_candidate(c) and (_parse_reading_to_float(c.get("reading")) is not None)
+                ]
+                if odo_pool:
+                    promoted = max(odo_pool, key=lambda c: float(c.get("confidence") or 0.0))
+            if promoted and promoted.get("reading") is not None:
+                ocr_data["reading"] = float(promoted.get("reading"))
+                if (not str(ocr_data.get("type") or "").strip()) or existing_type == "unknown":
+                    ocr_data["type"] = promoted.get("type")
+                if (not ocr_data.get("serial")) and promoted.get("serial"):
+                    ocr_data["serial"] = promoted.get("serial")
+                diag["warnings"].append(
+                    {
+                        "ocr_debug_promoted_before_retry": {
+                            "reading": float(promoted.get("reading")),
+                            "variant": promoted.get("variant"),
+                            "provider": promoted.get("provider"),
+                            "prev_ref": promoted_prev,
+                            "delta": promoted_delta,
+                        }
+                    }
+                )
+
+    # Single-photo safety retry:
+    # if OCR returned unknown/empty (or transport failed), give the same image one extra chance
+    # without changing the rest of the decision tree.
+    single_retry_needed = False
+    if len(photo_payloads) == 1:
+        if not isinstance(ocr_data, dict):
+            single_retry_needed = True
+        else:
+            existing_type = str(ocr_data.get("type") or "").strip().lower()
+            existing_notes = str(ocr_data.get("notes") or "").strip().lower()
+            existing_reading = _parse_reading_to_float(ocr_data.get("reading"))
+            if existing_reading is None and (
+                existing_type in ("", "unknown") or "openai_empty_response" in existing_notes
+            ):
+                single_retry_needed = True
+    if single_retry_needed:
+        diag["warnings"].append("ocr_single_second_pass")
+        try:
+            retry_resp, retry_exc = _call_ocr_with_retries(
+                blob,
+                filename=selected_filename,
+                mime_type=selected_mime,
+                trace_id=f"{trace_id}-sp2",
+                context_prev_water=context_prev_water,
+                context_serial_hint=context_serial_hint,
+                read_timeout_override_sec=max(float(OCR_HTTP_TIMEOUT_SEC), 110.0),
+            )
+            if retry_resp is not None and retry_resp.ok:
+                retry_json = retry_resp.json()
+                retry_type = str((retry_json or {}).get("type") or "").strip().lower()
+                retry_reading = _parse_reading_to_float((retry_json or {}).get("reading"))
+                if retry_reading is not None or retry_type not in ("", "unknown"):
+                    ocr_data = retry_json
+                    ocr_http_ok = True
+                    ocr_http_status = int(retry_resp.status_code)
+                    diag["warnings"].append("ocr_single_second_pass_improved")
+                else:
+                    diag["warnings"].append("ocr_single_second_pass_no_improve")
+            else:
+                if retry_resp is not None:
+                    diag["warnings"].append(f"ocr_single_second_pass_http_{retry_resp.status_code}")
+                if retry_exc is not None:
+                    diag["warnings"].append({"ocr_single_second_pass_error": str(retry_exc)})
+        except Exception as e:
+            diag["warnings"].append({"ocr_single_second_pass_exception": str(e)})
     # Safety fallback for multi-photo batch:
     # when /recognize-series fails or times out, run single-image OCR per file and pick best locally.
     if len(photo_payloads) > 1 and (not isinstance(ocr_data, dict)):
@@ -1706,6 +1835,28 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     kind = _ocr_to_kind(ocr_type)
     value_float = _parse_reading_to_float(ocr_reading)
     serial_norm = _normalize_serial(ocr_serial)
+    serial_force_kind = None
+    if db_ready() and apartment_id and serial_norm:
+        try:
+            with engine.begin() as conn:
+                apt_row = conn.execute(
+                    text("SELECT cold_serial, hot_serial FROM apartments WHERE id=:aid LIMIT 1"),
+                    {"aid": int(apartment_id)},
+                ).mappings().first()
+            if apt_row:
+                s_last5 = _last5_serial(serial_norm)
+                cold_last5 = _last5_serial(apt_row.get("cold_serial"))
+                hot_last5 = _last5_serial(apt_row.get("hot_serial"))
+                cold_match = _serial_last5_matches(s_last5, cold_last5)
+                hot_match = _serial_last5_matches(s_last5, hot_last5)
+                if cold_match and not hot_match:
+                    serial_force_kind = "cold"
+                elif hot_match and not cold_match:
+                    serial_force_kind = "hot"
+        except Exception as e:
+            diag["warnings"].append({"serial_route_prepare_failed": str(e)})
+    if serial_force_kind and kind not in ("cold", "hot"):
+        kind = str(serial_force_kind)
     try:
         ocr_conf = float(ocr_confidence) if ocr_confidence is not None else 0.0
     except Exception:
@@ -1713,7 +1864,14 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     is_water_unknown = str(ocr_type or "").strip().lower() == "unknown"
     debug_candidates = _debug_candidates_from_ocr(ocr_data if isinstance(ocr_data, dict) else None)
     is_water_debug = any(_is_odometer_debug_candidate(c) for c in debug_candidates)
-    is_water_context = (kind in ("cold", "hot")) or (is_water_unknown and is_water_debug)
+    ocr_notes_l = str((ocr_data or {}).get("notes") or "").strip().lower() if isinstance(ocr_data, dict) else ""
+    is_water_template_hint = "water_template" in ocr_notes_l or any(
+        str(c.get("provider") or "").strip().lower().startswith("det-water:template")
+        for c in debug_candidates
+    )
+    is_water_context = (kind in ("cold", "hot")) or (
+        is_water_unknown and (is_water_debug or bool(serial_norm) or is_water_template_hint)
+    )
 
     # Guard: OCR may mistakenly read serial number as meter reading.
     # Try to recover from debug candidates first; otherwise mark as unknown reading.
@@ -1808,6 +1966,26 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 or (float(value_float) <= 0.0)
             )
             if suspicious:
+                def _allow_severe_outlier_keep(v_now: float, v_prev) -> bool:
+                    try:
+                        now_v = float(v_now)
+                        prev_v = float(v_prev) if v_prev is not None else None
+                    except Exception:
+                        return False
+                    if prev_v is None:
+                        return False
+                    if now_v <= 0.0:
+                        return False
+                    # Hard cap for water counters: keep only plausible absolute range.
+                    if now_v > 5000.0:
+                        return False
+                    # Keep only moderately severe jumps; extreme spikes remain blocked.
+                    if abs(now_v - prev_v) > max(2000.0, float(WATER_ANOMALY_THRESHOLD) * 20.0):
+                        return False
+                    if _looks_like_serial_reading(now_v, serial_norm):
+                        return False
+                    return True
+
                 if WATER_INTEGER_ONLY:
                     # Important: in integer-only mode don't auto-replace OCR value by
                     # "closer to previous month" candidate. This was causing systematic
@@ -1876,16 +2054,27 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             if (prev_ref is not None) and (
                                 abs(old_v - float(prev_ref)) > float(WATER_ANOMALY_THRESHOLD) * 2.0
                             ):
-                                value_float = None
-                                diag["warnings"].append(
-                                    {
-                                        "water_prev_sanity_blocked": {
-                                            "value": old_v,
-                                            "prev_ref": prev_ref,
-                                            "reason": "blocked_severe_outlier",
+                                if _allow_severe_outlier_keep(old_v, prev_ref):
+                                    diag["warnings"].append(
+                                        {
+                                            "water_prev_sanity_saved_with_review": {
+                                                "value": old_v,
+                                                "prev_ref": prev_ref,
+                                                "reason": "severe_outlier_saved_with_review",
+                                            }
                                         }
-                                    }
-                                )
+                                    )
+                                else:
+                                    value_float = None
+                                    diag["warnings"].append(
+                                        {
+                                            "water_prev_sanity_blocked": {
+                                                "value": old_v,
+                                                "prev_ref": prev_ref,
+                                                "reason": "blocked_severe_outlier",
+                                            }
+                                        }
+                                    )
                     elif _looks_like_serial_reading(value_float, serial_norm):
                         diag["warnings"].append(
                             {
@@ -1900,16 +2089,27 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         float(delta_from_prev) > float(WATER_ANOMALY_THRESHOLD) * 2.0
                     ):
                         old_v = float(value_float)
-                        value_float = None
-                        diag["warnings"].append(
-                            {
-                                "water_prev_sanity_blocked": {
-                                    "value": old_v,
-                                    "prev_ref": prev_ref,
-                                    "reason": "blocked_severe_outlier_no_candidate",
+                        if _allow_severe_outlier_keep(old_v, prev_ref):
+                            diag["warnings"].append(
+                                {
+                                    "water_prev_sanity_saved_with_review": {
+                                        "value": old_v,
+                                        "prev_ref": prev_ref,
+                                        "reason": "severe_outlier_no_candidate_saved_with_review",
+                                    }
                                 }
-                            }
-                        )
+                            )
+                        else:
+                            value_float = None
+                            diag["warnings"].append(
+                                {
+                                    "water_prev_sanity_blocked": {
+                                        "value": old_v,
+                                        "prev_ref": prev_ref,
+                                        "reason": "blocked_severe_outlier_no_candidate",
+                                    }
+                                }
+                            )
         except Exception as e:
             diag["warnings"].append({"water_prev_sanity_failed": str(e)})
 
@@ -2728,18 +2928,38 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                                 }
                                             )
                                         else:
-                                            water_prev_hard_block = True
-                                            water_prev_hard_block_reason = {
-                                                "value": float(value_float),
-                                                "prev_ref": float(serial_prev_ref),
-                                                "meter_type": serial_prev_kind,
-                                                "reason": "serial_prev_outlier",
-                                                "threshold": float(WATER_SERIAL_HARD_DELTA),
-                                                "ydisk_path": ydisk_path,
-                                            }
-                                            diag["warnings"].append(
-                                                {"water_prev_hard_block": dict(water_prev_hard_block_reason)}
+                                            keep_with_review = bool(
+                                                (not _looks_like_serial_reading(value_float, serial_norm))
+                                                and (float(value_float) > 0.0)
+                                                and (float(value_float) <= 5000.0)
+                                                and (cur_delta <= max(600.0, float(WATER_SERIAL_HARD_DELTA) * 8.0))
                                             )
+                                            if keep_with_review:
+                                                diag["warnings"].append(
+                                                    {
+                                                        "water_serial_prev_saved_with_review": {
+                                                            "value": float(value_float),
+                                                            "prev_ref": float(serial_prev_ref),
+                                                            "meter_type": serial_prev_kind,
+                                                            "delta": float(cur_delta),
+                                                            "threshold": float(WATER_SERIAL_HARD_DELTA),
+                                                            "reason": "serial_prev_outlier_saved_with_review",
+                                                        }
+                                                    }
+                                                )
+                                            else:
+                                                water_prev_hard_block = True
+                                                water_prev_hard_block_reason = {
+                                                    "value": float(value_float),
+                                                    "prev_ref": float(serial_prev_ref),
+                                                    "meter_type": serial_prev_kind,
+                                                    "reason": "serial_prev_outlier",
+                                                    "threshold": float(WATER_SERIAL_HARD_DELTA),
+                                                    "ydisk_path": ydisk_path,
+                                                }
+                                                diag["warnings"].append(
+                                                    {"water_prev_hard_block": dict(water_prev_hard_block_reason)}
+                                                )
                         except Exception:
                             pass
 
@@ -3262,6 +3482,14 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         except Exception as e:
             diag["warnings"].append({"bill_calc_failed": str(e)})
 
+    resolved_meter_kind = str(kind) if kind is not None else None
+    resolved_meter_label = _kind_to_label(resolved_meter_kind, assigned_meter_index)
+    if isinstance(ocr_data, dict):
+        if resolved_meter_kind:
+            ocr_data["resolved_kind"] = resolved_meter_kind
+        if resolved_meter_label:
+            ocr_data["resolved_type"] = resolved_meter_label
+
     payload = {
         "trace_id": trace_id,
         "status": "ok",
@@ -3273,6 +3501,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         "apartment_id": apartment_id,
         "event_status": status,
         "ocr": ocr_data,
+        "meter_kind": resolved_meter_kind,
+        "meter_type_label": resolved_meter_label,
         "meter_written": wrote_meter,
         "ocr_failed": bool((value_float is None) or (not kind and not is_water_unknown)),
         "diag": diag,
@@ -3280,6 +3510,33 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         "ym": ym,
         "bill": bill,
     }
+
+    if db_ready() and photo_event_id:
+        try:
+            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+            ocr_json_str = json.dumps(ocr_data, ensure_ascii=False) if isinstance(ocr_data, dict) else None
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE photo_events
+                        SET
+                            meter_kind = COALESCE(:meter_kind, meter_kind),
+                            diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END,
+                            ocr_json = CASE WHEN :ocr_json IS NULL THEN ocr_json ELSE CAST(:ocr_json AS JSONB) END
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": int(photo_event_id),
+                        "meter_kind": resolved_meter_kind,
+                        "diag_json": diag_json_str,
+                        "ocr_json": ocr_json_str,
+                    },
+                )
+        except Exception as e:
+            diag["warnings"].append({"photo_event_resolved_update_failed": str(e)})
+
     logger.info(
         "photo_event done trace_id=%s elapsed_ms=%s apartment_id=%s meter_written=%s ocr_type=%s ocr_reading=%s warnings=%s errors=%s",
         trace_id,

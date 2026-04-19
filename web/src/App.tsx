@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import * as XLSX from "xlsx-js-style";
 import MetersTable from "./components/MetersTable";
 
@@ -25,6 +25,20 @@ type ApartmentItem = {
 };
 
 type ApartmentsResp = { ok: boolean; ym: string; items: ApartmentItem[] };
+
+type MeterCellField = "rub" | "reading" | "delta" | "tariff";
+
+const DEFAULT_METER_CELL_FIELDS: MeterCellField[] = ["rub", "reading", "delta", "tariff"];
+const DEFAULT_COLOR_1 = "#ff2d8d";
+const DEFAULT_COLOR_2 = "#95c52c";
+const WATER_READING_THRESHOLD = 50;
+const ELECTRIC_READING_THRESHOLD = 500;
+const METER_CELL_FIELD_LABELS: Record<MeterCellField, string> = {
+  rub: "Сумма",
+  reading: "Показания",
+  delta: "Разница",
+  tariff: "Тариф",
+};
 
 type HistoryResp = {
   apartment_id: number;
@@ -90,6 +104,7 @@ type BillState = {
   last?: any;
   approved_at?: string | null;
   sent_at?: string | null;
+  sent_total?: number | null;
 };
 
 type BillResp = {
@@ -98,6 +113,12 @@ type BillResp = {
   ym: string;
   bill: any;
   state: BillState;
+};
+
+type PendingBillSend = {
+  apartmentId: number;
+  ym: string;
+  total: number;
 };
 
 type ReviewFlagItem = {
@@ -111,6 +132,35 @@ type ReviewFlagItem = {
   comment?: string | null;
 };
 type ReviewFlagsResp = { ok: boolean; apartment_id: number; items: ReviewFlagItem[] };
+
+type MeterPhotoContextResp = {
+  ok: boolean;
+  context: {
+    apartment_id: number;
+    ym: string;
+    meter_type: "cold" | "hot" | "electric" | "sewer" | string;
+    meter_index: number;
+    requested_flag_id?: number | null;
+    open_flag_id?: number | null;
+    reading?: {
+      value?: number | null;
+      source?: string | null;
+      ocr_value?: number | null;
+      updated_at?: string | null;
+    } | null;
+    photo?: {
+      event_id?: number | null;
+      selected_by?: string | null;
+      ydisk_path?: string | null;
+      created_at?: string | null;
+      meter_value?: number | null;
+      ocr_reading?: number | null;
+      meter_written?: boolean | null;
+      stage?: string | null;
+      image_url?: string | null;
+    } | null;
+  };
+};
 
 
 type UnassignedPhoto = {
@@ -333,6 +383,52 @@ function ymToIndex(ym: string): number | null {
   return Number(ym.slice(0, 4)) * 12 + Number(ym.slice(5, 7)) - 1;
 }
 
+function normalizeAccentColor(value: unknown, fallback: string): string {
+  const color = String(value || "").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(color) ? color.toLowerCase() : fallback;
+}
+
+function sameTotal(a: unknown, b: unknown): boolean {
+  const left = Number(a);
+  const right = Number(b);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false;
+  return Math.round(left * 100) === Math.round(right * 100);
+}
+
+function asFiniteNumber(value: unknown): number | null {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function readingThresholdForMeter(meterType: string): number | null {
+  const mt = String(meterType || "").toLowerCase();
+  if (mt === "cold" || mt === "hot") return WATER_READING_THRESHOLD;
+  if (mt === "electric") return ELECTRIC_READING_THRESHOLD;
+  return null;
+}
+
+function isDetectedReadingOutOfRange(
+  current: unknown,
+  previous: unknown,
+  meterType: string,
+  source?: unknown,
+  options?: { requireOcrSource?: boolean }
+): boolean {
+  const threshold = readingThresholdForMeter(meterType);
+  const curr = asFiniteNumber(current);
+  const prev = asFiniteNumber(previous);
+  const requireOcrSource = options?.requireOcrSource !== false;
+  if (threshold == null || curr == null || prev == null) return false;
+  if (requireOcrSource && String(source || "").toLowerCase() !== "ocr") return false;
+  return Math.abs(curr - prev) > threshold;
+}
+
+function isDraftReadingOutOfRange(value: string, previous: unknown, meterType: string): boolean {
+  const normalized = String(value ?? "").trim().replace(",", ".");
+  if (!normalized) return false;
+  return isDetectedReadingOutOfRange(normalized, previous, meterType, "manual", { requireOcrSource: false });
+}
+
 export default function App() {
   const [tab, setTab] = useState<"apartments" | "ops">("apartments");
   const [err, setErr] = useState<string | null>(null);
@@ -340,6 +436,9 @@ export default function App() {
   const [uiTheme, setUiTheme] = useState<"light" | "light-cool" | "dark" | "ultra">("light");
   const [indicatorPalette, setIndicatorPalette] = useState<"classic" | "bright">("classic");
   const [indicatorStyle, setIndicatorStyle] = useState<"dot" | "diamond" | "triangles">("dot");
+  const [indicatorColor1, setIndicatorColor1] = useState(DEFAULT_COLOR_1);
+  const [indicatorColor2, setIndicatorColor2] = useState(DEFAULT_COLOR_2);
+  const [accentPickerOpen, setAccentPickerOpen] = useState<"color1" | "color2" | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [notifOpen, setNotifOpen] = useState(false);
   const [notifications, setNotifications] = useState<NotificationItem[]>([]);
@@ -350,10 +449,19 @@ export default function App() {
   const [notifHighlight, setNotifHighlight] = useState<{ ym: string; meter_type: string; meter_index: number } | null>(null);
   const [ocrRunLoading, setOcrRunLoading] = useState(false);
   const [ocrRunMsg, setOcrRunMsg] = useState("");
+  const [meterCellFieldsByApartment, setMeterCellFieldsByApartment] = useState<Record<string, MeterCellField[]>>({});
+  const [currentMeterCellFields, setCurrentMeterCellFields] = useState<MeterCellField[]>(DEFAULT_METER_CELL_FIELDS);
+  const [meterFieldsOpen, setMeterFieldsOpen] = useState(false);
+  const [summaryMonth, setSummaryMonth] = useState("");
+  const [summaryMonthOpen, setSummaryMonthOpen] = useState(false);
+  const meterFieldsRef = useRef<HTMLDivElement | null>(null);
+  const accentPickerRef = useRef<HTMLDivElement | null>(null);
+  const summaryMonthRef = useRef<HTMLDivElement | null>(null);
 
   const [apartments, setApartments] = useState<ApartmentItem[]>([]);
   const [selectedId, setSelectedId] = useState<number | null>(null);
   const STORAGE_SELECTED_ID = "rent.selectedApartmentId";
+  const STORAGE_METER_CELL_FIELDS = "rent.meterCellFieldsByApartment";
 
   // серверный "текущий месяц"
   const [serverYm, setServerYm] = useState<string>("");
@@ -403,11 +511,25 @@ export default function App() {
   const [photoUrl, setPhotoUrl] = useState<string>("");
   const [photoTitle, setPhotoTitle] = useState<string>("");
   const [photoLoading, setPhotoLoading] = useState(false);
-  const [photoPos, setPhotoPos] = useState<{ x: number; y: number }>({ x: 80, y: 80 });
-  const [photoDrag, setPhotoDrag] = useState<{ active: boolean; dx: number; dy: number }>({ active: false, dx: 0, dy: 0 });
+  const [photoContext, setPhotoContext] = useState<MeterPhotoContextResp["context"] | null>(null);
+  const [photoEditedValue, setPhotoEditedValue] = useState<string>("");
+  const [photoSaveLoading, setPhotoSaveLoading] = useState(false);
+  const [inlineRentEditing, setInlineRentEditing] = useState(false);
+  const [inlineRentValue, setInlineRentValue] = useState("");
+  const [inlineRentSaving, setInlineRentSaving] = useState(false);
+  const [inlineDueEditing, setInlineDueEditing] = useState(false);
+  const [inlineDueValue, setInlineDueValue] = useState("");
+  const [inlineDueSaving, setInlineDueSaving] = useState(false);
 
   // <-- добавили: сколько фото электро ждём (1..3)
   const [infoElectricExpected, setInfoElectricExpected] = useState<string>("1");
+
+  function sanitizeMeterCellFields(value: unknown): MeterCellField[] {
+    if (!Array.isArray(value)) return DEFAULT_METER_CELL_FIELDS;
+    const filtered = value.filter((item): item is MeterCellField => item === "rub" || item === "reading" || item === "delta" || item === "tariff");
+    const unique = filtered.filter((item, index) => filtered.indexOf(item) === index);
+    return unique.length ? unique : DEFAULT_METER_CELL_FIELDS;
+  }
 
   useEffect(() => {
     const check = () => {
@@ -433,9 +555,23 @@ export default function App() {
       const t = localStorage.getItem("v7rent-theme");
       const p = localStorage.getItem("v7rent-indicator-palette");
       const s = localStorage.getItem("v7rent-indicator-style");
+      const c1 = localStorage.getItem("v7rent-indicator-color1");
+      const c2 = localStorage.getItem("v7rent-indicator-color2");
+      const meterFieldsRaw = localStorage.getItem(STORAGE_METER_CELL_FIELDS);
       if (t === "dark" || t === "light" || t === "light-cool" || t === "ultra") setUiTheme(t);
       if (p === "classic" || p === "bright") setIndicatorPalette(p);
       if (s === "dot" || s === "diamond" || s === "triangles") setIndicatorStyle(s);
+      if (c1) setIndicatorColor1(normalizeAccentColor(c1, DEFAULT_COLOR_1));
+      if (c2) setIndicatorColor2(normalizeAccentColor(c2, DEFAULT_COLOR_2));
+      if (meterFieldsRaw) {
+        const parsed = JSON.parse(meterFieldsRaw);
+        if (parsed && typeof parsed === "object") {
+          const normalized = Object.fromEntries(
+            Object.entries(parsed).map(([key, value]) => [key, sanitizeMeterCellFields(value)])
+          ) as Record<string, MeterCellField[]>;
+          setMeterCellFieldsByApartment(normalized);
+        }
+      }
     } catch {
       // ignore
     }
@@ -445,14 +581,91 @@ export default function App() {
     document.body.setAttribute("data-theme", uiTheme);
     document.body.setAttribute("data-indicator-palette", indicatorPalette);
     document.body.setAttribute("data-indicator-style", indicatorStyle);
+    document.body.style.setProperty("--warn-bright", indicatorColor1);
+    document.body.style.setProperty("--ok-bright", indicatorColor2);
     try {
       localStorage.setItem("v7rent-theme", uiTheme);
       localStorage.setItem("v7rent-indicator-palette", indicatorPalette);
       localStorage.setItem("v7rent-indicator-style", indicatorStyle);
+      localStorage.setItem("v7rent-indicator-color1", indicatorColor1);
+      localStorage.setItem("v7rent-indicator-color2", indicatorColor2);
     } catch {
       // ignore
     }
-  }, [uiTheme, indicatorPalette, indicatorStyle]);
+  }, [uiTheme, indicatorPalette, indicatorStyle, indicatorColor1, indicatorColor2]);
+
+  useEffect(() => {
+    if (!meterFieldsOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!meterFieldsRef.current) return;
+      if (meterFieldsRef.current.contains(event.target as Node)) return;
+      setMeterFieldsOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [meterFieldsOpen]);
+
+  useEffect(() => {
+    if (!accentPickerOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!accentPickerRef.current) return;
+      if (accentPickerRef.current.contains(event.target as Node)) return;
+      setAccentPickerOpen(null);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [accentPickerOpen]);
+
+  useEffect(() => {
+    if (!summaryMonthOpen) return;
+    const onPointerDown = (event: MouseEvent) => {
+      if (!summaryMonthRef.current) return;
+      if (summaryMonthRef.current.contains(event.target as Node)) return;
+      setSummaryMonthOpen(false);
+    };
+    document.addEventListener("mousedown", onPointerDown);
+    return () => document.removeEventListener("mousedown", onPointerDown);
+  }, [summaryMonthOpen]);
+
+  useEffect(() => {
+    setMeterFieldsOpen(false);
+  }, [selectedId]);
+
+  useEffect(() => {
+    if (selectedId == null) {
+      setCurrentMeterCellFields(DEFAULT_METER_CELL_FIELDS);
+      return;
+    }
+    setCurrentMeterCellFields(
+      sanitizeMeterCellFields(meterCellFieldsByApartment[String(selectedId)])
+    );
+  }, [selectedId, meterCellFieldsByApartment]);
+
+  useEffect(() => {
+    if (inlineRentEditing) return;
+    setInlineRentValue(
+      selected?.rent_monthly == null ? "" : String(Number(selected.rent_monthly) || 0)
+    );
+  }, [selected?.id, selected?.rent_monthly, inlineRentEditing]);
+
+  useEffect(() => {
+    if (inlineDueEditing) return;
+    const raw = String((selected as any)?.tenant_since ?? "").trim();
+    const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+    setInlineDueValue(m ? String(Number(m[3])) : "");
+  }, [selected?.id, selected?.tenant_since, inlineDueEditing]);
+
+  useEffect(() => {
+    setAccentPickerOpen(null);
+  }, [settingsOpen]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_METER_CELL_FIELDS, JSON.stringify(meterCellFieldsByApartment));
+    } catch {
+      // ignore
+    }
+  }, [meterCellFieldsByApartment]);
 
   async function openInfo(apartmentId: number) {
     setInfoOpen(true);
@@ -642,9 +855,9 @@ export default function App() {
     }
   }
 
-  async function clearReadNotifications() {
+  async function clearAllNotifications() {
     try {
-      await apiPost(`/admin/notifications/clear-read`, {});
+      await apiPost(`/admin/notifications/clear-all`, {});
       await loadNotifications(true);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
@@ -739,6 +952,8 @@ export default function App() {
   const [billInfo, setBillInfo] = useState<BillResp | null>(null);
   const [billLoading, setBillLoading] = useState(false);
   const [billErr, setBillErr] = useState<string | null>(null);
+  const [pendingBillSend, setPendingBillSend] = useState<PendingBillSend | null>(null);
+  const [pendingBillSendLoading, setPendingBillSendLoading] = useState(false);
 
   // Tariffs
   const [tariffs, setTariffs] = useState<TariffItem[]>([]);
@@ -1196,19 +1411,37 @@ export default function App() {
       const data = await apiGet<BillResp>(`/admin/ui/apartments/${apartmentId}/bill?ym=${encodeURIComponent(ym)}`);
       setBillInfo(data);
       setBillErr(null);
+      return data;
     } catch (e: any) {
       setBillErr(String(e?.message ?? e));
       setBillInfo(null);
+      return null;
     } finally {
       setBillLoading(false);
     }
+  }
+
+  function syncPendingBillSend(apartmentId: number, ym: string, data: BillResp | null) {
+    const total = data?.bill?.total_rub;
+    const sentTotal = data?.state?.sent_total;
+    const canSend = data?.bill?.reason === "ok" && total != null && !sameTotal(sentTotal, total);
+    if (canSend) {
+      setPendingBillSend({ apartmentId, ym, total: Number(total) });
+      return;
+    }
+    setPendingBillSend((prev) => {
+      if (!prev) return prev;
+      if (prev.apartmentId !== apartmentId || prev.ym !== ym) return prev;
+      return null;
+    });
   }
 
   async function approveBill(apartmentId: number, ym: string, send: boolean) {
     try {
       setBillErr(null);
       await apiPost(`/admin/ui/apartments/${apartmentId}/bill/approve`, { ym, send });
-      await loadBill(apartmentId, ym);
+      const billData = await loadBill(apartmentId, ym);
+      syncPendingBillSend(apartmentId, ym, billData);
       await loadHistory(apartmentId);
     } catch (e: any) {
       setBillErr(String(e?.message ?? e));
@@ -1219,10 +1452,26 @@ export default function App() {
     try {
       setBillErr(null);
       await apiPost(`/admin/ui/apartments/${apartmentId}/bill/send-without-t3-photo`, { ym, send: true });
-      await loadBill(apartmentId, ym);
+      const billData = await loadBill(apartmentId, ym);
+      syncPendingBillSend(apartmentId, ym, billData);
       await loadHistory(apartmentId);
     } catch (e: any) {
       setBillErr(String(e?.message ?? e));
+    }
+  }
+
+  async function sendUpdatedBill(apartmentId: number, ym: string) {
+    try {
+      setBillErr(null);
+      setPendingBillSendLoading(true);
+      await apiPost(`/admin/ui/apartments/${apartmentId}/bill/approve`, { ym, send: true });
+      const billData = await loadBill(apartmentId, ym);
+      syncPendingBillSend(apartmentId, ym, billData);
+      await loadHistory(apartmentId);
+    } catch (e: any) {
+      setBillErr(String(e?.message ?? e));
+    } finally {
+      setPendingBillSendLoading(false);
     }
   }
 
@@ -1262,7 +1511,8 @@ export default function App() {
 
       await apiPost(`/admin/ui/apartments/${selectedId}/meters`, payload);
       await loadHistory(selectedId);
-      await loadBill(selectedId, editMonth);
+      const billData = await loadBill(selectedId, editMonth);
+      syncPendingBillSend(selectedId, editMonth, billData);
       setEditOpen(false);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
@@ -1282,6 +1532,8 @@ export default function App() {
       setErr(null);
       await apiPost(`/admin/ui/apartments/${selectedId}/meters`, payload);
       await loadHistory(selectedId);
+      const billData = await loadBill(selectedId, month);
+      syncPendingBillSend(selectedId, month, billData);
     } catch (e: any) {
       setErr(String(e?.message ?? e));
       throw e;
@@ -1351,9 +1603,18 @@ export default function App() {
   }, [history, serverYm]);
 
   const currentYm = isYm(serverYm) ? serverYm : null;
-  const latest = currentYm ? historyWithFuture.find((h) => h.month === currentYm) : null;
-  const latestMonth = currentYm;
+  const latestMonth = summaryMonth || currentYm || "";
+  const latest = latestMonth ? historyWithFuture.find((h) => h.month === latestMonth) : null;
   const latestMeters = latest?.meters ?? null;
+  const editReadingMeta = editMonth
+    ? {
+        cold: getMeterReadingMeta(editMonth, "cold", 1),
+        hot: getMeterReadingMeta(editMonth, "hot", 1),
+        e1: getMeterReadingMeta(editMonth, "electric", 1),
+        e2: getMeterReadingMeta(editMonth, "electric", 2),
+        e3: getMeterReadingMeta(editMonth, "electric", 3),
+      }
+    : null;
 
   function emptyMonthRow(month: string) {
     return {
@@ -1385,6 +1646,27 @@ export default function App() {
   const allHistoryMonths = useMemo(() => {
     return (history ?? []).map((h) => h.month).filter(isYm).sort();
   }, [history]);
+
+  const summaryMonthOptions = useMemo(() => {
+    return Array.from(new Set(historyWithFuture.map((h) => h.month).filter(isYm))).sort();
+  }, [historyWithFuture]);
+
+  useEffect(() => {
+    const defaultMonth =
+      (currentYm && summaryMonthOptions.includes(currentYm) ? currentYm : "") ||
+      summaryMonthOptions[summaryMonthOptions.length - 1] ||
+      "";
+    setSummaryMonth(defaultMonth);
+    setSummaryMonthOpen(false);
+  }, [selectedId]);
+
+  useEffect(() => {
+    const defaultMonth =
+      (currentYm && summaryMonthOptions.includes(currentYm) ? currentYm : "") ||
+      summaryMonthOptions[summaryMonthOptions.length - 1] ||
+      "";
+    setSummaryMonth((prev) => (prev && summaryMonthOptions.includes(prev) ? prev : defaultMonth));
+  }, [summaryMonthOptions, currentYm]);
 
   useEffect(() => {
     if (!allHistoryMonths.length) return;
@@ -1459,28 +1741,116 @@ export default function App() {
     return m;
   }, [history]);
 
+  function closePhotoModal() {
+    setPhotoUrl((prev) => {
+      if (prev) URL.revokeObjectURL(prev);
+      return "";
+    });
+    setPhotoContext(null);
+    setPhotoEditedValue("");
+    setPhotoOpen(false);
+  }
+
   async function openMeterPhoto(month: string, meterType: string, meterIndex: number, flagId?: number) {
     if (!selectedId) return;
     try {
       setErr(null);
+      setPhotoOpen(true);
       setPhotoLoading(true);
+      setPhotoContext(null);
+      setPhotoEditedValue("");
       setPhotoTitle(`${month} · ${meterType.toUpperCase()}${meterType === "electric" ? ` ${meterIndex}` : ""}`);
-      const qFlag = flagId ? `&flag_id=${encodeURIComponent(String(flagId))}` : "";
-      const res = await fetch(
-        `/api/admin/ui/apartments/${selectedId}/photo?ym=${encodeURIComponent(month)}&meter_type=${encodeURIComponent(meterType)}&meter_index=${encodeURIComponent(String(meterIndex))}${qFlag}`
-      );
-      if (!res.ok) throw new Error(`Фото не найдено`);
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
       setPhotoUrl((prev) => {
         if (prev) URL.revokeObjectURL(prev);
-        return url;
+        return "";
       });
-      setPhotoOpen(true);
+
+      const qFlag = flagId ? `&flag_id=${encodeURIComponent(String(flagId))}` : "";
+      const ctx = await apiGet<MeterPhotoContextResp>(
+        `/admin/ui/apartments/${selectedId}/photo-context?ym=${encodeURIComponent(month)}&meter_type=${encodeURIComponent(meterType)}&meter_index=${encodeURIComponent(String(meterIndex))}${qFlag}`
+      );
+
+      const c = ctx?.context ?? null;
+      setPhotoContext(c);
+
+      const initialValue =
+        c?.photo?.ocr_reading != null
+          ? Number(c.photo.ocr_reading)
+          : c?.reading?.value != null
+            ? Number(c.reading.value)
+            : null;
+      setPhotoEditedValue(initialValue == null || !Number.isFinite(initialValue) ? "" : String(initialValue));
+
+      const imageUrl = c?.photo?.image_url;
+      if (imageUrl) {
+        const res = await fetch(imageUrl);
+        if (res.ok) {
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          setPhotoUrl((prev) => {
+            if (prev) URL.revokeObjectURL(prev);
+            return url;
+          });
+        }
+      }
     } catch (e: any) {
       setErr(String(e?.message ?? e));
     } finally {
       setPhotoLoading(false);
+    }
+  }
+
+  async function savePhotoModalValue(resolveAfterSave: boolean) {
+    if (!photoContext) return;
+    const mt = String(photoContext.meter_type || "").toLowerCase();
+    const mi = Number(photoContext.meter_index || 1);
+    if (!["cold", "hot", "electric"].includes(mt)) {
+      setErr("Для этого типа показания ручное редактирование недоступно.");
+      return;
+    }
+
+    const raw = String(photoEditedValue ?? "").trim().replace(",", ".");
+    const val = Number(raw);
+    if (!raw || !Number.isFinite(val)) {
+      setErr("Введите корректное числовое значение.");
+      return;
+    }
+
+    try {
+      setErr(null);
+      setPhotoSaveLoading(true);
+      await saveInlineCell(String(photoContext.ym), mt, mi, val);
+
+      if (resolveAfterSave) {
+        const openFlagId =
+          photoContext.open_flag_id ??
+          photoContext.requested_flag_id ??
+          getReviewFlag(String(photoContext.ym), mt, mi)?.id ??
+          null;
+        if (openFlagId != null) {
+          await resolveReviewFlag(Number(openFlagId));
+          setPhotoContext((prev) => (prev ? { ...prev, open_flag_id: null } : prev));
+        }
+      }
+
+      setPhotoContext((prev) =>
+        prev
+          ? {
+              ...prev,
+              reading: {
+                ...(prev.reading || {}),
+                value: val,
+                source: "manual",
+                ocr_value: prev.reading?.ocr_value ?? null,
+                updated_at: new Date().toISOString(),
+              },
+            }
+          : prev
+      );
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    } finally {
+      setPhotoSaveLoading(false);
     }
   }
 
@@ -1499,11 +1869,11 @@ export default function App() {
 
   function renderGraph() {
     const width = 1000;
-    const height = 280;
+    const height = 300;
     const padL = 48;
     const padR = 18;
-    const padT = 16;
-    const padB = 34;
+    const padT = 18;
+    const padB = 46;
 
     const seriesKeys: Array<keyof typeof graphSeries> = ["cold", "hot", "t1", "t2"];
     const activeKeys = seriesKeys.filter((k) => graphSeries[k]);
@@ -1514,14 +1884,29 @@ export default function App() {
         if (v != null && Number.isFinite(v)) values.push(Number(v));
       }
     }
-    const maxValRaw = values.length ? Math.max(...values) : 1;
-    const maxVal = Math.max(1, maxValRaw * 1.15);
+    if (!activeKeys.length || !graphData.length) {
+      return <div style={{ color: "var(--muted)", padding: "18px 0" }}>Нет данных для графика.</div>;
+    }
 
     const xStep = graphData.length > 1 ? (width - padL - padR) / (graphData.length - 1) : 1;
-    const yScale = (height - padT - padB) / maxVal;
+    let minValRaw = values.length ? Math.min(...values) : 0;
+    let maxValRaw = values.length ? Math.max(...values) : 1;
+    if (Math.abs(maxValRaw - minValRaw) < 1e-9) {
+      const anchor = maxValRaw || 1;
+      const pad = Math.max(Math.abs(anchor) * 0.08, 1);
+      minValRaw = anchor - pad;
+      maxValRaw = anchor + pad;
+    } else {
+      const spread = maxValRaw - minValRaw;
+      const pad = Math.max(spread * 0.14, 1);
+      minValRaw -= pad;
+      maxValRaw += pad;
+    }
+    const valueRange = Math.max(1, maxValRaw - minValRaw);
+    const yScale = (height - padT - padB) / valueRange;
 
     function y(v: number) {
-      return height - padB - v * yScale;
+      return height - padB - (v - minValRaw) * yScale;
     }
 
     function linePoints(key: keyof typeof graphSeries) {
@@ -1536,17 +1921,31 @@ export default function App() {
     }
 
     const colors: Record<string, string> = {
-      cold: "#2563eb",
-      hot: "#ef4444",
-      t1: "#111827",
-      t2: "#16a34a",
+      cold: "#7396c8",
+      hot: "#c98a95",
+      t1: "#858fba",
+      t2: "#7ca992",
+    };
+    const gridStroke = "var(--hair)";
+    const axisStroke = "color-mix(in srgb, var(--muted) 24%, transparent)";
+    const tickCount = 4;
+    const tickValues = Array.from({ length: tickCount }, (_, index) => minValRaw + (valueRange * index) / (tickCount - 1));
+    const monthLabelStep = graphData.length > 8 ? Math.ceil(graphData.length / 6) : 1;
+    const formatGraphValue = (value: number | null | undefined) => {
+      if (value == null || !Number.isFinite(Number(value))) return "—";
+      if (graphMode === "rub") return `₽ ${fmtRub(Number(value))}`;
+      return fmtNum(Number(value), 3);
+    };
+    const formatAxisValue = (value: number) => {
+      if (graphMode === "rub") return Math.round(value).toLocaleString("ru-RU");
+      return fmtNum(value, Math.abs(value) >= 100 ? 0 : 2);
     };
 
     return (
       <div style={{ position: "relative" }}>
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          style={{ width: "100%", height: 280, display: "block" }}
+          style={{ width: "100%", height: 300, display: "block" }}
           onMouseMove={(e) => {
             const rect = (e.currentTarget as any).getBoundingClientRect();
             const x = e.clientX - rect.left;
@@ -1560,25 +1959,44 @@ export default function App() {
           }}
           onMouseLeave={() => setGraphHover(null)}
         >
-          {[0, 0.33, 0.66, 1].map((t) => {
-            const val = maxVal * t;
+          {tickValues.map((val, index) => {
             const yy = y(val);
             return (
-              <g key={t}>
-                <line x1={padL} y1={yy} x2={width - padR} y2={yy} stroke="#f1f5f9" />
-                <text x={8} y={yy + 4} fontSize={10} fill="#9ca3af">
-                  {Math.round(val).toLocaleString()}
+              <g key={`${index}-${val}`}>
+                <line x1={padL} y1={yy} x2={width - padR} y2={yy} stroke={gridStroke} />
+                <text x={10} y={yy + 4} fontSize={10} fill="var(--muted)">
+                  {formatAxisValue(val)}
                 </text>
               </g>
             );
           })}
-          <line x1={padL} y1={height - padB} x2={width - padR} y2={height - padB} stroke="#e5e7eb" />
-          <line x1={padL} y1={padT} x2={padL} y2={height - padB} stroke="#e5e7eb" />
+          <line x1={padL} y1={height - padB} x2={width - padR} y2={height - padB} stroke={axisStroke} />
+          <line x1={padL} y1={padT} x2={padL} y2={height - padB} stroke={axisStroke} />
+
+          {graphData.map((row, i) => {
+            if (i % monthLabelStep !== 0 && i !== graphData.length - 1) return null;
+            const xx = padL + i * xStep;
+            return (
+              <text key={`month-${row.month}`} x={xx} y={height - 14} textAnchor="middle" fontSize={10.5} fill="var(--muted)">
+                {ymDisplay(row.month).split(" ")[0].slice(0, 3)}
+              </text>
+            );
+          })}
 
           {activeKeys.map((k) => {
             const pts = linePoints(k);
             if (!pts) return null;
-            return <polyline key={k} fill="none" stroke={colors[k]} strokeWidth={2.5} points={pts} />;
+            return (
+              <polyline
+                key={k}
+                fill="none"
+                stroke={colors[k]}
+                strokeWidth={2.5}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                points={pts}
+              />
+            );
           })}
 
           {activeKeys.map((k) =>
@@ -1590,10 +2008,10 @@ export default function App() {
                   key={`${k}-${row.month}`}
                   cx={padL + i * xStep}
                   cy={y(Number(v))}
-                  r={3}
+                  r={3.25}
                   fill={colors[k]}
-                  stroke="#fff"
-                  strokeWidth={1}
+                  stroke="var(--surface)"
+                  strokeWidth={1.2}
                 />
               );
             })
@@ -1605,7 +2023,7 @@ export default function App() {
               y1={padT}
               x2={graphHover.x}
               y2={height - padB}
-              stroke="#e5e7eb"
+              stroke={axisStroke}
               strokeDasharray="4 4"
             />
           ) : null}
@@ -1617,11 +2035,11 @@ export default function App() {
               position: "absolute",
               left: Math.min(Math.max(graphHover.x + 12, 8), 740),
               top: 8,
-              background: "white",
-              border: "1px solid #e5e7eb",
-              borderRadius: 10,
-              padding: "8px 10px",
-              boxShadow: "0 10px 24px rgba(0,0,0,0.12)",
+              background: "color-mix(in srgb, var(--surface) 94%, transparent)",
+              border: "1px solid var(--hair)",
+              borderRadius: 12,
+              padding: "10px 12px",
+              boxShadow: "var(--shadow)",
               fontSize: 12,
               minWidth: 180,
             }}
@@ -1631,14 +2049,14 @@ export default function App() {
               <div key={k} style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
                 <span style={{ color: colors[k] }}>{k.toUpperCase()}</span>
                 <span>
-                  {graphData[graphHover.index]?.[k] == null ? "—" : fmtRub(Number(graphData[graphHover.index]?.[k]))}
+                  {formatGraphValue(graphData[graphHover.index]?.[k] as number | null)}
                 </span>
               </div>
             ))}
           </div>
         ) : null}
 
-        <div style={{ display: "flex", gap: 16, marginTop: 8, flexWrap: "wrap", fontSize: 12, color: "#444" }}>
+        <div style={{ display: "flex", gap: 16, marginTop: 8, flexWrap: "wrap", fontSize: 12, color: "var(--muted)" }}>
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             {activeKeys.map((k) => (
               <div key={k} style={{ display: "flex", gap: 6, alignItems: "center" }}>
@@ -1815,11 +2233,6 @@ export default function App() {
   // сколько столбцов электро показывать (T1/T2/T3)
   const eN = Math.max(1, Math.min(3, Number((selected as any)?.electric_expected ?? 1) || 1));
   const tableColsNoAction = eN + 5; // month + cold + hot + sewer + Tn + sum
-  const summaryGridTemplate = `repeat(${tableColsNoAction}, minmax(0, 1fr)) 56px`;
-  const summarySumCol = eN + 5; // same as table sum col index
-  const summaryRentCol = 2;
-  const summaryUtilitiesPlannedCol = Math.max(3, summarySumCol - 2);
-  const summaryUtilitiesActualCol = Math.max(summaryUtilitiesPlannedCol + 1, summarySumCol - 1);
 
   function getReviewFlag(month: string, meterType: string, meterIndex: number): ReviewFlagItem | null {
     const mt = String(meterType || "").toLowerCase();
@@ -1851,6 +2264,35 @@ export default function App() {
     return { current: e3c, delta: e3d };
   }
 
+  function getMeterReadingMeta(month: string, meterType: string, meterIndex = 1) {
+    const row = historyWithFuture.find((item) => item.month === month);
+    const mt = String(meterType || "").toLowerCase();
+    if (!row) return { current: null as number | null, previous: null as number | null, source: "" as string };
+    if (mt === "cold") {
+      return {
+        current: row.meters?.cold?.current ?? null,
+        previous: row.meters?.cold?.previous ?? null,
+        source: String(row.meters?.cold?.source || ""),
+      };
+    }
+    if (mt === "hot") {
+      return {
+        current: row.meters?.hot?.current ?? null,
+        previous: row.meters?.hot?.previous ?? null,
+        source: String(row.meters?.hot?.source || ""),
+      };
+    }
+    if (mt === "electric") {
+      const key = meterIndex === 2 ? "t2" : meterIndex === 3 ? "t3" : "t1";
+      return {
+        current: row.meters?.electric?.[key]?.current ?? null,
+        previous: row.meters?.electric?.[key]?.previous ?? null,
+        source: String(row.meters?.electric?.[key]?.source || ""),
+      };
+    }
+    return { current: null as number | null, previous: null as number | null, source: "" as string };
+  }
+
 
   function cellTriplet(
     current: number | null,
@@ -1858,17 +2300,251 @@ export default function App() {
     rub: number | null,
     tariff: number | null,
     rubEnabled: boolean,
-    highlightMode: "none" | "missing" | "review" = "none"
+    highlightMode: "none" | "missing" | "review" | "anomaly" = "none"
   ) {
-    const color = highlightMode === "review" ? "var(--warn-active)" : highlightMode === "missing" ? "#d97706" : "var(--text)";
+    const color =
+      highlightMode === "anomaly"
+        ? "var(--warn-bright)"
+        : highlightMode === "review"
+          ? "var(--warn-active)"
+          : highlightMode === "missing"
+            ? "#d97706"
+            : "var(--text)";
+    const readingColor = highlightMode === "none" ? "var(--muted)" : color;
+    const items: Array<React.ReactNode> = [];
+    if (currentMeterCellFields.includes("rub") && rubEnabled) {
+      items.push(<div key="rub" className="meter-rub" style={{ color: "var(--text)", fontSize: 12 }}>{rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`}</div>);
+    }
+    if (currentMeterCellFields.includes("reading")) {
+      items.push(<div key="reading" className="meter-main" style={{ color: readingColor, fontSize: 13, fontWeight: 400 }}>{fmtNum(current, 3)}</div>);
+    }
+    if (currentMeterCellFields.includes("delta")) {
+      items.push(<div key="delta" className="meter-delta" style={{ color: "var(--muted)", fontSize: 10.5 }}>Δ {fmtNum(delta, 3)}</div>);
+    }
+    if (currentMeterCellFields.includes("tariff")) {
+      items.push(<div key="tariff" className="meter-tariff" style={{ color: "var(--muted)", fontSize: 10 }}>тариф: {tariff == null ? "—" : fmtNum(tariff, 3)}</div>);
+    }
     return (
       <div className="meter-triplet" style={{ display: "grid", gap: 2, lineHeight: 1.25 }}>
-        <div className="meter-main" style={{ color, fontSize: 13, fontWeight: 400 }}>{fmtNum(current, 3)}</div>
-        <div className="meter-rub" style={{ color: "var(--muted)", fontSize: 12 }}>{rubEnabled ? (rub == null ? "₽ —" : `₽ ${fmtRub(rub)}`) : "₽ —"}</div>
-        <div className="meter-delta" style={{ color: "var(--muted)", fontSize: 12 }}>Δ {fmtNum(delta, 3)}</div>
-        <div className="meter-tariff" style={{ color: "var(--muted)", fontSize: 11 }}>тариф: {tariff == null ? "—" : fmtNum(tariff, 3)}</div>
+        {items}
       </div>
     );
+  }
+
+  const meterFieldsLabel =
+    currentMeterCellFields.length === DEFAULT_METER_CELL_FIELDS.length
+      ? "Все показатели"
+      : currentMeterCellFields.map((field) => METER_CELL_FIELD_LABELS[field]).join(", ");
+
+  function toggleMeterCellField(field: MeterCellField) {
+    if (selectedId == null) return;
+    const apartmentKey = String(selectedId);
+    setCurrentMeterCellFields((prevCurrent) => {
+      const current = sanitizeMeterCellFields(prevCurrent);
+      const hasField = current.includes(field);
+      const next = sanitizeMeterCellFields(hasField ? current.filter((item) => item !== field) : [...current, field]);
+      setMeterCellFieldsByApartment((prev) => ({
+        ...prev,
+        [apartmentKey]: next,
+      }));
+      return next;
+    });
+  }
+
+  const accentColorSwatches = [
+    "#ff2d8d",
+    "#ff5f96",
+    "#ff7a59",
+    "#f59e0b",
+    "#95c52c",
+    "#5ca73d",
+    "#3bb273",
+    "#2cb1a1",
+    "#4f8cff",
+    "#8b5cf6",
+  ];
+
+  function renderAccentColorControl(
+    key: "color1" | "color2",
+    label: string,
+    value: string,
+    onChange: (next: string) => void,
+    defaultValue: string
+  ) {
+    const isOpen = accentPickerOpen === key;
+    return (
+      <div className="accent-color-control">
+        <button
+          type="button"
+          className={`accent-color-trigger${isOpen ? " is-open" : ""}`}
+          onClick={() => setAccentPickerOpen((prev) => (prev === key ? null : key))}
+          aria-haspopup="dialog"
+          aria-expanded={isOpen}
+        >
+          <span className="accent-color-trigger__swatch" style={{ background: value }} />
+          <span>{label}</span>
+        </button>
+        {isOpen ? (
+          <div className="accent-color-menu" role="dialog" aria-label={label}>
+            <div className="accent-color-menu__head">
+              <span className="accent-color-menu__title">{label}</span>
+              <button type="button" className="accent-color-menu__reset" onClick={() => onChange(defaultValue)}>
+                Стандарт
+              </button>
+            </div>
+            <div className="accent-color-swatches">
+              {accentColorSwatches.map((swatch) => (
+                <button
+                  key={swatch}
+                  type="button"
+                  className={`accent-color-swatch${value === swatch ? " is-selected" : ""}`}
+                  style={{ background: swatch }}
+                  onClick={() => onChange(swatch)}
+                  aria-label={`Выбрать ${swatch}`}
+                >
+                  {value === swatch ? "✓" : ""}
+                </button>
+              ))}
+            </div>
+            <label className="accent-color-custom">
+              <span>Свой цвет</span>
+              <input type="color" value={value} onChange={(e) => onChange(normalizeAccentColor(e.target.value, defaultValue))} />
+            </label>
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  function renderMeterFieldPickerButton() {
+    return (
+      <div ref={meterFieldsRef} className="meter-fields-toolbar">
+        <button
+          type="button"
+          disabled={!selected}
+          className={`tool-btn tool-icon-btn has-delayed-tooltip${meterFieldsOpen ? " is-active" : ""}`}
+          onClick={() => selected && setMeterFieldsOpen((value) => !value)}
+          data-tooltip="Показатели в ячейке"
+          aria-label="Показатели в ячейке"
+          aria-pressed={meterFieldsOpen}
+        >
+          <svg viewBox="0 0 24 24" width="16" height="16">
+            <path d="M4 6h16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <path d="M7 12h10" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+            <path d="M10 18h4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+          </svg>
+        </button>
+        {meterFieldsOpen && selected ? (
+          <div className="meter-fields-menu">
+            <div className="meter-fields-title">{meterFieldsLabel}</div>
+          {DEFAULT_METER_CELL_FIELDS.map((field) => {
+            const checked = currentMeterCellFields.includes(field);
+            return (
+              <label key={field} className="meter-fields-option">
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  onChange={() => toggleMeterCellField(field)}
+                />
+                <span className={`meter-fields-check${checked ? " is-checked" : ""}`} aria-hidden="true">
+                  {checked ? (
+                    <svg viewBox="0 0 16 16" width="11" height="11">
+                      <path d="M3.2 8.4 6.5 11.3 12.8 4.7" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" />
+                    </svg>
+                  ) : null}
+                </span>
+                <span className="meter-fields-option__label">{METER_CELL_FIELD_LABELS[field]}</span>
+              </label>
+            );
+          })}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  async function saveInlineRentMonthly() {
+    if (!selected || inlineRentSaving) return;
+    const nextRent = numOrNull(inlineRentValue) ?? 0;
+    const currentRent = Number((selected as any)?.rent_monthly ?? 0);
+    if (Math.abs(currentRent - nextRent) < 0.0001) {
+      setInlineRentEditing(false);
+      setInlineRentValue(String(nextRent || 0));
+      return;
+    }
+    try {
+      setErr(null);
+      setInlineRentSaving(true);
+      await fetch(`/api/admin/ui/apartments/${selected.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rent_monthly: nextRent }),
+      }).then(async (r) => {
+        if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+        return r.json();
+      });
+      setInfoRentMonthly(String(nextRent || 0));
+      await loadApartments(false);
+      await loadHistory(selected.id);
+      setInlineRentEditing(false);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    } finally {
+      setInlineRentSaving(false);
+    }
+  }
+
+  async function saveInlineRentDueDay() {
+    if (!selected || inlineDueSaving) return;
+    const parsed = Number(String(inlineDueValue || "").trim());
+    if (!Number.isFinite(parsed)) {
+      setInlineDueValue(latestRentDue.day == null ? "" : String(latestRentDue.day));
+      setInlineDueEditing(false);
+      return;
+    }
+    const requestedDay = Math.max(1, Math.min(31, Math.round(parsed)));
+    const currentDay = latestRentDue.day;
+    if (currentDay != null && requestedDay === currentDay) {
+      setInlineDueEditing(false);
+      setInlineDueValue(String(requestedDay));
+      return;
+    }
+    const raw = String((selected as any)?.tenant_since ?? "").trim();
+    const currentYm =
+      normalizeYmAny(raw) ||
+      normalizeYmAny(latestMonth || "") ||
+      normalizeYmAny(serverYm || "") ||
+      `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, "0")}`;
+    if (!currentYm || !isYm(currentYm)) {
+      setInlineDueEditing(false);
+      return;
+    }
+    const y = Number(currentYm.slice(0, 4));
+    const m = Number(currentYm.slice(5, 7));
+    const lastDay = new Date(y, m, 0).getDate();
+    const nextDay = Math.max(1, Math.min(requestedDay, lastDay));
+    const nextTenantSince = `${currentYm}-${String(nextDay).padStart(2, "0")}`;
+    try {
+      setErr(null);
+      setInlineDueSaving(true);
+      await fetch(`/api/admin/ui/apartments/${selected.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tenant_since: nextTenantSince }),
+      }).then(async (r) => {
+        if (!r.ok) throw new Error(`${r.status} ${await r.text()}`);
+        return r.json();
+      });
+      setInfoTenantSince(nextTenantSince);
+      await loadApartments(false);
+      await loadHistory(selected.id);
+      setInlineDueValue(String(nextDay));
+      setInlineDueEditing(false);
+    } catch (e: any) {
+      setErr(String(e?.message ?? e));
+    } finally {
+      setInlineDueSaving(false);
+    }
   }
 
   function calcSumRub(rc: number | null, rh: number | null, re1: number | null, re2: number | null, rs: number | null) {
@@ -1908,6 +2584,17 @@ export default function App() {
       return isStart && Number.isFinite(amount) && amount > 0 ? amount : 0;
     }
     return actual;
+  }
+
+  function utilitiesModeSummaryText(): string {
+    if (!selected) return "режим: —";
+    const mode = String((selected as any)?.utilities_mode ?? "by_actual_monthly");
+    if (mode === "fixed_monthly") return "режим: фикс";
+    if (mode === "quarterly_advance") {
+      const cycle = Math.max(2, Number((selected as any)?.utilities_advance_cycle_months ?? 3) || 3);
+      return `режим: аванс · ${cycle} мес.`;
+    }
+    return "режим: по факту";
   }
 
   function rentDueInfoForMonth(ym: string): { day: number | null; text: string; overdue: boolean } {
@@ -2042,8 +2729,7 @@ export default function App() {
           e.stopPropagation();
           if (!readOnly && onToggle) onToggle();
         }}
-        className="lamp-btn has-delayed-tooltip"
-        data-tooltip={checked ? "Ок" : "Проблема"}
+        className="lamp-btn"
         style={{ cursor: readOnly ? "default" : "pointer", opacity: readOnly ? 0.9 : 1 }}
         aria-label={checked ? "Ок" : "Проблема"}
       >
@@ -2087,40 +2773,24 @@ export default function App() {
           </button>
 
           <button
-            onClick={() => deleteSelectedApartment()}
-            className="action-btn icon-static-btn has-delayed-tooltip"
-            style={{ borderRadius: 14, width: 36, height: 36, padding: 0 }}
-            data-tooltip="Удалить"
-            aria-label="Удалить"
-          >
-            <svg viewBox="0 0 24 24" width="17" height="17" style={{ display: "block", margin: "0 auto" }}>
-              <path d="M9 4.8h6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-              <path d="M4.8 7.2h14.4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-              <path d="M7.2 7.2l.8 11.1a1.8 1.8 0 0 0 1.8 1.7h4.4a1.8 1.8 0 0 0 1.8-1.7l.8-11.1" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
-              <path d="M10.2 10.4v6.2M13.8 10.4v6.2" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
-            </svg>
-          </button>
-
-          <button
             onClick={() => setSettingsOpen(true)}
             className={`action-btn icon-static-btn has-delayed-tooltip${settingsOpen ? " is-active" : ""}`}
             style={{ width: 38, height: 38, padding: 0 }}
             data-tooltip="Тема и индикаторы"
             aria-label="Тема и индикаторы"
           >
-            <svg viewBox="0 0 24 24" width="17" height="17" style={{ display: "block", margin: "0 auto", color: "currentColor" }}>
+            <svg viewBox="0 0 24 24" width="18" height="18" style={{ display: "block", margin: "0 auto", color: "currentColor" }} aria-hidden="true">
               <path
-                d="M12 4.1c-4.4 0-8 3.2-8 7.3 0 4 3.2 7.2 7.2 7.2h1.2c1 0 1.8-.8 1.8-1.8 0-.5-.2-.9-.5-1.3-.5-.5-.7-1-.7-1.4 0-1.1.9-1.9 2-1.9h1.2c2.2 0 3.9-1.7 3.9-3.9C20.1 6 16.8 4.1 12 4.1Z"
+                d="M12 3.5c-4.8 0-8.5 3.6-8.5 8.1 0 4.8 3.8 8.9 8.6 8.9.7 0 1.2-.5 1.2-1.2 0-.3-.1-.6-.3-.9-.3-.4-.5-.8-.5-1.3 0-1.4 1.1-2.5 2.5-2.5h1.2c2.7 0 4.8-2 4.8-4.6 0-3.9-3.5-6.5-9-6.5Z"
                 fill="none"
                 stroke="currentColor"
-                strokeWidth="1.75"
+                strokeWidth="1.55"
                 strokeLinecap="round"
                 strokeLinejoin="round"
               />
-              <circle cx="8.1" cy="10.2" r="1.05" fill="none" stroke="currentColor" strokeWidth="1.55" />
-              <circle cx="11.8" cy="8.1" r="1.05" fill="none" stroke="currentColor" strokeWidth="1.55" />
-              <circle cx="15.2" cy="9.4" r="1.05" fill="none" stroke="currentColor" strokeWidth="1.55" />
-              <circle cx="7.1" cy="13.6" r="1.05" fill="none" stroke="currentColor" strokeWidth="1.55" />
+              <circle cx="8.3" cy="11.6" r="1.45" fill="none" stroke="currentColor" strokeWidth="1.55" />
+              <circle cx="12.1" cy="8.7" r="1.25" fill="none" stroke="currentColor" strokeWidth="1.55" />
+              <circle cx="15.8" cy="11.3" r="1.45" fill="none" stroke="currentColor" strokeWidth="1.55" />
             </svg>
           </button>
 
@@ -2211,10 +2881,10 @@ export default function App() {
                     {ocrRunLoading ? "Запуск..." : "Собрать OCR"}
                   </button>
                   <button
-                    onClick={() => clearReadNotifications()}
+                    onClick={() => clearAllNotifications()}
                     style={{ padding: "6px 8px", borderRadius: 8, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 800, fontSize: 12 }}
                   >
-                    Очистить прочитанные
+                    Очистить сообщения
                   </button>
                 </div>
               </div>
@@ -2298,7 +2968,7 @@ export default function App() {
 
       {tab === "apartments" ? (
         <>
-        <div className="section-head" style={{ marginTop: 8 }}>
+        <div className="section-head" style={{ marginTop: 8, marginBottom: 6 }}>
           <div className="panel-title">Квартиры</div>
           <div className="toolbar">
             <button disabled={!selected} className={`tool-btn tool-icon-btn has-delayed-tooltip${infoOpen ? " is-active" : ""}`} onClick={() => selected && openInfo(selected.id)} data-tooltip="Инфо" aria-label="Инфо" aria-pressed={infoOpen}>
@@ -2333,6 +3003,21 @@ export default function App() {
             <button disabled={!selected} className={`tool-btn tool-icon-btn has-delayed-tooltip${showGraph ? " is-active" : ""}`} onClick={() => setShowGraph((v) => !v)} data-tooltip="Графики" aria-label="Графики" aria-pressed={showGraph}>
               <svg viewBox="0 0 24 24" width="16" height="16"><path d="M4 16l5-5 4 4 7-7" fill="none" stroke="currentColor" strokeWidth="2"/><path d="M20 7v5h-5" fill="none" stroke="currentColor" strokeWidth="2"/></svg>
             </button>
+            {renderMeterFieldPickerButton()}
+            <button
+              disabled={!selected}
+              className="tool-btn tool-icon-btn has-delayed-tooltip"
+              onClick={() => deleteSelectedApartment()}
+              data-tooltip="Удалить квартиру"
+              aria-label="Удалить квартиру"
+            >
+              <svg viewBox="0 0 24 24" width="16" height="16">
+                <path d="M9 4.8h6" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                <path d="M4.8 7.2h14.4" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
+                <path d="M7.2 7.2l.8 11.1a1.8 1.8 0 0 0 1.8 1.7h4.4a1.8 1.8 0 0 0 1.8-1.7l.8-11.1" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" />
+                <path d="M10.2 10.4v6.2M13.8 10.4v6.2" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" />
+              </svg>
+            </button>
           </div>
         </div>
         <div
@@ -2345,7 +3030,7 @@ export default function App() {
           }}
         >
           {/* LEFT */}
-          <div className="panel" style={{ order: 0 }}>
+          <div className="panel" style={{ order: 0, paddingTop: 9 }}>
 
             {!apartments.length ? (
               <div style={{ color: "#666" }}>Пока нет квартир. Нажми “+ Квартира”.</div>
@@ -2395,20 +3080,17 @@ export default function App() {
           </div>
 
           {/* RIGHT */}
-          <div className="panel" style={{ order: isMobile ? 1 : 0 }}>
+          <div className="panel" style={{ order: isMobile ? 1 : 0, paddingTop: 9 }}>
             <div className="panel-title" style={{ visibility: "hidden", height: 0, margin: 0 }} />
 
             {!selected ? (
               <div style={{ color: "#666" }}>Выбери квартиру слева или создай новую.</div>
-            ) : loadingHistory && !historyWithFuture.length ? (
-              <div style={{ color: "#666" }}>Загрузка...</div>
             ) : !historyWithFuture.length ? (
+              loadingHistory ? null : (
               <div style={{ color: "#666" }}>Пока нет показаний по этой квартире.</div>
+              )
             ) : (
               <>
-                {loadingHistory ? (
-                  <div style={{ marginBottom: 8, color: "var(--muted)", fontSize: 12 }}>Обновляем данные…</div>
-                ) : null}
                 {calcBlockingIssues.length ? (
                   <div
                     style={{
@@ -2428,49 +3110,129 @@ export default function App() {
                     ))}
                   </div>
                 ) : null}
-                <div
-                  className="summary-strip"
-                  style={{
-                    gridTemplateColumns: summaryGridTemplate,
-                  }}
-                >
-                  <div className="summary-cell summary-cell-month" style={{ gridColumn: "1 / span 1" }}>
-                    <div className="summary-label ghost-label">&nbsp;</div>
-                    <div className="summary-value">{ymRuLabel(latestMonth)}</div>
-                  </div>
-                  <div className="summary-cell summary-cell-rent" style={{ gridColumn: `${summaryRentCol} / span 1`, textAlign: "center" }}>
-                    <div className="summary-label">Аренда</div>
-                    <div className="summary-label" style={{ marginTop: 2 }}>{latestRentDue.text}</div>
-                    <div
-                      className="summary-value"
-                      style={{ marginTop: 4, color: isRentUnpaid ? rentAlertColor : undefined }}
-                      title={isRentUnpaid ? "Аренда не оплачена" : undefined}
-                    >
-                      {latestRentAmount > 0 ? fmtRub(latestRentAmount) : "—"}
+                <div className="summary-strip">
+                  <div className="summary-cell summary-cell-month">
+                    <div ref={summaryMonthRef} className="summary-month-picker">
+                      <button
+                        type="button"
+                        className={`summary-month-trigger summary-value${summaryMonthOpen ? " is-open" : ""}`}
+                        onClick={() => setSummaryMonthOpen((prev) => !prev)}
+                        disabled={!summaryMonthOptions.length}
+                        aria-haspopup="menu"
+                        aria-expanded={summaryMonthOpen}
+                      >
+                        <span>{latestMonth ? ymRuLabel(latestMonth) : "—"}</span>
+                      </button>
+                      {summaryMonthOpen && summaryMonthOptions.length ? (
+                        <div className="summary-month-menu" role="menu" aria-label="Выбор месяца">
+                          {summaryMonthOptions.slice().reverse().map((month) => (
+                            <button
+                              key={month}
+                              type="button"
+                              className={`summary-month-option${month === latestMonth ? " is-active" : ""}`}
+                              onClick={() => {
+                                setSummaryMonth(month);
+                                setSummaryMonthOpen(false);
+                              }}
+                            >
+                              {ymRuLabel(month)}
+                            </button>
+                          ))}
+                        </div>
+                      ) : null}
                     </div>
                   </div>
-                  <div className="summary-cell summary-cell-counters" style={{ gridColumn: `${summaryUtilitiesPlannedCol} / span 1`, textAlign: "center" }}>
+                  <div className="summary-cell summary-cell-rent">
+                    <div className="summary-rent-title-row">
+                      <span className="summary-label">Аренда</span>
+                      {inlineDueEditing ? (
+                        <input
+                          autoFocus
+                          className="summary-inline-due__input summary-label"
+                          value={inlineDueValue}
+                          inputMode="numeric"
+                          onChange={(e) => setInlineDueValue(e.target.value.replace(/[^\d]/g, "").slice(0, 2))}
+                          onBlur={() => saveInlineRentDueDay()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              saveInlineRentDueDay();
+                            }
+                            if (e.key === "Escape") {
+                              setInlineDueValue(latestRentDue.day == null ? "" : String(latestRentDue.day));
+                              setInlineDueEditing(false);
+                            }
+                          }}
+                          disabled={inlineDueSaving}
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="summary-inline-due__trigger summary-label"
+                          onClick={() => {
+                            setInlineDueValue(latestRentDue.day == null ? "" : String(latestRentDue.day));
+                            setInlineDueEditing(true);
+                          }}
+                        >
+                          ({latestRentDue.day == null ? "—" : `${latestRentDue.day}-ое`})
+                        </button>
+                      )}
+                    </div>
+                    <div className={`summary-inline-rent${inlineRentSaving ? " is-saving" : ""}`} style={{ marginTop: 4 }}>
+                      {inlineRentEditing ? (
+                        <input
+                          autoFocus
+                          className="summary-inline-rent__input summary-value"
+                          value={inlineRentValue}
+                          inputMode="decimal"
+                          onChange={(e) => setInlineRentValue(e.target.value)}
+                          onBlur={() => saveInlineRentMonthly()}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.preventDefault();
+                              saveInlineRentMonthly();
+                            }
+                            if (e.key === "Escape") {
+                              setInlineRentValue(selected?.rent_monthly == null ? "" : String(Number(selected.rent_monthly) || 0));
+                              setInlineRentEditing(false);
+                            }
+                          }}
+                          disabled={inlineRentSaving}
+                        />
+                      ) : (
+                        <button
+                          type="button"
+                          className="summary-inline-rent__trigger summary-value"
+                          style={{ color: isRentUnpaid ? rentAlertColor : undefined }}
+                          onClick={() => {
+                            setInlineRentValue(selected?.rent_monthly == null ? "" : String(Number(selected.rent_monthly) || 0));
+                            setInlineRentEditing(true);
+                          }}
+                        >
+                          {latestRentAmount > 0 ? fmtRub(latestRentAmount) : "—"}
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                  <div className="summary-cell summary-cell-counters">
                     <div className="summary-label">К оплате (счетчики)</div>
+                    <div className="summary-meta">{utilitiesModeSummaryText()}</div>
                     <div className="summary-value">
                       {latestUtilitiesPlanned == null ? "—" : `${fmtRub(latestUtilitiesPlanned)}`}
                     </div>
                   </div>
-                  <div className="summary-cell summary-cell-counters-fact" style={{ gridColumn: `${summaryUtilitiesActualCol} / span 1`, textAlign: "center" }}>
+                  <div className="summary-cell summary-cell-counters-fact">
                     <div className="summary-label">Факт (счетчики)</div>
                     <div className="summary-value">
                       {latestUtilitiesActual == null ? "—" : `${fmtRub(latestUtilitiesActual)}`}
                     </div>
                   </div>
-                  <div
-                    className="summary-cell summary-cell-total"
-                    style={{ gridColumn: `${summarySumCol} / span 1`, textAlign: "center" }}
-                  >
+                  <div className="summary-cell summary-cell-total">
                     <div className="summary-label">Сумма</div>
                     <div className="summary-value">
                       {latestTotalDisplay == null ? "—" : `${fmtRub(latestTotalDisplay)}`}
                     </div>
                   </div>
-                  <div className="summary-cell summary-cell-actions-spacer" style={{ gridColumn: `${summarySumCol + 1} / span 1` }} />
                 </div>
 
                 <div className="right-stack">
@@ -2549,29 +3311,44 @@ export default function App() {
                       {renderGraph()}
                     </div>
                   ) : (
-                    <MetersTable
-                      rows={last4}
-                      eN={eN}
-                      currentYm={serverYm}
-                      showDualSummary={true}
-                      showRentColumn={false}
-                      showPolicyColumns={false}
-                      utilitiesForMonth={(m) => utilitiesByMonth.get(m) || null}
-                      effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
-                      calcSewerDelta={calcSewerDelta}
-                      calcElectricT3Fallback={calcElectricT3Fallback}
-                      cellTriplet={cellTriplet}
-                      calcSumRub={calcSumRub}
-                      fmtRub={fmtRub}
-                      openEdit={openEdit}
-                      getReviewFlag={getReviewFlag}
-                      onResolveReviewFlag={resolveReviewFlag}
-                      notificationHighlight={notifHighlight}
-                      onCellPhoto={openMeterPhoto}
-                      onInlineSave={saveInlineCell}
-                    />
+                    <>
+                      <MetersTable
+                        rows={last4}
+                        eN={eN}
+                        currentYm={serverYm}
+                        showDualSummary={true}
+                        showRentColumn={false}
+                        showPolicyColumns={false}
+                        utilitiesForMonth={(m) => utilitiesByMonth.get(m) || null}
+                        effectiveTariffForMonth={(m) => effectiveTariffForMonthForSelected(m)}
+                        calcSewerDelta={calcSewerDelta}
+                        calcElectricT3Fallback={calcElectricT3Fallback}
+                        cellTriplet={cellTriplet}
+                        calcSumRub={calcSumRub}
+                        fmtRub={fmtRub}
+                        openEdit={openEdit}
+                        getReviewFlag={getReviewFlag}
+                        onResolveReviewFlag={resolveReviewFlag}
+                        notificationHighlight={notifHighlight}
+                        onCellPhoto={openMeterPhoto}
+                        onInlineSave={saveInlineCell}
+                      />
+                    </>
                   )}
                 </div>
+                {pendingBillSend && selected && pendingBillSend.apartmentId === selected.id ? (
+                  <div style={{ marginTop: 14, display: "flex", justifyContent: "flex-end" }}>
+                    <button
+                      className="action-btn is-primary"
+                      onClick={() => sendUpdatedBill(selected.id, pendingBillSend.ym)}
+                      disabled={pendingBillSendLoading}
+                      style={{ minWidth: 220, justifyContent: "center" }}
+                      title={ymRuLabel(pendingBillSend.ym)}
+                    >
+                      {pendingBillSendLoading ? "Отправка..." : "Отправить новую сумму"}
+                    </button>
+                  </div>
+                ) : null}
               </>
             )}
           </div>
@@ -2721,26 +3498,76 @@ export default function App() {
               <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr" }}>
                 <label style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 800 }}>ХВС</div>
-                  <input value={editCold} onChange={(e) => setEditCold(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                  <input
+                    value={editCold}
+                    onChange={(e) => setEditCold(e.target.value)}
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ddd",
+                      color: editReadingMeta && isDraftReadingOutOfRange(editCold, editReadingMeta.cold.previous, "cold") ? "var(--warn-bright)" : "var(--text)",
+                      fontWeight: editReadingMeta && isDraftReadingOutOfRange(editCold, editReadingMeta.cold.previous, "cold") ? 700 : 500,
+                    }}
+                  />
                 </label>
                 <label style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 800 }}>ГВС</div>
-                  <input value={editHot} onChange={(e) => setEditHot(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                  <input
+                    value={editHot}
+                    onChange={(e) => setEditHot(e.target.value)}
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ddd",
+                      color: editReadingMeta && isDraftReadingOutOfRange(editHot, editReadingMeta.hot.previous, "hot") ? "var(--warn-bright)" : "var(--text)",
+                      fontWeight: editReadingMeta && isDraftReadingOutOfRange(editHot, editReadingMeta.hot.previous, "hot") ? 700 : 500,
+                    }}
+                  />
                 </label>
               </div>
 
               <div style={{ display: "grid", gap: 10, gridTemplateColumns: "1fr 1fr 1fr" }}>
                 <label style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 800 }}>Электро T1</div>
-                  <input value={editE1} onChange={(e) => setEditE1(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                  <input
+                    value={editE1}
+                    onChange={(e) => setEditE1(e.target.value)}
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ddd",
+                      color: editReadingMeta && isDraftReadingOutOfRange(editE1, editReadingMeta.e1.previous, "electric") ? "var(--warn-bright)" : "var(--text)",
+                      fontWeight: editReadingMeta && isDraftReadingOutOfRange(editE1, editReadingMeta.e1.previous, "electric") ? 700 : 500,
+                    }}
+                  />
                 </label>
                 <label style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 800 }}>Электро T2</div>
-                  <input value={editE2} onChange={(e) => setEditE2(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                  <input
+                    value={editE2}
+                    onChange={(e) => setEditE2(e.target.value)}
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ddd",
+                      color: editReadingMeta && isDraftReadingOutOfRange(editE2, editReadingMeta.e2.previous, "electric") ? "var(--warn-bright)" : "var(--text)",
+                      fontWeight: editReadingMeta && isDraftReadingOutOfRange(editE2, editReadingMeta.e2.previous, "electric") ? 700 : 500,
+                    }}
+                  />
                 </label>
                 <label style={{ display: "grid", gap: 6 }}>
                   <div style={{ fontWeight: 800 }}>Электро T3 (итого, без тарифа)</div>
-                  <input value={editE3} onChange={(e) => setEditE3(e.target.value)} style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd" }} />
+                  <input
+                    value={editE3}
+                    onChange={(e) => setEditE3(e.target.value)}
+                    style={{
+                      padding: 10,
+                      borderRadius: 10,
+                      border: "1px solid #ddd",
+                      color: editReadingMeta && isDraftReadingOutOfRange(editE3, editReadingMeta.e3.previous, "electric") ? "var(--warn-bright)" : "var(--text)",
+                      fontWeight: editReadingMeta && isDraftReadingOutOfRange(editE3, editReadingMeta.e3.previous, "electric") ? 700 : 500,
+                    }}
+                  />
                 </label>
               </div>
 
@@ -2902,53 +3729,195 @@ export default function App() {
       )}
 
       {photoOpen && (
-        <div
-          onMouseMove={(e) => {
-            if (!photoDrag.active) return;
-            setPhotoPos({ x: e.clientX - photoDrag.dx, y: e.clientY - photoDrag.dy });
-          }}
-          onMouseUp={() => setPhotoDrag({ active: false, dx: 0, dy: 0 })}
-          className="modal-overlay modal-overlay-transparent"
-          style={{ zIndex: 80, pointerEvents: "auto" }}
-        >
+        <div className="modal-overlay" style={{ zIndex: 80, padding: 12 }}>
           <div
             className="modal-shell modal-photo-shell"
-            style={{ position: "absolute", left: photoPos.x, top: photoPos.y, width: 520, maxWidth: "90vw" }}
+            style={{
+              width: "min(1180px, 96vw)",
+              maxWidth: "96vw",
+              height: "min(92vh, 920px)",
+              maxHeight: "92vh",
+              overflow: "hidden",
+              display: "grid",
+              gridTemplateRows: "auto 1fr",
+            }}
           >
             <div
-              onMouseDown={(e) => {
-                setPhotoDrag({ active: true, dx: e.clientX - photoPos.x, dy: e.clientY - photoPos.y });
-              }}
               style={{
                 padding: "8px 10px",
                 borderBottom: "1px solid #e5e7eb",
-                cursor: "move",
                 display: "flex",
                 justifyContent: "space-between",
                 alignItems: "center",
+                gap: 8,
                 fontWeight: 800,
               }}
             >
               <div>{photoTitle || "Фото"}</div>
-              <button
-                onClick={() => {
-                  if (photoUrl) URL.revokeObjectURL(photoUrl);
-                  setPhotoUrl("");
-                  setPhotoOpen(false);
-                }}
-                style={{ border: "1px solid #e5e7eb", background: "white", borderRadius: 8, padding: "4px 8px", cursor: "pointer" }}
-              >
-                Закрыть
-              </button>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                {photoContext?.photo?.image_url ? (
+                  <a
+                    href={photoContext.photo.image_url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="action-btn"
+                    style={{ textDecoration: "none", padding: "6px 10px", borderRadius: 8, fontWeight: 700 }}
+                  >
+                    Открыть оригинал
+                  </a>
+                ) : null}
+                <button
+                  onClick={closePhotoModal}
+                  style={{ border: "1px solid #e5e7eb", background: "white", borderRadius: 8, padding: "4px 8px", cursor: "pointer" }}
+                >
+                  Закрыть
+                </button>
+              </div>
             </div>
-            <div style={{ padding: 10, textAlign: "center" }}>
-              {photoLoading ? (
-                <div style={{ color: "#666" }}>Загрузка...</div>
-              ) : photoUrl ? (
-                <img src={photoUrl} alt="meter" style={{ maxWidth: "100%", borderRadius: 8 }} />
-              ) : (
-                <div style={{ color: "#666" }}>Фото не найдено</div>
-              )}
+            <div
+              style={{
+                padding: 10,
+                minHeight: 0,
+                display: "grid",
+                gridTemplateColumns: isMobile ? "1fr" : "minmax(0, 1.25fr) minmax(300px, 0.75fr)",
+                gap: 10,
+              }}
+            >
+              <div
+                style={{
+                  border: "1px solid var(--hair)",
+                  borderRadius: 10,
+                  background: "var(--panel)",
+                  minHeight: 0,
+                  overflow: "auto",
+                  padding: 8,
+                  WebkitOverflowScrolling: "touch",
+                }}
+              >
+                {photoLoading ? (
+                  <div style={{ color: "#666", textAlign: "center", paddingTop: 20 }}>Загрузка...</div>
+                ) : photoUrl ? (
+                  <img
+                    src={photoUrl}
+                    alt="meter"
+                    style={{
+                      display: "block",
+                      width: "auto",
+                      maxWidth: "100%",
+                      height: "auto",
+                      borderRadius: 8,
+                      margin: "0 auto",
+                      touchAction: "pinch-zoom",
+                    }}
+                  />
+                ) : (
+                  <div style={{ color: "#666", textAlign: "center", paddingTop: 20 }}>Фото не найдено</div>
+                )}
+              </div>
+
+              <div
+                style={{
+                  minHeight: 0,
+                  overflow: "auto",
+                  display: "grid",
+                  gap: 8,
+                  alignContent: "start",
+                }}
+              >
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                  <div style={{ border: "1px solid var(--hair)", borderRadius: 10, padding: "8px 10px", background: "var(--panel)" }}>
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 3 }}>Распознано (OCR)</div>
+                    <div
+                      style={{
+                        fontWeight: 700,
+                        color:
+                          photoContext &&
+                          isDetectedReadingOutOfRange(
+                            photoContext?.photo?.ocr_reading ?? null,
+                            getMeterReadingMeta(String(photoContext.ym), String(photoContext.meter_type), Number(photoContext.meter_index || 1)).previous,
+                            String(photoContext.meter_type),
+                            "ocr"
+                          )
+                            ? "var(--warn-bright)"
+                            : "var(--text)",
+                      }}
+                    >
+                      {fmtNum(photoContext?.photo?.ocr_reading ?? null, 3)}
+                    </div>
+                  </div>
+                  <div style={{ border: "1px solid var(--hair)", borderRadius: 10, padding: "8px 10px", background: "var(--panel)" }}>
+                    <div style={{ fontSize: 11, color: "var(--muted)", marginBottom: 3 }}>Записано в базе</div>
+                    <input
+                      className="photo-recorded-input"
+                      value={photoEditedValue}
+                      onChange={(e) => setPhotoEditedValue(e.target.value)}
+                      placeholder="Введите значение"
+                      disabled={
+                        photoSaveLoading ||
+                        !photoContext ||
+                        !["cold", "hot", "electric"].includes(String(photoContext?.meter_type || "").toLowerCase())
+                      }
+                      style={{
+                        width: "100%",
+                        padding: 0,
+                        border: 0,
+                        borderRadius: 0,
+                        background: "transparent",
+                        outline: "none",
+                        boxShadow: "none",
+                        appearance: "none",
+                        color:
+                          photoContext &&
+                          isDraftReadingOutOfRange(
+                            photoEditedValue,
+                            getMeterReadingMeta(String(photoContext.ym), String(photoContext.meter_type), Number(photoContext.meter_index || 1)).previous,
+                            String(photoContext.meter_type)
+                          )
+                            ? "var(--warn-bright)"
+                            : "var(--text)",
+                        fontWeight:
+                          photoContext &&
+                          isDraftReadingOutOfRange(
+                            photoEditedValue,
+                            getMeterReadingMeta(String(photoContext.ym), String(photoContext.meter_type), Number(photoContext.meter_index || 1)).previous,
+                            String(photoContext.meter_type)
+                          )
+                            ? 700
+                            : 700,
+                        fontSize: 15,
+                        lineHeight: 1.2,
+                      }}
+                    />
+                  </div>
+                </div>
+
+                <div style={{ display: "grid", gap: 6 }}>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button
+                      className="action-btn"
+                      onClick={() => void savePhotoModalValue(false)}
+                      disabled={
+                        photoSaveLoading ||
+                        !photoContext ||
+                        !["cold", "hot", "electric"].includes(String(photoContext?.meter_type || "").toLowerCase())
+                      }
+                    >
+                      {photoSaveLoading ? "Сохранение..." : "Сохранить"}
+                    </button>
+                    <button
+                      className="action-btn is-primary"
+                      onClick={() => void savePhotoModalValue(true)}
+                      disabled={
+                        photoSaveLoading ||
+                        !photoContext ||
+                        !["cold", "hot", "electric"].includes(String(photoContext?.meter_type || "").toLowerCase())
+                      }
+                    >
+                      {photoSaveLoading ? "Сохранение..." : "Сохранить и подтвердить"}
+                    </button>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         </div>
@@ -2981,11 +3950,11 @@ export default function App() {
               saveInfo(selected.id);
             }}
             style={{
-              width: 600,
+              width: 580,
               maxWidth: "96vw",
-              maxHeight: "92vh",
+              maxHeight: "calc(100vh - 24px)",
               overflow: "auto",
-              fontSize: 13,
+              fontSize: 12.5,
               transform: `translate(${infoPos.x}px, ${infoPos.y}px)`,
               cursor: infoDrag.active ? "grabbing" : "grab",
             }}
@@ -2998,22 +3967,22 @@ export default function App() {
             </div>
 
             {infoLoading ? (
-              <div style={{ marginTop: 12, color: "#666" }}>Загрузка...</div>
+              <div style={{ marginTop: 8, color: "#666" }}>Загрузка...</div>
             ) : (
-              <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
-                <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+              <div style={{ marginTop: 8, display: "grid", gap: 8 }}>
+                <div style={{ display: "grid", gap: 6, gridTemplateColumns: "1fr 1fr" }}>
                   <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Арендатор: имя (для отображения)</div>
-                    <input value={infoTenantName} onChange={(e) => setInfoTenantName(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
+                    <input value={infoTenantName} onChange={(e) => setInfoTenantName(e.target.value)} style={{ padding: 7, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
 
                   <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Комментарий (необязательно)</div>
-                    <input value={infoNote} onChange={(e) => setInfoNote(e.target.value)} style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
+                    <input value={infoNote} onChange={(e) => setInfoNote(e.target.value)} style={{ padding: 7, borderRadius: 10, border: "1px solid #ddd" }} />
                   </label>
                 </div>
 
-                <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                <div style={{ display: "grid", gap: 6, gridTemplateColumns: "1fr 1fr" }}>
                   <label style={{ display: "grid", gap: 4 }}>
                     <div style={{ fontWeight: 800 }}>Дата заселения</div>
                     <input
@@ -3030,33 +3999,33 @@ export default function App() {
                       value={infoRentMonthly}
                       onChange={(e) => setInfoRentMonthly(e.target.value)}
                       placeholder="0"
-                      style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                      style={{ padding: 7, borderRadius: 10, border: "1px solid #ddd" }}
                     />
                   </label>
                 </div>
 
-                <div className="info-section" style={{ paddingTop: 8 }}>
-                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Последние изменения аренды</div>
+                <div className="info-section" style={{ paddingTop: 4 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 6 }}>Последние изменения аренды</div>
                   {!infoRentHistory.length ? (
                     <div style={{ color: "#666" }}>История пока пустая.</div>
                   ) : (
                     <div style={{ overflowX: "auto" }}>
-                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                      <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11.5 }}>
                         <thead>
                           <tr>
-                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>С месяца</th>
-                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>Сумма (₽)</th>
-                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>Арендатор</th>
-                            <th style={{ textAlign: "left", padding: "6px 4px", borderBottom: "1px solid #eee" }}>Когда</th>
+                            <th style={{ textAlign: "left", padding: "4px 4px", borderBottom: "1px solid #eee" }}>С месяца</th>
+                            <th style={{ textAlign: "left", padding: "4px 4px", borderBottom: "1px solid #eee" }}>Сумма (₽)</th>
+                            <th style={{ textAlign: "left", padding: "4px 4px", borderBottom: "1px solid #eee" }}>Арендатор</th>
+                            <th style={{ textAlign: "left", padding: "4px 4px", borderBottom: "1px solid #eee" }}>Когда</th>
                           </tr>
                         </thead>
                         <tbody>
                           {infoRentHistory.map((row) => (
                             <tr key={row.id}>
-                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{ymDisplay(row.ym_from)}</td>
-                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{fmtRub(Number(row.rent_monthly || 0))}</td>
-                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{(row.tenant_name_snapshot || "—")}</td>
-                              <td style={{ padding: "6px 4px", borderBottom: "1px solid #f3f4f6" }}>{fmtDateTime(row.changed_at)}</td>
+                              <td style={{ padding: "4px 4px", borderBottom: "1px solid #f3f4f6" }}>{ymDisplay(row.ym_from)}</td>
+                              <td style={{ padding: "4px 4px", borderBottom: "1px solid #f3f4f6" }}>{fmtRub(Number(row.rent_monthly || 0))}</td>
+                              <td style={{ padding: "4px 4px", borderBottom: "1px solid #f3f4f6" }}>{(row.tenant_name_snapshot || "—")}</td>
+                              <td style={{ padding: "4px 4px", borderBottom: "1px solid #f3f4f6" }}>{fmtDateTime(row.changed_at)}</td>
                             </tr>
                           ))}
                         </tbody>
@@ -3065,17 +4034,17 @@ export default function App() {
                   )}
                 </div>
 
-                <div className="info-section" style={{ paddingTop: 8 }}>
-                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Оплата счетчиков (режим)</div>
+                <div className="info-section" style={{ paddingTop: 4 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 6 }}>Оплата счетчиков (режим)</div>
                   {(infoFixedMissing || infoAdvanceAmountMissing || infoAdvanceCycleMissing || infoAdvanceAnchorMissing) ? (
                     <div
                       style={{
-                        marginBottom: 8,
-                        padding: "8px 10px",
+                        marginBottom: 6,
+                        padding: "6px 8px",
                         borderRadius: 10,
                         border: "1px solid rgba(239,68,68,0.45)",
                         background: "rgba(239,68,68,0.08)",
-                        fontSize: 12,
+                        fontSize: 11.5,
                         display: "grid",
                         gap: 2,
                       }}
@@ -3093,7 +4062,7 @@ export default function App() {
                       <select
                         value={infoUtilitiesMode}
                         onChange={(e) => setInfoUtilitiesMode(e.target.value as any)}
-                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                        style={{ padding: 7, borderRadius: 10, border: "1px solid #ddd" }}
                       >
                         <option value="by_actual_monthly">По факту ежемесячно</option>
                         <option value="fixed_monthly">Фикс ежемесячно</option>
@@ -3102,7 +4071,7 @@ export default function App() {
                     </label>
                     <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>Показывать факт клиенту</div>
-                      <div style={{ display: "flex", alignItems: "center", gap: 8, height: 38 }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 8, height: 34 }}>
                         <input
                           type="checkbox"
                           checked={infoUtilitiesShowActualToTenant}
@@ -3114,7 +4083,7 @@ export default function App() {
                   </div>
 
                   {infoUtilitiesMode === "fixed_monthly" ? (
-                    <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr", marginTop: 8 }}>
+                    <div style={{ display: "grid", gap: 6, gridTemplateColumns: "1fr 1fr", marginTop: 6 }}>
                       <label style={{ display: "grid", gap: 4 }}>
                         <div style={{ fontWeight: 800 }}>Фикс в месяц (₽)</div>
                         <input
@@ -3128,7 +4097,7 @@ export default function App() {
                   ) : null}
 
                   {infoUtilitiesMode === "quarterly_advance" ? (
-                    <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr 1fr", marginTop: 8 }}>
+                    <div style={{ display: "grid", gap: 6, gridTemplateColumns: "1fr 1fr 1fr", marginTop: 6 }}>
                       <label style={{ display: "grid", gap: 4 }}>
                         <div style={{ fontWeight: 800 }}>Сумма аванса (₽)</div>
                         <input
@@ -3160,29 +4129,29 @@ export default function App() {
                   ) : null}
                 </div>
 
-                <div className="info-section" style={{ paddingTop: 8 }}>
-                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Контакты для авто-привязки фото</div>
+                <div className="info-section" style={{ paddingTop: 4 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 6 }}>Контакты для авто-привязки фото</div>
 
-                  <div style={{ display: "grid", gap: 8, gridTemplateColumns: "1fr 1fr" }}>
+                  <div style={{ display: "grid", gap: 6, gridTemplateColumns: "1fr 1fr" }}>
                     <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>Телефон</div>
                       <input
                         value={infoPhone}
                         onChange={(e) => setInfoPhone(e.target.value)}
                         placeholder="+7 999 111-22-33 или 8 999 111-22-33"
-                        style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }}
+                        style={{ padding: 7, borderRadius: 10, border: "1px solid #ddd" }}
                       />
                     </label>
 
                     <label style={{ display: "grid", gap: 4 }}>
                       <div style={{ fontWeight: 800 }}>Telegram username</div>
-                      <input value={infoTelegram} onChange={(e) => setInfoTelegram(e.target.value)} placeholder="@username" style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd" }} />
+                      <input value={infoTelegram} onChange={(e) => setInfoTelegram(e.target.value)} placeholder="@username" style={{ padding: 7, borderRadius: 10, border: "1px solid #ddd" }} />
                     </label>
                   </div>
                 </div>
 
-                <div className="info-section" style={{ paddingTop: 8 }}>
-                  <div style={{ fontWeight: 900, marginBottom: 8 }}>Привязанные Telegram ID (chat_id)</div>
+                <div className="info-section" style={{ paddingTop: 4 }}>
+                  <div style={{ fontWeight: 900, marginBottom: 6 }}>Привязанные Telegram ID (chat_id)</div>
 
                   {!infoChats.length ? (
                     <div style={{ color: "#666" }}>Пока нет привязок. Они появятся автоматически после первого совпадения по телефону/нику или после ручной привязки ниже.</div>
@@ -3197,14 +4166,14 @@ export default function App() {
                             justifyContent: "space-between",
                             gap: 10,
                             alignItems: "center",
-                            padding: 10,
+                            padding: 8,
                             border: "1px solid #eee",
                             borderRadius: 10,
                           }}
                         >
                           <div>
                             <div style={{ fontWeight: 900 }}>{c.chat_id}</div>
-                            <div style={{ color: "#666", fontSize: 12 }}>
+                            <div style={{ color: "#666", fontSize: 11.5 }}>
                               {c.is_active ? "active" : "inactive"}
                             </div>
                           </div>
@@ -3220,24 +4189,24 @@ export default function App() {
                     </div>
                   )}
 
-                  <div style={{ marginTop: 10, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                  <div style={{ marginTop: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
                     <input
                       value={bindChatInput}
                       onChange={(e) => setBindChatInput(e.target.value)}
                       placeholder="Ввести chat_id для ручной привязки"
-                      style={{ padding: 10, borderRadius: 10, border: "1px solid #ddd", minWidth: 260, flex: "1 1 260px" }}
+                      style={{ padding: 8, borderRadius: 10, border: "1px solid #ddd", minWidth: 240, flex: "1 1 240px" }}
                     />
-                    <button className="action-btn is-primary" onClick={() => bindChatToApartment(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
+                    <button className="action-btn is-primary" onClick={() => bindChatToApartment(selected.id)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                       Привязать
                     </button>
                   </div>
                 </div>
 
-                <div className="info-footer" style={{ display: "flex", gap: 10, justifyContent: "flex-end", paddingTop: 8, marginTop: 8 }}>
-                  <button className="action-btn" onClick={() => setInfoOpen(false)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
+                <div className="info-footer" style={{ display: "flex", gap: 8, justifyContent: "flex-end", paddingTop: 6, marginTop: 6 }}>
+                  <button className="action-btn" onClick={() => setInfoOpen(false)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #ddd", background: "white", cursor: "pointer", fontWeight: 900 }}>
                     Отмена
                   </button>
-                  <button className="action-btn is-primary" onClick={() => saveInfo(selected.id)} style={{ padding: "10px 12px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
+                  <button className="action-btn is-primary" onClick={() => saveInfo(selected.id)} style={{ padding: "8px 10px", borderRadius: 10, border: "1px solid #111", background: "#111", color: "white", cursor: "pointer", fontWeight: 900 }}>
                     Сохранить
                   </button>
                 </div>
@@ -3692,8 +4661,7 @@ export default function App() {
           >
             <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12, padding: "4px 4px 10px", borderBottom: "1px solid var(--top-sep)", marginBottom: 12 }}>
               <div>
-                <div style={{ fontWeight: 700 }}>Тема и индикаторы</div>
-                <div style={{ fontSize: 12, color: "var(--muted)" }}>Светлая тёплая/светлая холодная/тёмная/ультра</div>
+                <div style={{ fontWeight: 700 }}>Персонализация</div>
               </div>
               <button className="action-btn" onClick={() => setSettingsOpen(false)}>Закрыть</button>
             </div>
@@ -3732,6 +4700,11 @@ export default function App() {
                     <input type="radio" checked={indicatorPalette === "bright"} onChange={() => setIndicatorPalette("bright")} />
                     Палитра 2 (яркая)
                   </label>
+                </div>
+                <div style={{ margin: "12px 0 10px", fontWeight: 700, fontSize: 13 }}>Акцентные цвета</div>
+                <div ref={accentPickerRef} className="accent-color-row">
+                  {renderAccentColorControl("color1", "Цвет 1", indicatorColor1, setIndicatorColor1, DEFAULT_COLOR_1)}
+                  {renderAccentColorControl("color2", "Цвет 2", indicatorColor2, setIndicatorColor2, DEFAULT_COLOR_2)}
                 </div>
                 <div style={{ margin: "12px 0 10px", fontWeight: 700, fontSize: 13 }}>Стиль индикаторов</div>
                 <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
