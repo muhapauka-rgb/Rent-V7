@@ -3463,6 +3463,7 @@ class WaterCandidateScorecard(TypedDict, total=False):
     context_bonus: float
     suspicious_flags: list[str]
     candidate_score: float
+    score_breakdown: dict[str, Any]
     crop_meta: dict[str, Any]
     debug_meta: dict[str, Any]
 
@@ -3478,6 +3479,7 @@ class WaterSerialCandidate(TypedDict, total=False):
     tail_match: int
     suspicious_flags: list[str]
     candidate_score: float
+    score_breakdown: dict[str, Any]
     crop_meta: dict[str, Any]
     debug_meta: dict[str, Any]
 
@@ -3673,16 +3675,24 @@ def _build_water_candidate_scorecard(
         serial_hints=serial_hints,
     )
     score = float(_candidate_score(candidate, all_items))
-    score += 0.10 * odo_conf
-    score += 0.06 * geometry_conf
-    score += 0.04 * serial_conf
+    base_score = float(score)
+    odo_bonus = 0.10 * odo_conf
+    geometry_bonus = 0.06 * geometry_conf
+    serial_bonus = 0.04 * serial_conf
+    fullframe_penalty = 0.0
+    template_penalty = 0.0
+    score += odo_bonus
+    score += geometry_bonus
+    score += serial_bonus
     score += context_bonus
     score -= serial_overlap_penalty
     if source == "fullframe" and has_odometer_candidates and not _is_strong_water_digits(candidate):
-        score -= 0.18
+        fullframe_penalty = 0.18
+        score -= fullframe_penalty
         suspicious_flags.append("fullframe_without_odometer_support")
     if source == "template" and has_odometer_candidates:
-        score -= 0.08
+        template_penalty = 0.08
+        score -= template_penalty
     crop_meta = {
         "variant": variant,
         "source": source,
@@ -3711,6 +3721,16 @@ def _build_water_candidate_scorecard(
         context_bonus=round(float(context_bonus), 4),
         suspicious_flags=sorted(set(suspicious_flags)),
         candidate_score=round(float(score), 4),
+        score_breakdown={
+            "base_score": round(base_score, 4),
+            "odo_bonus": round(float(odo_bonus), 4),
+            "geometry_bonus": round(float(geometry_bonus), 4),
+            "serial_bonus": round(float(serial_bonus), 4),
+            "context_bonus": round(float(context_bonus), 4),
+            "serial_overlap_penalty": round(float(serial_overlap_penalty), 4),
+            "fullframe_penalty": round(float(fullframe_penalty), 4),
+            "template_penalty": round(float(template_penalty), 4),
+        },
         crop_meta=crop_meta,
         debug_meta=debug_meta,
     )
@@ -3767,14 +3787,20 @@ def _build_water_serial_candidate(
     if _digits_overlap_serial(candidate.get("black_digits"), serial_norm):
         suspicious_flags.append("serial_digits_overlap")
     score = (0.62 * serial_conf) + (0.24 * geom_conf) + min(0.14, float(tail_match) * 0.03)
+    source_adjustment = 0.0
+    serial_like_penalty = 0.0
     if source in {"face_top_strip", "face_row", "odometer_row", "odometer_window", "cells", "cells_rescue"}:
+        source_adjustment += 0.05
         score += 0.05
     if source == "template":
+        source_adjustment -= 0.02
         score -= 0.02
     if source == "fullframe":
+        source_adjustment -= 0.03
         score -= 0.03
     if "reading_looks_like_serial" in suspicious_flags:
-        score -= 0.06
+        serial_like_penalty = 0.06
+        score -= serial_like_penalty
     return WaterSerialCandidate(
         candidate=candidate,
         source=source,
@@ -3786,6 +3812,13 @@ def _build_water_serial_candidate(
         tail_match=int(tail_match),
         suspicious_flags=sorted(set(suspicious_flags)),
         candidate_score=round(float(score), 4),
+        score_breakdown={
+            "serial_component": round(float(0.62 * serial_conf), 4),
+            "geometry_component": round(float(0.24 * geom_conf), 4),
+            "tail_component": round(float(min(0.14, float(tail_match) * 0.03)), 4),
+            "source_adjustment": round(float(source_adjustment), 4),
+            "serial_like_penalty": round(float(serial_like_penalty), 4),
+        },
         crop_meta={
             "variant": variant,
             "source": source,
@@ -3873,6 +3906,71 @@ def _build_water_detection_debug(
     }
 
 
+def _compact_water_scorecard_debug(sc: WaterCandidateScorecard) -> dict[str, Any]:
+    return {
+        "source": sc.get("source"),
+        "variant": sc.get("variant"),
+        "provider": sc.get("provider"),
+        "type": sc.get("raw_type"),
+        "reading": sc.get("reading"),
+        "serial": sc.get("serial"),
+        "integer_digits": sc.get("integer_digits"),
+        "decimal_digits": sc.get("decimal_digits"),
+        "candidate_score": sc.get("candidate_score"),
+        "odo_confidence": sc.get("odo_confidence"),
+        "serial_confidence": sc.get("serial_confidence"),
+        "geometry_confidence": sc.get("geometry_confidence"),
+        "serial_overlap_penalty": sc.get("serial_overlap_penalty"),
+        "context_distance": sc.get("context_distance"),
+        "context_bonus": sc.get("context_bonus"),
+        "score_breakdown": sc.get("score_breakdown") or {},
+        "suspicious_flags": sc.get("suspicious_flags") or [],
+    }
+
+
+def _compact_water_serial_debug(sc: WaterSerialCandidate) -> dict[str, Any]:
+    return {
+        "source": sc.get("source"),
+        "variant": sc.get("variant"),
+        "provider": sc.get("provider"),
+        "serial": sc.get("serial"),
+        "serial_confidence": sc.get("serial_confidence"),
+        "geometry_confidence": sc.get("geometry_confidence"),
+        "tail_match": sc.get("tail_match"),
+        "candidate_score": sc.get("candidate_score"),
+        "score_breakdown": sc.get("score_breakdown") or {},
+        "suspicious_flags": sc.get("suspicious_flags") or [],
+    }
+
+
+def _water_decision_summary(
+    winner: Optional[WaterCandidateScorecard],
+    *,
+    serial_candidate: Optional[WaterSerialCandidate],
+    odometer_candidate: Optional[WaterCandidateScorecard],
+    ranked: list[WaterCandidateScorecard],
+    override_note: str,
+) -> dict[str, Any]:
+    return {
+        "winner": (_compact_water_scorecard_debug(winner) if winner else None),
+        "serial_branch_winner": (_compact_water_serial_debug(serial_candidate) if serial_candidate else None),
+        "odometer_branch_winner": (_compact_water_scorecard_debug(odometer_candidate) if odometer_candidate else None),
+        "override": override_note or None,
+        "context_override_applied": bool(override_note and "context_override" in override_note),
+        "serial_tail_like": bool(winner and "serial_tail_like" in (winner.get("suspicious_flags") or [])),
+        "top_sources": [
+            {
+                "source": sc.get("source"),
+                "variant": sc.get("variant"),
+                "reading": sc.get("reading"),
+                "candidate_score": sc.get("candidate_score"),
+            }
+            for sc in ranked[:3]
+            if sc.get("source")
+        ],
+    }
+
+
 def _water_decision_debug(
     scorecards: list[WaterCandidateScorecard],
     *,
@@ -3905,135 +4003,42 @@ def _water_decision_debug(
         odometer_candidate = odometer_ranked[0] if odometer_ranked else None
     ranked = []
     for sc in scorecards[:8]:
-        ranked.append(
-            {
-                "source": sc.get("source"),
-                "variant": sc.get("variant"),
-                "provider": sc.get("provider"),
-                "type": sc.get("raw_type"),
-                "reading": sc.get("reading"),
-                "serial": sc.get("serial"),
-                "integer_digits": sc.get("integer_digits"),
-                "decimal_digits": sc.get("decimal_digits"),
-                "candidate_score": sc.get("candidate_score"),
-                "odo_confidence": sc.get("odo_confidence"),
-                "serial_confidence": sc.get("serial_confidence"),
-                "geometry_confidence": sc.get("geometry_confidence"),
-                "serial_overlap_penalty": sc.get("serial_overlap_penalty"),
-                "context_distance": sc.get("context_distance"),
-                "context_bonus": sc.get("context_bonus"),
-                "suspicious_flags": sc.get("suspicious_flags") or [],
-            }
-        )
+        ranked.append(_compact_water_scorecard_debug(sc))
     serial_ranked = []
     for sc in list(serial_branch or [])[:6]:
-        serial_ranked.append(
-            {
-                "source": sc.get("source"),
-                "variant": sc.get("variant"),
-                "provider": sc.get("provider"),
-                "serial": sc.get("serial"),
-                "serial_confidence": sc.get("serial_confidence"),
-                "geometry_confidence": sc.get("geometry_confidence"),
-                "tail_match": sc.get("tail_match"),
-                "candidate_score": sc.get("candidate_score"),
-                "suspicious_flags": sc.get("suspicious_flags") or [],
-            }
-        )
+        serial_ranked.append(_compact_water_serial_debug(sc))
     odometer_ranked_debug = []
     for sc in odometer_ranked[:6]:
-        odometer_ranked_debug.append(
-            {
-                "source": sc.get("source"),
-                "variant": sc.get("variant"),
-                "provider": sc.get("provider"),
-                "reading": sc.get("reading"),
-                "integer_digits": sc.get("integer_digits"),
-                "decimal_digits": sc.get("decimal_digits"),
-                "candidate_score": sc.get("candidate_score"),
-                "odo_confidence": sc.get("odo_confidence"),
-                "geometry_confidence": sc.get("geometry_confidence"),
-                "suspicious_flags": sc.get("suspicious_flags") or [],
-            }
-        )
+        odometer_ranked_debug.append(_compact_water_scorecard_debug(sc))
     return {
         "model": "water_candidate_v2",
         "pool_size": int(selected_pool_size),
         "strict_pool_size": int(strict_pool_size),
         "strong_pool_size": int(strong_pool_size),
-        "winner": (
-            {
-                "source": winner.get("source"),
-                "variant": winner.get("variant"),
-                "provider": winner.get("provider"),
-                "type": winner.get("raw_type"),
-                "reading": winner.get("reading"),
-                "serial": winner.get("serial"),
-                "integer_digits": winner.get("integer_digits"),
-                "decimal_digits": winner.get("decimal_digits"),
-                "candidate_score": winner.get("candidate_score"),
-                "suspicious_flags": winner.get("suspicious_flags") or [],
-            }
-            if winner
-            else None
+        "summary": _water_decision_summary(
+            winner,
+            serial_candidate=serial_candidate if serial_candidate and float(serial_candidate.get("serial_confidence") or 0.0) > 0.0 else None,
+            odometer_candidate=odometer_candidate,
+            ranked=scorecards,
+            override_note=override_note,
         ),
+        "winner": (_compact_water_scorecard_debug(winner) if winner else None),
         "serial_candidate": (
-            {
-                "source": serial_candidate.get("source"),
-                "variant": serial_candidate.get("variant"),
-                "serial": serial_candidate.get("serial"),
-                "serial_confidence": serial_candidate.get("serial_confidence"),
-                "candidate_score": serial_candidate.get("candidate_score"),
-            }
+            _compact_water_serial_debug(serial_candidate)
             if serial_candidate and float(serial_candidate.get("serial_confidence") or 0.0) > 0.0
             else None
         ),
         "serial_branch": {
             "winner": (
-                {
-                    "source": serial_candidate.get("source"),
-                    "variant": serial_candidate.get("variant"),
-                    "provider": serial_candidate.get("provider"),
-                    "serial": serial_candidate.get("serial"),
-                    "serial_confidence": serial_candidate.get("serial_confidence"),
-                    "geometry_confidence": serial_candidate.get("geometry_confidence"),
-                    "tail_match": serial_candidate.get("tail_match"),
-                    "candidate_score": serial_candidate.get("candidate_score"),
-                    "suspicious_flags": serial_candidate.get("suspicious_flags") or [],
-                }
+                _compact_water_serial_debug(serial_candidate)
                 if serial_candidate and float(serial_candidate.get("serial_confidence") or 0.0) > 0.0
                 else None
             ),
             "ranked": serial_ranked,
         },
-        "odometer_candidate": (
-            {
-                "source": odometer_candidate.get("source"),
-                "variant": odometer_candidate.get("variant"),
-                "reading": odometer_candidate.get("reading"),
-                "candidate_score": odometer_candidate.get("candidate_score"),
-                "geometry_confidence": odometer_candidate.get("geometry_confidence"),
-            }
-            if odometer_candidate
-            else None
-        ),
+        "odometer_candidate": (_compact_water_scorecard_debug(odometer_candidate) if odometer_candidate else None),
         "odometer_branch": {
-            "winner": (
-                {
-                    "source": odometer_candidate.get("source"),
-                    "variant": odometer_candidate.get("variant"),
-                    "provider": odometer_candidate.get("provider"),
-                    "reading": odometer_candidate.get("reading"),
-                    "integer_digits": odometer_candidate.get("integer_digits"),
-                    "decimal_digits": odometer_candidate.get("decimal_digits"),
-                    "candidate_score": odometer_candidate.get("candidate_score"),
-                    "odo_confidence": odometer_candidate.get("odo_confidence"),
-                    "geometry_confidence": odometer_candidate.get("geometry_confidence"),
-                    "suspicious_flags": odometer_candidate.get("suspicious_flags") or [],
-                }
-                if odometer_candidate
-                else None
-            ),
+            "winner": (_compact_water_scorecard_debug(odometer_candidate) if odometer_candidate else None),
             "ranked": odometer_ranked_debug,
         },
         "override": override_note or None,

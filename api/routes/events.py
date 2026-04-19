@@ -2047,8 +2047,9 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             water_decision = dict(ocr_data.get("water_decision") or {})
             serial_branch = water_decision.get("serial_branch") if isinstance(water_decision.get("serial_branch"), dict) else None
             odometer_branch = water_decision.get("odometer_branch") if isinstance(water_decision.get("odometer_branch"), dict) else None
+            water_summary = water_decision.get("summary") if isinstance(water_decision.get("summary"), dict) else None
             diag["ocr_water_decision"] = {
-                "summary": _summarize_water_decision_for_diag(water_decision),
+                "summary": jsonable_encoder(water_summary or _summarize_water_decision_for_diag(water_decision)),
                 "model": water_decision.get("model"),
                 "pool_size": water_decision.get("pool_size"),
                 "strict_pool_size": water_decision.get("strict_pool_size"),
