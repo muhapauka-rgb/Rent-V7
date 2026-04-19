@@ -1867,6 +1867,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     if isinstance(ocr_data, dict) and isinstance(ocr_data.get("water_decision"), dict):
         try:
             water_decision = dict(ocr_data.get("water_decision") or {})
+            serial_branch = water_decision.get("serial_branch") if isinstance(water_decision.get("serial_branch"), dict) else None
+            odometer_branch = water_decision.get("odometer_branch") if isinstance(water_decision.get("odometer_branch"), dict) else None
             diag["ocr_water_decision"] = {
                 "model": water_decision.get("model"),
                 "pool_size": water_decision.get("pool_size"),
@@ -1875,6 +1877,15 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 "override": water_decision.get("override"),
                 "winner": water_decision.get("winner"),
                 "ranked": list(water_decision.get("ranked") or [])[:5],
+                "serial_branch": {
+                    "winner": (serial_branch or {}).get("winner"),
+                    "ranked": list((serial_branch or {}).get("ranked") or [])[:5],
+                } if serial_branch else None,
+                "odometer_branch": {
+                    "winner": (odometer_branch or {}).get("winner"),
+                    "ranked": list((odometer_branch or {}).get("ranked") or [])[:5],
+                } if odometer_branch else None,
+                "detection": water_decision.get("detection"),
             }
         except Exception as e:
             diag["warnings"].append({"ocr_water_decision_parse_failed": str(e)})
