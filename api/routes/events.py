@@ -9,6 +9,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from fastapi import APIRouter, Request, UploadFile, File
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from sqlalchemy import text
 from datetime import datetime
@@ -3496,6 +3497,28 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         except Exception as e:
             diag["warnings"].append({"bill_calc_failed": str(e)})
 
+    if isinstance(diag.get("ocr_water_decision"), dict):
+        gate_keys = {
+            "water_prev_sanity_blocked",
+            "water_prev_sanity_saved_with_review",
+            "water_prev_sanity_saved_with_review",
+            "water_serial_prev_saved_with_review",
+            "anomaly_jump",
+            "anomaly_saved_with_review",
+            "water_type_uncertain",
+            "ocr_type_conflict",
+            "serial_mismatch",
+        }
+        gate_notes: list[dict | str] = []
+        for warning in list(diag.get("warnings") or []):
+            if isinstance(warning, dict):
+                if any(key in warning for key in gate_keys):
+                    gate_notes.append(warning)
+            elif isinstance(warning, str) and ("review" in warning or "anomaly" in warning):
+                gate_notes.append(warning)
+        if gate_notes:
+            diag["ocr_water_decision"]["review_gate"] = jsonable_encoder(gate_notes[:8])
+
     resolved_meter_kind = str(kind) if kind is not None else None
     resolved_meter_label = _kind_to_label(resolved_meter_kind, assigned_meter_index)
     if isinstance(ocr_data, dict):
@@ -3562,4 +3585,4 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         len(diag.get("warnings") or []),
         len(diag.get("errors") or []),
     )
-    return JSONResponse(status_code=200, content=payload)
+    return JSONResponse(status_code=200, content=jsonable_encoder(payload))
