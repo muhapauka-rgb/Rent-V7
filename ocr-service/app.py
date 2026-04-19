@@ -12,7 +12,7 @@ from collections import Counter
 from io import BytesIO
 from datetime import datetime
 from PIL import Image, ImageOps, ImageFilter, ImageEnhance, ImageDraw
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple, TypedDict
 from fastapi import FastAPI, UploadFile, File, HTTPException, Form
 import numpy as np
 import cv2
@@ -3432,12 +3432,373 @@ def _hydrate_water_candidate_digits(item: dict) -> dict:
     return out
 
 
+class WaterCandidateScorecard(TypedDict, total=False):
+    candidate: dict[str, Any]
+    source: str
+    provider: str
+    variant: str
+    raw_type: str
+    reading: Optional[float]
+    serial: Optional[str]
+    integer_digits: Optional[str]
+    decimal_digits: Optional[str]
+    odo_confidence: float
+    serial_confidence: float
+    geometry_confidence: float
+    serial_overlap_penalty: float
+    context_distance: Optional[float]
+    context_bonus: float
+    suspicious_flags: list[str]
+    candidate_score: float
+    crop_meta: dict[str, Any]
+    debug_meta: dict[str, Any]
+
+
+def _water_candidate_source(item: dict) -> str:
+    provider = str(item.get("provider") or "")
+    variant = str(item.get("variant") or "")
+    if provider.startswith("det-water:template") or "water_template" in variant:
+        return "template"
+    if provider.startswith("det-water-quick"):
+        return "local_quick"
+    if provider.startswith("det-water-cells"):
+        return "cells_det"
+    if provider.startswith("google_vision"):
+        return "google_vision"
+    if provider.startswith("openai-odo-cells"):
+        if "rescue" in variant:
+            return "cells_rescue"
+        return "cells"
+    if "_top_strip_" in variant and variant.startswith("face"):
+        return "face_top_strip"
+    if variant.startswith("counter_row_face") or variant.startswith("face_row_"):
+        return "face_row"
+    if variant.startswith("counter_row_") or variant.startswith("roi_row_") or variant.startswith("cells_row_"):
+        return "odometer_row"
+    if variant.startswith("water_odometer_band_") or variant.startswith("odo_window_") or variant.startswith("circle_odo_"):
+        return "odometer_window"
+    if variant.startswith("odo_full_") or provider.startswith("openai-odo"):
+        return "odometer_fullframe"
+    if variant.endswith("_fullframe") or provider.startswith("openai-water"):
+        return "fullframe"
+    if variant == "water_dial" or variant.startswith("water_dial_"):
+        return "dial"
+    if variant.endswith("_ctxtrim"):
+        return "context_fix"
+    if "layout_fix" in str(item.get("notes") or "") or "_layout_" in variant:
+        return "layout_fix"
+    return "generic"
+
+
+def _water_geometry_confidence(item: dict) -> float:
+    source = _water_candidate_source(item)
+    variant = str(item.get("variant") or "")
+    mapping = {
+        "cells": 0.96,
+        "cells_det": 0.9,
+        "cells_rescue": 0.93,
+        "face_top_strip": 0.94,
+        "face_row": 0.9,
+        "odometer_row": 0.88,
+        "odometer_window": 0.86,
+        "odometer_fullframe": 0.68,
+        "fullframe": 0.52,
+        "dial": 0.42,
+        "template": 0.58,
+        "local_quick": 0.64,
+        "context_fix": 0.54,
+        "layout_fix": 0.5,
+        "google_vision": 0.44,
+        "generic": 0.5,
+    }
+    geom = mapping.get(source, 0.5)
+    if _is_odometer_variant(variant):
+        geom = max(geom, 0.8)
+    return _clamp_confidence(geom)
+
+
+def _water_serial_confidence(item: dict, serial_hints: Optional[list[str]] = None) -> float:
+    serial_norm = _normalize_serial(item.get("serial"))
+    if not serial_norm:
+        return 0.0
+    conf = 0.42
+    if serial_hints:
+        tail_match = _best_serial_tail_match(serial_norm, serial_hints)
+        conf += min(0.5, max(0.0, float(tail_match) * 0.11))
+    if _digits_overlap_serial(item.get("black_digits"), serial_norm):
+        conf -= 0.35
+    return _clamp_confidence(conf)
+
+
+def _water_candidate_suspicious_flags(
+    item: dict,
+    *,
+    context_prev_values: Optional[list[float]] = None,
+    serial_hints: Optional[list[str]] = None,
+) -> list[str]:
+    flags: list[str] = []
+    reading = _normalize_reading(item.get("reading"))
+    serial_norm = _normalize_serial(item.get("serial"))
+    black = _normalize_digits_string(item.get("black_digits"))
+    red = _normalize_digits_string(item.get("red_digits"))
+    variant = str(item.get("variant") or "")
+    notes = str(item.get("notes") or "")
+    if _is_suspicious_water_digits(item):
+        flags.append("suspicious_digits")
+    if _digits_overlap_serial(black, serial_norm):
+        flags.append("serial_overlap")
+    if _looks_like_serial_candidate(reading, serial_norm):
+        flags.append("serial_tail_like")
+    if _is_weak_red_digits(red):
+        flags.append("weak_red_digits")
+    if "_layout_" in variant or "layout_fix" in notes:
+        flags.append("layout_fix")
+    if reading is not None and reading >= 5000.0:
+        flags.append("inflated_reading")
+    if str(item.get("type") or "unknown") == "unknown":
+        flags.append("unknown_type")
+    if context_prev_values and reading is not None:
+        dist = _nearest_prev_distance(reading, context_prev_values)
+        if dist > 140.0:
+            flags.append("context_far")
+    if serial_hints and serial_norm and _best_serial_tail_match(serial_norm, serial_hints) >= 4:
+        flags.append("serial_hint_match")
+    return flags
+
+
+def _water_candidate_serial_overlap_penalty(item: dict, serial_hints: Optional[list[str]] = None) -> float:
+    penalty = 0.0
+    serial_norm = _normalize_serial(item.get("serial"))
+    reading = _normalize_reading(item.get("reading"))
+    black = _normalize_digits_string(item.get("black_digits"))
+    if _digits_overlap_serial(black, serial_norm):
+        penalty += 0.52
+    if _looks_like_serial_candidate(reading, serial_norm):
+        penalty += 0.45
+    if serial_hints and serial_norm and _best_serial_tail_match(serial_norm, serial_hints) == 0:
+        penalty += 0.08
+    return penalty
+
+
+def _water_candidate_context_bonus(
+    item: dict,
+    *,
+    context_prev_values: Optional[list[float]] = None,
+    serial_hints: Optional[list[str]] = None,
+) -> tuple[float, Optional[float]]:
+    reading = _normalize_reading(item.get("reading"))
+    if (not context_prev_values) or reading is None:
+        return 0.0, None
+    dist = _nearest_prev_distance(reading, context_prev_values)
+    bonus = 0.0
+    if dist <= 20.0:
+        bonus += 0.18
+    elif dist <= 50.0:
+        bonus += 0.10
+    elif dist <= 120.0:
+        bonus += 0.03
+    elif dist > 220.0:
+        bonus -= 0.16
+    elif dist > 140.0:
+        bonus -= 0.08
+    serial_norm = _normalize_serial(item.get("serial"))
+    if serial_hints and serial_norm and _best_serial_tail_match(serial_norm, serial_hints) >= 4:
+        bonus += 0.04
+    return bonus, dist
+
+
+def _build_water_candidate_scorecard(
+    item: dict,
+    *,
+    all_items: list[dict],
+    context_prev_values: Optional[list[float]] = None,
+    serial_hints: Optional[list[str]] = None,
+    has_odometer_candidates: bool = False,
+) -> WaterCandidateScorecard:
+    candidate = _hydrate_water_candidate_digits(item)
+    source = _water_candidate_source(candidate)
+    variant = str(candidate.get("variant") or "")
+    provider = str(candidate.get("provider") or "")
+    reading = _normalize_reading(candidate.get("reading"))
+    integer_digits = _normalize_digits_string(candidate.get("black_digits"))
+    decimal_digits = _normalized_red_digits(candidate.get("red_digits"), min_len=2, max_len=OCR_WATER_DECIMALS)
+    odo_conf = 0.0
+    if reading is not None:
+        odo_conf = min(0.98, max(0.18, float(candidate.get("confidence") or 0.0)))
+        if _is_ok_water_digits(candidate):
+            odo_conf = max(odo_conf, 0.74)
+        if _is_strong_water_digits(candidate):
+            odo_conf = max(odo_conf, 0.88)
+        if _is_odometer_variant(variant):
+            odo_conf = min(0.98, odo_conf + 0.05)
+    serial_conf = _water_serial_confidence(candidate, serial_hints=serial_hints)
+    geometry_conf = _water_geometry_confidence(candidate)
+    suspicious_flags = _water_candidate_suspicious_flags(
+        candidate,
+        context_prev_values=context_prev_values,
+        serial_hints=serial_hints,
+    )
+    serial_overlap_penalty = _water_candidate_serial_overlap_penalty(candidate, serial_hints=serial_hints)
+    context_bonus, context_distance = _water_candidate_context_bonus(
+        candidate,
+        context_prev_values=context_prev_values,
+        serial_hints=serial_hints,
+    )
+    score = float(_candidate_score(candidate, all_items))
+    score += 0.10 * odo_conf
+    score += 0.06 * geometry_conf
+    score += 0.04 * serial_conf
+    score += context_bonus
+    score -= serial_overlap_penalty
+    if source == "fullframe" and has_odometer_candidates and not _is_strong_water_digits(candidate):
+        score -= 0.18
+        suspicious_flags.append("fullframe_without_odometer_support")
+    if source == "template" and has_odometer_candidates:
+        score -= 0.08
+    crop_meta = {
+        "variant": variant,
+        "source": source,
+        "odometer_variant": bool(_is_odometer_variant(variant)),
+    }
+    debug_meta = {
+        "provider": provider,
+        "notes": str(candidate.get("notes") or ""),
+        "note2": str(candidate.get("note2") or ""),
+    }
+    return WaterCandidateScorecard(
+        candidate=candidate,
+        source=source,
+        provider=provider,
+        variant=variant,
+        raw_type=str(candidate.get("type") or "unknown"),
+        reading=reading,
+        serial=_normalize_serial(candidate.get("serial")) or None,
+        integer_digits=integer_digits,
+        decimal_digits=decimal_digits,
+        odo_confidence=_clamp_confidence(odo_conf),
+        serial_confidence=_clamp_confidence(serial_conf),
+        geometry_confidence=_clamp_confidence(geometry_conf),
+        serial_overlap_penalty=round(float(serial_overlap_penalty), 4),
+        context_distance=(round(float(context_distance), 3) if context_distance is not None else None),
+        context_bonus=round(float(context_bonus), 4),
+        suspicious_flags=sorted(set(suspicious_flags)),
+        candidate_score=round(float(score), 4),
+        crop_meta=crop_meta,
+        debug_meta=debug_meta,
+    )
+
+
+def _rank_water_candidate_scorecards(
+    pool: list[dict],
+    *,
+    all_items: list[dict],
+    context_prev_values: Optional[list[float]] = None,
+    serial_hints: Optional[list[str]] = None,
+    has_odometer_candidates: bool = False,
+) -> list[WaterCandidateScorecard]:
+    scorecards = [
+        _build_water_candidate_scorecard(
+            item,
+            all_items=all_items,
+            context_prev_values=context_prev_values,
+            serial_hints=serial_hints,
+            has_odometer_candidates=has_odometer_candidates,
+        )
+        for item in pool
+    ]
+    scorecards.sort(
+        key=lambda sc: (
+            float(sc.get("candidate_score") or 0.0),
+            float(sc.get("odo_confidence") or 0.0),
+            float(sc.get("serial_confidence") or 0.0),
+            float(sc.get("geometry_confidence") or 0.0),
+        ),
+        reverse=True,
+    )
+    return scorecards
+
+
+def _water_decision_debug(
+    scorecards: list[WaterCandidateScorecard],
+    *,
+    strict_pool_size: int,
+    strong_pool_size: int,
+    selected_pool_size: int,
+    override_note: str = "",
+) -> dict[str, Any]:
+    winner = scorecards[0] if scorecards else None
+    ranked = []
+    for sc in scorecards[:8]:
+        ranked.append(
+            {
+                "source": sc.get("source"),
+                "variant": sc.get("variant"),
+                "provider": sc.get("provider"),
+                "type": sc.get("raw_type"),
+                "reading": sc.get("reading"),
+                "serial": sc.get("serial"),
+                "integer_digits": sc.get("integer_digits"),
+                "decimal_digits": sc.get("decimal_digits"),
+                "candidate_score": sc.get("candidate_score"),
+                "odo_confidence": sc.get("odo_confidence"),
+                "serial_confidence": sc.get("serial_confidence"),
+                "geometry_confidence": sc.get("geometry_confidence"),
+                "serial_overlap_penalty": sc.get("serial_overlap_penalty"),
+                "context_distance": sc.get("context_distance"),
+                "context_bonus": sc.get("context_bonus"),
+                "suspicious_flags": sc.get("suspicious_flags") or [],
+            }
+        )
+    return {
+        "model": "water_candidate_v2",
+        "pool_size": int(selected_pool_size),
+        "strict_pool_size": int(strict_pool_size),
+        "strong_pool_size": int(strong_pool_size),
+        "winner": (
+            {
+                "source": winner.get("source"),
+                "variant": winner.get("variant"),
+                "provider": winner.get("provider"),
+                "type": winner.get("raw_type"),
+                "reading": winner.get("reading"),
+                "serial": winner.get("serial"),
+                "integer_digits": winner.get("integer_digits"),
+                "decimal_digits": winner.get("decimal_digits"),
+                "candidate_score": winner.get("candidate_score"),
+                "suspicious_flags": winner.get("suspicious_flags") or [],
+            }
+            if winner
+            else None
+        ),
+        "override": override_note or None,
+        "ranked": ranked,
+    }
+
+
+def _is_strong_water_geometry_source(source: str) -> bool:
+    return source in {
+        "cells",
+        "cells_rescue",
+        "face_top_strip",
+        "face_row",
+        "odometer_row",
+        "odometer_window",
+        "odometer_fullframe",
+    }
+
+
 def _is_fast_accept_water_candidate(item: dict) -> bool:
     t = str(item.get("type") or "unknown")
     conf = float(item.get("confidence") or 0.0)
+    source = _water_candidate_source(item)
     if _digits_overlap_serial(item.get("black_digits"), item.get("serial")):
         return False
     if _looks_like_serial_candidate(item.get("reading"), item.get("serial")):
+        return False
+    # Candidate-based water OCR should not let a generic/full-frame pass short-circuit
+    # the drum/strip/cells ranking. Fast accept is reserved only for sources that
+    # already operate on odometer-focused geometry.
+    if not _is_strong_water_geometry_source(source):
         return False
     return bool(
         t in ("ХВС", "ГВС")
@@ -6624,6 +6985,7 @@ async def recognize(
                 and ff_candidate.get("reading") is not None
                 and str(ff_candidate.get("type") or "unknown") in ("ХВС", "ГВС", "unknown")
                 and (not _looks_like_serial_candidate(ff_candidate.get("reading"), ff_candidate.get("serial")))
+                and _is_strong_water_geometry_source(_water_candidate_source(ff_candidate))
             ):
                 fast_accept_water = True
             if fast_accept_water and OCR_WATER_DIGIT_FIRST and ff_serial and odo_variants and (not ff_fast_dial_hit):
@@ -8374,8 +8736,8 @@ async def recognize(
     # Fallback: previous mixed ranking across all candidates.
     has_water_odometer_candidates = len(water_pool) > 0
     strong_water_pool: list[dict] = []
+    strict_pool: list[dict] = []
     if OCR_WATER_DIGIT_FIRST:
-        strict_pool: list[dict] = []
         for c in water_pool:
             if not _is_strict_water_odometer_candidate(c):
                 continue
@@ -8408,7 +8770,19 @@ async def recognize(
             pool = candidates
     else:
         pool = candidates
-    best = max(pool, key=lambda x: _candidate_score(x, pool))
+    use_water_scorecards = bool(has_water_odometer_candidates)
+    water_scorecards = (
+        _rank_water_candidate_scorecards(
+            pool,
+            all_items=candidates,
+            context_prev_values=context_prev_values,
+            serial_hints=context_serial_hints,
+            has_odometer_candidates=has_water_odometer_candidates,
+        )
+        if use_water_scorecards
+        else []
+    )
+    best = dict(water_scorecards[0]["candidate"]) if water_scorecards else max(pool, key=lambda x: _candidate_score(x, pool))
     context_override_note = ""
     if context_prev_values:
         ctx_best = _pick_water_candidate_with_context(
@@ -8417,14 +8791,28 @@ async def recognize(
             serial_hints=context_serial_hints,
         )
         if ctx_best is not None:
+            ctx_scorecard = _build_water_candidate_scorecard(
+                ctx_best,
+                all_items=candidates,
+                context_prev_values=context_prev_values,
+                serial_hints=context_serial_hints,
+                has_odometer_candidates=has_water_odometer_candidates,
+            ) if use_water_scorecards else None
+            best_scorecard = _build_water_candidate_scorecard(
+                best,
+                all_items=candidates,
+                context_prev_values=context_prev_values,
+                serial_hints=context_serial_hints,
+                has_odometer_candidates=has_water_odometer_candidates,
+            ) if use_water_scorecards else None
             best_dist = _nearest_prev_distance(_normalize_reading(best.get("reading")), context_prev_values)
             ctx_dist = _nearest_prev_distance(_normalize_reading(ctx_best.get("reading")), context_prev_values)
             best_tail = _best_serial_tail_match(best.get("serial"), context_serial_hints) if context_serial_hints else 0
             ctx_tail = _best_serial_tail_match(ctx_best.get("serial"), context_serial_hints) if context_serial_hints else 0
-            best_conf = float(best.get("confidence") or 0.0)
-            ctx_conf = float(ctx_best.get("confidence") or 0.0)
-            best_provider = str(best.get("provider") or "")
-            ctx_provider = str(ctx_best.get("provider") or "")
+            best_conf = float((best_scorecard or {}).get("candidate_score") or best.get("confidence") or 0.0)
+            ctx_conf = float((ctx_scorecard or {}).get("candidate_score") or ctx_best.get("confidence") or 0.0)
+            best_provider = str((best_scorecard or {}).get("provider") or best.get("provider") or "")
+            ctx_provider = str((ctx_scorecard or {}).get("provider") or ctx_best.get("provider") or "")
             best_is_explicit_water_fullframe = bool(
                 _normalize_reading(best.get("reading")) is not None
                 and (
@@ -8452,7 +8840,7 @@ async def recognize(
             if should_override and ctx_provider.endswith(":ctxtrim") and (ctx_dist > 25.0):
                 should_override = False
             if should_override:
-                best = ctx_best
+                best = dict(ctx_best)
                 context_override_note = (
                     f"context_override prev={','.join(f'{v:.3f}' for v in context_prev_values[:3])}"
                 )
@@ -8461,10 +8849,28 @@ async def recognize(
         if serial_best is not None:
             base_tail = _best_serial_tail_match(best.get("serial"), context_serial_hints)
             serial_tail = _best_serial_tail_match(serial_best.get("serial"), context_serial_hints)
-            best_score = _candidate_score(best, candidates)
-            serial_score = _candidate_score(serial_best, candidates)
+            best_score = float(
+                _build_water_candidate_scorecard(
+                    best,
+                    all_items=candidates,
+                    context_prev_values=context_prev_values,
+                    serial_hints=context_serial_hints,
+                    has_odometer_candidates=has_water_odometer_candidates,
+                ).get("candidate_score")
+                or 0.0
+            ) if use_water_scorecards else float(_candidate_score(best, candidates))
+            serial_score = float(
+                _build_water_candidate_scorecard(
+                    serial_best,
+                    all_items=candidates,
+                    context_prev_values=context_prev_values,
+                    serial_hints=context_serial_hints,
+                    has_odometer_candidates=has_water_odometer_candidates,
+                ).get("candidate_score")
+                or 0.0
+            ) if use_water_scorecards else float(_candidate_score(serial_best, candidates))
             if serial_tail >= 4 and ((base_tail < 4) or (serial_score + 0.05 >= best_score)):
-                best = serial_best
+                best = dict(serial_best)
                 context_override_note = "serial_hint_override"
 
     # Hard-photo recovery: ask model for several alternative hypotheses from odometer-focused crops.
@@ -8890,20 +9296,63 @@ async def recognize(
         "confidence": conf,
         "notes": notes,
     }
+    water_decision_debug = None
+    if OCR_WATER_DIGIT_FIRST and has_water_odometer_candidates and pool:
+        final_scorecards = _rank_water_candidate_scorecards(
+            pool,
+            all_items=candidates,
+            context_prev_values=context_prev_values,
+            serial_hints=context_serial_hints,
+            has_odometer_candidates=has_water_odometer_candidates,
+        )
+        if final_scorecards:
+            winner_variant = str(best.get("variant") or "")
+            matched = next((sc for sc in final_scorecards if str(sc.get("variant") or "") == winner_variant and _normalize_reading(sc.get("reading")) == _normalize_reading(best.get("reading"))), None)
+            if matched is not None:
+                final_scorecards = [matched] + [sc for sc in final_scorecards if sc is not matched]
+            water_decision_debug = _water_decision_debug(
+                final_scorecards,
+                strict_pool_size=len(strict_pool),
+                strong_pool_size=len(strong_water_pool),
+                selected_pool_size=len(pool),
+                override_note=context_override_note,
+            )
+            out["water_decision"] = water_decision_debug
     if OCR_DEBUG:
-        ranked = sorted(candidates, key=lambda x: _candidate_score(x, candidates), reverse=True)[:20]
-        out["debug"] = [
-            {
-                "provider": str(c.get("provider") or "unknown"),
-                "variant": str(c.get("variant") or "orig"),
-                "type": str(c.get("type") or "unknown"),
-                "reading": c.get("reading"),
-                "confidence": float(c.get("confidence") or 0.0),
-                "black_digits": c.get("black_digits"),
-                "red_digits": c.get("red_digits"),
-            }
-            for c in ranked
-        ]
+        if water_decision_debug and water_decision_debug.get("ranked"):
+            out["debug"] = [
+                {
+                    "provider": str(item.get("provider") or "unknown"),
+                    "variant": str(item.get("variant") or "orig"),
+                    "type": str(item.get("type") or "unknown"),
+                    "reading": item.get("reading"),
+                    "confidence": float(item.get("odo_confidence") or 0.0),
+                    "black_digits": item.get("integer_digits"),
+                    "red_digits": item.get("decimal_digits"),
+                    "candidate_score": item.get("candidate_score"),
+                    "source": item.get("source"),
+                    "serial": item.get("serial"),
+                    "serial_confidence": item.get("serial_confidence"),
+                    "geometry_confidence": item.get("geometry_confidence"),
+                    "context_distance": item.get("context_distance"),
+                    "suspicious_flags": item.get("suspicious_flags") or [],
+                }
+                for item in list(water_decision_debug.get("ranked") or [])[:20]
+            ]
+        else:
+            ranked = sorted(candidates, key=lambda x: _candidate_score(x, candidates), reverse=True)[:20]
+            out["debug"] = [
+                {
+                    "provider": str(c.get("provider") or "unknown"),
+                    "variant": str(c.get("variant") or "orig"),
+                    "type": str(c.get("type") or "unknown"),
+                    "reading": c.get("reading"),
+                    "confidence": float(c.get("confidence") or 0.0),
+                    "black_digits": c.get("black_digits"),
+                    "red_digits": c.get("red_digits"),
+                }
+                for c in ranked
+            ]
         out["timings_ms"] = dict(stage_ms)
         out["openai_calls"] = vision_calls + rescue_vision_calls
     out["trace_id"] = req_trace_id

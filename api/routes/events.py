@@ -1863,6 +1863,20 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         ocr_conf = 0.0
     is_water_unknown = str(ocr_type or "").strip().lower() == "unknown"
     debug_candidates = _debug_candidates_from_ocr(ocr_data if isinstance(ocr_data, dict) else None)
+    if isinstance(ocr_data, dict) and isinstance(ocr_data.get("water_decision"), dict):
+        try:
+            water_decision = dict(ocr_data.get("water_decision") or {})
+            diag["ocr_water_decision"] = {
+                "model": water_decision.get("model"),
+                "pool_size": water_decision.get("pool_size"),
+                "strict_pool_size": water_decision.get("strict_pool_size"),
+                "strong_pool_size": water_decision.get("strong_pool_size"),
+                "override": water_decision.get("override"),
+                "winner": water_decision.get("winner"),
+                "ranked": list(water_decision.get("ranked") or [])[:5],
+            }
+        except Exception as e:
+            diag["warnings"].append({"ocr_water_decision_parse_failed": str(e)})
     is_water_debug = any(_is_odometer_debug_candidate(c) for c in debug_candidates)
     ocr_notes_l = str((ocr_data or {}).get("notes") or "").strip().lower() if isinstance(ocr_data, dict) else ""
     is_water_template_hint = "water_template" in ocr_notes_l or any(
