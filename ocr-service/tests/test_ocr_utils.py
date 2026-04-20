@@ -1,4 +1,5 @@
 from app import (
+    _build_water_detection_context,
     _build_water_candidate_scorecard,
     _build_water_serial_candidate,
     _parse_context_serial_hints,
@@ -614,7 +615,8 @@ def test_rank_water_candidate_scorecards_penalizes_fullframe_vs_odometer():
     assert ranked
     assert ranked[0]["source"] == "face_top_strip"
     assert ranked[0]["reading"] == 991.89
-    assert "fullframe_without_odometer_support" in ranked[1]["suspicious_flags"]
+    assert ranked[1]["source"] == "fullframe"
+    assert ranked[1]["score_breakdown"]["detection_penalty"] > 0
 
 
 def test_build_water_serial_candidate_prefers_serial_match_without_overlap_penalty():
@@ -684,3 +686,97 @@ def test_water_decision_summary_exposes_branch_winners():
     assert summary["serial_branch_winner"]["serial"] == "13002714"
     assert summary["odometer_branch_winner"]["source"] == "face_top_strip"
     assert summary["top_sources"][0]["source"] == "face_top_strip"
+
+
+def test_build_water_detection_context_exposes_preferences():
+    ctx = _build_water_detection_context(
+        water_face_hint=True,
+        water_row_hint=False,
+        skip_electric_bootstrap=True,
+        quick_serial_mode=False,
+        pre_det_row_variants=[],
+        water_variants=[],
+        variants=[("orig", b"x")],
+        odo_variants=[("odo_window_1", b"x")],
+        meter_face_variants=[("face_1", b"x")],
+        face_top_variants=[("face_top_1", b"x")],
+        face_row_variants=[],
+        odometer_variants=[("odometer_focus_1", b"x")],
+        top_variants=[],
+        global_variants=[],
+        row_variants=[],
+        roi_row_variants=[],
+        box_variants=[],
+        circle_row_variants=[],
+        circle_odo_variants=[],
+        blackhat_row_variants=[],
+    )
+    assert ctx["rectified_support"] is True
+    assert ctx["focused_odometer_support"] is True
+    assert "face_top_strip" in ctx["preferred_sources"]
+    assert "odometer_window" in ctx["preferred_sources"]
+    assert "fullframe" in ctx["suppressed_sources"]
+    assert ctx["rectification_strength"] >= 0.8
+
+
+def test_build_water_candidate_scorecard_uses_detection_preferences():
+    det = _build_water_detection_context(
+        water_face_hint=True,
+        water_row_hint=False,
+        skip_electric_bootstrap=True,
+        quick_serial_mode=False,
+        pre_det_row_variants=[],
+        water_variants=[],
+        variants=[("orig", b"x")],
+        odo_variants=[("odo_window_1", b"x")],
+        meter_face_variants=[("face_1", b"x")],
+        face_top_variants=[("face_top_1", b"x")],
+        face_row_variants=[],
+        odometer_variants=[("odometer_focus_1", b"x")],
+        top_variants=[],
+        global_variants=[],
+        row_variants=[],
+        roi_row_variants=[],
+        box_variants=[],
+        circle_row_variants=[],
+        circle_odo_variants=[],
+        blackhat_row_variants=[],
+    )
+    face = _build_water_candidate_scorecard(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.84,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+        all_items=[],
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=True,
+        detection_context=det,
+    )
+    full = _build_water_candidate_scorecard(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-water:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        all_items=[],
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=True,
+        detection_context=det,
+    )
+    assert face["score_breakdown"]["detection_bonus"] > 0
+    assert full["score_breakdown"]["detection_penalty"] > 0

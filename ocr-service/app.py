@@ -3502,6 +3502,9 @@ class WaterDetectionContext(TypedDict, total=False):
     rectified_support: bool
     focused_odometer_support: bool
     row_support: bool
+    preferred_sources: list[str]
+    suppressed_sources: list[str]
+    rectification_strength: float
     variant_counts: dict[str, int]
 
 
@@ -3714,12 +3717,19 @@ def _build_water_candidate_scorecard(
         rectified_support = bool(detection_context.get("rectified_support"))
         focused_odometer_support = bool(detection_context.get("focused_odometer_support"))
         row_support = bool(detection_context.get("row_support"))
+        preferred_sources = {str(v) for v in (detection_context.get("preferred_sources") or []) if v}
+        suppressed_sources = {str(v) for v in (detection_context.get("suppressed_sources") or []) if v}
+        rectification_strength = float(detection_context.get("rectification_strength") or 0.0)
         if source in {"face_top_strip", "face_row"} and rectified_support:
             detection_bonus += 0.06
         elif source in {"odometer_row", "odometer_window", "cells", "cells_rescue"} and focused_odometer_support:
             detection_bonus += 0.05
         elif source in {"dial", "local_quick"} and row_support:
             detection_bonus += 0.02
+        if source in preferred_sources:
+            detection_bonus += 0.04 * max(0.25, rectification_strength)
+        if source in suppressed_sources:
+            detection_penalty += 0.05 * max(0.25, rectification_strength)
         if source in {"fullframe", "generic", "layout_fix"} and rectified_support:
             detection_penalty += 0.10
         elif source == "odometer_fullframe" and focused_odometer_support:
@@ -3769,6 +3779,7 @@ def _build_water_candidate_scorecard(
             "context_bonus": round(float(context_bonus), 4),
             "detection_bonus": round(float(detection_bonus), 4),
             "detection_penalty": round(float(detection_penalty), 4),
+            "rectification_strength": round(float((detection_context or {}).get("rectification_strength") or 0.0), 4),
             "serial_overlap_penalty": round(float(serial_overlap_penalty), 4),
             "fullframe_penalty": round(float(fullframe_penalty), 4),
             "template_penalty": round(float(template_penalty), 4),
@@ -3923,6 +3934,27 @@ def _build_water_detection_context(
     circle_odo_variants: list[tuple[str, bytes]],
     blackhat_row_variants: list[tuple[str, bytes]],
 ) -> WaterDetectionContext:
+    rectified_support = bool(meter_face_variants or face_top_variants or face_row_variants)
+    focused_odometer_support = bool(odometer_variants or circle_odo_variants or box_variants)
+    row_support = bool(row_variants or roi_row_variants or circle_row_variants or blackhat_row_variants)
+    preferred_sources: list[str] = []
+    suppressed_sources: list[str] = []
+    if rectified_support:
+        preferred_sources.extend(["face_top_strip", "face_row"])
+        suppressed_sources.extend(["fullframe", "generic", "layout_fix"])
+    if focused_odometer_support:
+        preferred_sources.extend(["odometer_window", "odometer_row", "cells", "cells_rescue"])
+        if "odometer_fullframe" not in suppressed_sources:
+            suppressed_sources.append("odometer_fullframe")
+    if row_support and not focused_odometer_support:
+        preferred_sources.extend(["dial", "local_quick", "odometer_row"])
+    rectification_strength = 0.0
+    if rectified_support:
+        rectification_strength += 0.6
+    if focused_odometer_support:
+        rectification_strength += 0.3
+    if row_support:
+        rectification_strength += 0.1
     variant_counts = {
         "generic": len(variants),
         "water_dial": len(water_variants),
@@ -3956,9 +3988,12 @@ def _build_water_detection_context(
         "has_circle_rows": bool(circle_row_variants),
         "has_circle_odo": bool(circle_odo_variants),
         "has_blackhat_rows": bool(blackhat_row_variants),
-        "rectified_support": bool(meter_face_variants or face_top_variants or face_row_variants),
-        "focused_odometer_support": bool(odometer_variants or circle_odo_variants or box_variants),
-        "row_support": bool(row_variants or roi_row_variants or circle_row_variants or blackhat_row_variants),
+        "rectified_support": rectified_support,
+        "focused_odometer_support": focused_odometer_support,
+        "row_support": row_support,
+        "preferred_sources": sorted(set(preferred_sources)),
+        "suppressed_sources": sorted(set(suppressed_sources)),
+        "rectification_strength": round(float(min(1.0, rectification_strength)), 3),
         "variant_counts": variant_counts,
     }
 
