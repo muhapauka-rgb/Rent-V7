@@ -2793,6 +2793,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     diag["warnings"].append({"anomaly_saved_with_review": True})
 
             # 6.1) write meter_readings and get assigned_meter_index
+            water_write_blocked = False
+
             if kind == "electric":
                 # By default always auto-sort.
                 # First: if value is very close to an existing one, overwrite that slot.

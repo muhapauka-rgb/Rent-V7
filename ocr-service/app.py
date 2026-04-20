@@ -3484,6 +3484,27 @@ class WaterSerialCandidate(TypedDict, total=False):
     debug_meta: dict[str, Any]
 
 
+class WaterDetectionContext(TypedDict, total=False):
+    water_face_hint: bool
+    water_row_hint: bool
+    skip_electric_bootstrap: bool
+    quick_serial_mode: bool
+    has_meter_faces: bool
+    has_face_top_strips: bool
+    has_face_rows: bool
+    has_odometer_focus: bool
+    has_counter_rows: bool
+    has_roi_rows: bool
+    has_counter_boxes: bool
+    has_circle_rows: bool
+    has_circle_odo: bool
+    has_blackhat_rows: bool
+    rectified_support: bool
+    focused_odometer_support: bool
+    row_support: bool
+    variant_counts: dict[str, int]
+
+
 def _water_candidate_source(item: dict) -> str:
     provider = str(item.get("provider") or "")
     variant = str(item.get("variant") or "")
@@ -3644,6 +3665,7 @@ def _build_water_candidate_scorecard(
     context_prev_values: Optional[list[float]] = None,
     serial_hints: Optional[list[str]] = None,
     has_odometer_candidates: bool = False,
+    detection_context: Optional[WaterDetectionContext] = None,
 ) -> WaterCandidateScorecard:
     candidate = _hydrate_water_candidate_digits(item)
     source = _water_candidate_source(candidate)
@@ -3679,6 +3701,8 @@ def _build_water_candidate_scorecard(
     odo_bonus = 0.10 * odo_conf
     geometry_bonus = 0.06 * geometry_conf
     serial_bonus = 0.04 * serial_conf
+    detection_bonus = 0.0
+    detection_penalty = 0.0
     fullframe_penalty = 0.0
     template_penalty = 0.0
     score += odo_bonus
@@ -3686,6 +3710,22 @@ def _build_water_candidate_scorecard(
     score += serial_bonus
     score += context_bonus
     score -= serial_overlap_penalty
+    if detection_context:
+        rectified_support = bool(detection_context.get("rectified_support"))
+        focused_odometer_support = bool(detection_context.get("focused_odometer_support"))
+        row_support = bool(detection_context.get("row_support"))
+        if source in {"face_top_strip", "face_row"} and rectified_support:
+            detection_bonus += 0.06
+        elif source in {"odometer_row", "odometer_window", "cells", "cells_rescue"} and focused_odometer_support:
+            detection_bonus += 0.05
+        elif source in {"dial", "local_quick"} and row_support:
+            detection_bonus += 0.02
+        if source in {"fullframe", "generic", "layout_fix"} and rectified_support:
+            detection_penalty += 0.10
+        elif source == "odometer_fullframe" and focused_odometer_support:
+            detection_penalty += 0.04
+        score += detection_bonus
+        score -= detection_penalty
     if source == "fullframe" and has_odometer_candidates and not _is_strong_water_digits(candidate):
         fullframe_penalty = 0.18
         score -= fullframe_penalty
@@ -3727,6 +3767,8 @@ def _build_water_candidate_scorecard(
             "geometry_bonus": round(float(geometry_bonus), 4),
             "serial_bonus": round(float(serial_bonus), 4),
             "context_bonus": round(float(context_bonus), 4),
+            "detection_bonus": round(float(detection_bonus), 4),
+            "detection_penalty": round(float(detection_penalty), 4),
             "serial_overlap_penalty": round(float(serial_overlap_penalty), 4),
             "fullframe_penalty": round(float(fullframe_penalty), 4),
             "template_penalty": round(float(template_penalty), 4),
@@ -3743,6 +3785,7 @@ def _rank_water_candidate_scorecards(
     context_prev_values: Optional[list[float]] = None,
     serial_hints: Optional[list[str]] = None,
     has_odometer_candidates: bool = False,
+    detection_context: Optional[WaterDetectionContext] = None,
 ) -> list[WaterCandidateScorecard]:
     scorecards = [
         _build_water_candidate_scorecard(
@@ -3751,6 +3794,7 @@ def _rank_water_candidate_scorecards(
             context_prev_values=context_prev_values,
             serial_hints=serial_hints,
             has_odometer_candidates=has_odometer_candidates,
+            detection_context=detection_context,
         )
         for item in pool
     ]
@@ -3856,6 +3900,69 @@ def _rank_water_serial_candidates(
     return serial_candidates
 
 
+def _build_water_detection_context(
+    *,
+    water_face_hint: bool,
+    water_row_hint: bool,
+    skip_electric_bootstrap: bool,
+    quick_serial_mode: bool,
+    pre_det_row_variants: list[tuple[str, bytes]],
+    water_variants: list[tuple[str, bytes]],
+    variants: list[tuple[str, bytes]],
+    odo_variants: list[tuple[str, bytes]],
+    meter_face_variants: list[tuple[str, bytes]],
+    face_top_variants: list[tuple[str, bytes]],
+    face_row_variants: list[tuple[str, bytes]],
+    odometer_variants: list[tuple[str, bytes]],
+    top_variants: list[tuple[str, bytes]],
+    global_variants: list[tuple[str, bytes]],
+    row_variants: list[tuple[str, bytes]],
+    roi_row_variants: list[tuple[str, bytes]],
+    box_variants: list[tuple[str, bytes]],
+    circle_row_variants: list[tuple[str, bytes]],
+    circle_odo_variants: list[tuple[str, bytes]],
+    blackhat_row_variants: list[tuple[str, bytes]],
+) -> WaterDetectionContext:
+    variant_counts = {
+        "generic": len(variants),
+        "water_dial": len(water_variants),
+        "pre_det_rows": len(pre_det_row_variants),
+        "odo_windows": len(odo_variants),
+        "meter_faces": len(meter_face_variants),
+        "face_top_strips": len(face_top_variants),
+        "face_rows": len(face_row_variants),
+        "odometer_focus": len(odometer_variants),
+        "top_strips": len(top_variants),
+        "global_strips": len(global_variants),
+        "counter_rows": len(row_variants),
+        "roi_rows": len(roi_row_variants),
+        "counter_boxes": len(box_variants),
+        "circle_rows": len(circle_row_variants),
+        "circle_odo": len(circle_odo_variants),
+        "blackhat_rows": len(blackhat_row_variants),
+    }
+    return {
+        "water_face_hint": bool(water_face_hint),
+        "water_row_hint": bool(water_row_hint),
+        "skip_electric_bootstrap": bool(skip_electric_bootstrap),
+        "quick_serial_mode": bool(quick_serial_mode),
+        "has_meter_faces": bool(meter_face_variants),
+        "has_face_top_strips": bool(face_top_variants),
+        "has_face_rows": bool(face_row_variants),
+        "has_odometer_focus": bool(odometer_variants),
+        "has_counter_rows": bool(row_variants),
+        "has_roi_rows": bool(roi_row_variants),
+        "has_counter_boxes": bool(box_variants),
+        "has_circle_rows": bool(circle_row_variants),
+        "has_circle_odo": bool(circle_odo_variants),
+        "has_blackhat_rows": bool(blackhat_row_variants),
+        "rectified_support": bool(meter_face_variants or face_top_variants or face_row_variants),
+        "focused_odometer_support": bool(odometer_variants or circle_odo_variants or box_variants),
+        "row_support": bool(row_variants or roi_row_variants or circle_row_variants or blackhat_row_variants),
+        "variant_counts": variant_counts,
+    }
+
+
 def _build_water_detection_debug(
     *,
     water_face_hint: bool,
@@ -3879,30 +3986,31 @@ def _build_water_detection_debug(
     circle_odo_variants: list[tuple[str, bytes]],
     blackhat_row_variants: list[tuple[str, bytes]],
 ) -> dict[str, Any]:
+    context = _build_water_detection_context(
+        water_face_hint=water_face_hint,
+        water_row_hint=water_row_hint,
+        skip_electric_bootstrap=skip_electric_bootstrap,
+        quick_serial_mode=quick_serial_mode,
+        pre_det_row_variants=pre_det_row_variants,
+        water_variants=water_variants,
+        variants=variants,
+        odo_variants=odo_variants,
+        meter_face_variants=meter_face_variants,
+        face_top_variants=face_top_variants,
+        face_row_variants=face_row_variants,
+        odometer_variants=odometer_variants,
+        top_variants=top_variants,
+        global_variants=global_variants,
+        row_variants=row_variants,
+        roi_row_variants=roi_row_variants,
+        box_variants=box_variants,
+        circle_row_variants=circle_row_variants,
+        circle_odo_variants=circle_odo_variants,
+        blackhat_row_variants=blackhat_row_variants,
+    )
     return {
-        "layer": "practical_detection_v1",
-        "water_face_hint": bool(water_face_hint),
-        "water_row_hint": bool(water_row_hint),
-        "skip_electric_bootstrap": bool(skip_electric_bootstrap),
-        "quick_serial_mode": bool(quick_serial_mode),
-        "variant_counts": {
-            "generic": len(variants),
-            "water_dial": len(water_variants),
-            "pre_det_rows": len(pre_det_row_variants),
-            "odo_windows": len(odo_variants),
-            "meter_faces": len(meter_face_variants),
-            "face_top_strips": len(face_top_variants),
-            "face_rows": len(face_row_variants),
-            "odometer_focus": len(odometer_variants),
-            "top_strips": len(top_variants),
-            "global_strips": len(global_variants),
-            "counter_rows": len(row_variants),
-            "roi_rows": len(roi_row_variants),
-            "counter_boxes": len(box_variants),
-            "circle_rows": len(circle_row_variants),
-            "circle_odo": len(circle_odo_variants),
-            "blackhat_rows": len(blackhat_row_variants),
-        },
+        "layer": "practical_detection_v2",
+        **context,
     }
 
 
@@ -9544,6 +9652,28 @@ async def recognize(
     }
     water_decision_debug = None
     if use_water_scorecards and pool:
+        detection_context = _build_water_detection_context(
+            water_face_hint=water_face_hint,
+            water_row_hint=water_row_hint,
+            skip_electric_bootstrap=bool(skip_electric_bootstrap),
+            quick_serial_mode=bool(quick_serial_mode),
+            pre_det_row_variants=pre_det_row_variants,
+            water_variants=water_variants,
+            variants=variants,
+            odo_variants=odo_variants,
+            meter_face_variants=meter_face_variants,
+            face_top_variants=face_top_variants,
+            face_row_variants=face_row_variants,
+            odometer_variants=odometer_variants,
+            top_variants=top_variants,
+            global_variants=global_variants,
+            row_variants=row_variants,
+            roi_row_variants=roi_row_variants,
+            box_variants=box_variants,
+            circle_row_variants=circle_row_variants,
+            circle_odo_variants=circle_odo_variants,
+            blackhat_row_variants=blackhat_row_variants,
+        )
         detection_debug = _build_water_detection_debug(
             water_face_hint=water_face_hint,
             water_row_hint=water_row_hint,
@@ -9572,6 +9702,7 @@ async def recognize(
             context_prev_values=context_prev_values,
             serial_hints=context_serial_hints,
             has_odometer_candidates=has_water_odometer_candidates,
+            detection_context=detection_context,
         )
         if final_scorecards:
             if template_override_note:
@@ -9593,6 +9724,34 @@ async def recognize(
                 detection_debug=detection_debug,
             )
             out["water_decision"] = water_decision_debug
+            winner_debug = water_decision_debug.get("winner") if isinstance(water_decision_debug, dict) else None
+            winner_reading = _normalize_reading((winner_debug or {}).get("reading"))
+            out_reading = _normalize_reading(out.get("reading"))
+            if winner_reading is not None and (
+                out_reading is None
+                or abs(float(winner_reading) - float(out_reading)) > 0.01
+            ):
+                winner_type = _sanitize_type((winner_debug or {}).get("type", "unknown"))
+                winner_serial = (str((winner_debug or {}).get("serial") or "").strip() or None)
+                out["reading"] = winner_reading
+                if winner_type in ("ХВС", "ГВС", "unknown"):
+                    out["type"] = winner_type
+                if winner_serial:
+                    out["serial"] = winner_serial
+                winner_conf = _clamp_confidence(
+                    float(
+                        (winner_debug or {}).get("odo_confidence")
+                        or (winner_debug or {}).get("candidate_score")
+                        or out.get("confidence")
+                        or 0.0
+                    )
+                )
+                if winner_conf > 0.0:
+                    out["confidence"] = max(float(out.get("confidence") or 0.0), winner_conf)
+                sync_note = f"winner_sync={str((winner_debug or {}).get('source') or 'water_candidate')}"
+                notes_now = str(out.get("notes") or "").strip()
+                if sync_note not in notes_now:
+                    out["notes"] = f"{notes_now}; {sync_note}".strip("; ").strip()
     if OCR_DEBUG:
         if water_decision_debug and water_decision_debug.get("ranked"):
             out["debug"] = [
@@ -9880,6 +10039,36 @@ async def recognize(
                     },
                 )
                 out["debug"] = dbg[:20]
+
+    if water_decision_debug and isinstance(water_decision_debug.get("winner"), dict):
+        winner_debug = water_decision_debug.get("winner") or {}
+        winner_reading = _normalize_reading(winner_debug.get("reading"))
+        out_reading = _normalize_reading(out.get("reading"))
+        if winner_reading is not None and (
+            out_reading is None
+            or abs(float(winner_reading) - float(out_reading)) > 0.01
+        ):
+            winner_type = _sanitize_type(winner_debug.get("type", "unknown"))
+            winner_serial = (str(winner_debug.get("serial") or "").strip() or None)
+            out["reading"] = winner_reading
+            if winner_type in ("ХВС", "ГВС", "unknown"):
+                out["type"] = winner_type
+            if winner_serial:
+                out["serial"] = winner_serial
+            winner_conf = _clamp_confidence(
+                float(
+                    winner_debug.get("odo_confidence")
+                    or winner_debug.get("candidate_score")
+                    or out.get("confidence")
+                    or 0.0
+                )
+            )
+            if winner_conf > 0.0:
+                out["confidence"] = max(float(out.get("confidence") or 0.0), winner_conf)
+            base_notes = str(out.get("notes") or "").strip()
+            sync_note = f"winner_sync={str(winner_debug.get('source') or 'water_candidate')}"
+            if sync_note not in base_notes:
+                out["notes"] = f"{base_notes}; {sync_note}".strip("; ").strip()
 
     _mark_stage("finalize")
     if OCR_DEBUG:
