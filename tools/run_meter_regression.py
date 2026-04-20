@@ -16,6 +16,9 @@ CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
             "reading": 991.89,
             "serial": "13 002714",
             "winner_source": "face_top_strip",
+            "winner_serial": "13002714",
+            "serial_branch_serial": "13002714",
+            "odometer_branch_source": "face_top_strip",
         },
         "api": {
             "meter_kind": "cold",
@@ -23,6 +26,10 @@ CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
             "ocr_reading": 991.89,
             "ocr_serial": "13 002714",
             "winner_source": "face_top_strip",
+            "winner_serial": "13002714",
+            "serial_branch_serial": "13002714",
+            "odometer_branch_source": "face_top_strip",
+            "meter_written": True,
         },
     },
     "4.jpeg": {
@@ -31,6 +38,9 @@ CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
             "reading": 877.00,
             "serial": "13076128",
             "winner_source": "template",
+            "winner_serial": "13076128",
+            "serial_branch_serial": "13076128",
+            "odometer_branch_source": None,
         },
         "api": {
             "meter_kind": "hot",
@@ -38,6 +48,10 @@ CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
             "ocr_reading": 877.00,
             "ocr_serial": "13076128",
             "winner_source": "template",
+            "winner_serial": "13076128",
+            "serial_branch_serial": "13076128",
+            "odometer_branch_source": None,
+            "meter_written": True,
         },
     },
     "31.jpg": {
@@ -48,8 +62,10 @@ CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "api": {
             "meter_kind": "electric",
+            "meter_type_label": "Электро T1",
             "ocr_reading": 4737.21,
             "ocr_serial": "25564336",
+            "meter_written": True,
         },
     },
     "32.jpg": {
@@ -60,8 +76,10 @@ CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
         },
         "api": {
             "meter_kind": "electric",
+            "meter_type_label": "Электро T3",
             "ocr_reading": 5680.55,
             "ocr_serial": "25564336",
+            "meter_written": True,
         },
     },
 }
@@ -93,6 +111,10 @@ def _ocr_row(endpoint: str, path: Path, timeout_sec: float) -> Dict[str, Any]:
     payload = resp.json()
     water_decision = payload.get("water_decision") or {}
     winner = water_decision.get("winner") or {}
+    serial_branch = water_decision.get("serial_branch") or {}
+    serial_branch_winner = serial_branch.get("winner") or {}
+    odometer_branch = water_decision.get("odometer_branch") or {}
+    odometer_branch_winner = odometer_branch.get("winner") or {}
     return {
         "mode": "ocr",
         "file": path.name,
@@ -101,6 +123,9 @@ def _ocr_row(endpoint: str, path: Path, timeout_sec: float) -> Dict[str, Any]:
         "serial": payload.get("serial"),
         "openai_calls": payload.get("openai_calls"),
         "winner_source": winner.get("source"),
+        "winner_serial": winner.get("serial"),
+        "serial_branch_serial": serial_branch_winner.get("serial"),
+        "odometer_branch_source": odometer_branch_winner.get("source"),
         "winner_score": winner.get("candidate_score"),
         "top_candidates": _top_candidates(water_decision),
         "notes": payload.get("notes"),
@@ -120,6 +145,10 @@ def _api_row(endpoint: str, path: Path, timeout_sec: float, chat_id: str, ym: st
     diag = payload.get("diag") or {}
     water_decision = diag.get("ocr_water_decision") or {}
     winner = water_decision.get("winner") or {}
+    serial_branch = water_decision.get("serial_branch") or {}
+    serial_branch_winner = serial_branch.get("winner") or {}
+    odometer_branch = water_decision.get("odometer_branch") or {}
+    odometer_branch_winner = odometer_branch.get("winner") or {}
     ocr = payload.get("ocr") or {}
     return {
         "mode": "api",
@@ -133,6 +162,9 @@ def _api_row(endpoint: str, path: Path, timeout_sec: float, chat_id: str, ym: st
         "ocr_reading": ocr.get("reading"),
         "ocr_serial": ocr.get("serial"),
         "winner_source": winner.get("source"),
+        "winner_serial": winner.get("serial"),
+        "serial_branch_serial": serial_branch_winner.get("serial"),
+        "odometer_branch_source": odometer_branch_winner.get("source"),
         "winner_score": winner.get("candidate_score"),
         "top_candidates": _top_candidates(water_decision),
         "review_gate": water_decision.get("review_gate"),

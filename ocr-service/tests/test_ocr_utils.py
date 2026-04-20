@@ -1,4 +1,6 @@
 from app import (
+    _build_water_candidate_scorecard,
+    _build_water_serial_candidate,
     _parse_context_serial_hints,
     _serial_hint_tails,
     _pick_water_candidate_by_serial,
@@ -28,6 +30,8 @@ from app import (
     _pick_red_digits_by_vote,
     _has_red_disagreement_for_integer,
     _water_suspicious_layout_fixes,
+    _water_decision_summary,
+    _rank_water_candidate_scorecards,
 )
 
 
@@ -572,3 +576,111 @@ def test_has_red_disagreement_for_integer():
         {"reading": 999.243, "red_digits": "243", "confidence": 0.95, "type": "unknown"},
     ]
     assert _has_red_disagreement_for_integer(cands, 999) is True
+
+
+def test_rank_water_candidate_scorecards_penalizes_fullframe_vs_odometer():
+    candidates = [
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-water:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.84,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+    ]
+    ranked = _rank_water_candidate_scorecards(
+        candidates,
+        all_items=candidates,
+        context_prev_values=[987.79, 881.10],
+        serial_hints=["13002714", "13076128"],
+        has_odometer_candidates=True,
+        detection_context={"rectified_support": True, "focused_odometer_support": True},
+    )
+    assert ranked
+    assert ranked[0]["source"] == "face_top_strip"
+    assert ranked[0]["reading"] == 991.89
+    assert "fullframe_without_odometer_support" in ranked[1]["suspicious_flags"]
+
+
+def test_build_water_serial_candidate_prefers_serial_match_without_overlap_penalty():
+    item = {
+        "type": "unknown",
+        "reading": 877.0,
+        "serial": "13 076128",
+        "confidence": 0.96,
+        "black_digits": None,
+        "red_digits": None,
+        "provider": "det-water:template",
+        "variant": "water_template",
+        "notes": "",
+    }
+    sc = _build_water_serial_candidate(item, serial_hints=["13002714", "13076128"])
+    assert sc is not None
+    assert sc["serial"] == "13076128"
+    assert sc["tail_match"] >= 5
+    assert sc["candidate_score"] > 0.7
+    assert "reading_looks_like_serial" not in sc["suspicious_flags"]
+
+
+def test_water_decision_summary_exposes_branch_winners():
+    winner = _build_water_candidate_scorecard(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.88,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+        all_items=[],
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=True,
+        detection_context={"rectified_support": True, "focused_odometer_support": True},
+    )
+    serial_winner = _build_water_serial_candidate(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.88,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+        serial_hints=["13002714"],
+    )
+    summary = _water_decision_summary(
+        winner=winner,
+        serial_winner=serial_winner,
+        odometer_winner=winner,
+        override_reason=None,
+        context_override_applied=False,
+        serial_tail_like=False,
+        ranked_scorecards=[winner],
+    )
+    assert summary["winner"]["source"] == "face_top_strip"
+    assert summary["winner"]["serial"] == "13002714"
+    assert summary["serial_branch_winner"]["serial"] == "13002714"
+    assert summary["odometer_branch_winner"]["source"] == "face_top_strip"
+    assert summary["top_sources"][0]["source"] == "face_top_strip"
