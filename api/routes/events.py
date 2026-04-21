@@ -22,6 +22,7 @@ from core.billing import (
     month_now,
     is_ym,
     _calc_month_bill,
+    _get_apartment_electric_expected,
     _get_month_bill_state,
     _set_month_bill_state,
     _same_total,
@@ -1474,6 +1475,64 @@ def _summarize_water_decision_for_diag(water_decision: dict[str, Any]) -> dict[s
     )
 
 
+def _get_electric_month_snapshot(conn, apartment_id: int, ym: str) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT meter_index, value, source, ocr_value
+            FROM meter_readings
+            WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index IN (1,2,3)
+            ORDER BY meter_index
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym)},
+    ).fetchall()
+    out: list[dict[str, Any]] = []
+    for meter_index, value, source, ocr_value in (rows or []):
+        item: dict[str, Any] = {
+            "meter_index": int(meter_index),
+            "source": str(source or ""),
+        }
+        if value is not None:
+            item["value"] = float(value)
+        if ocr_value is not None:
+            item["ocr_value"] = float(ocr_value)
+        out.append(item)
+    return out
+
+
+def _set_electric_assignment_debug(
+    diag: dict[str, Any],
+    *,
+    apartment_id: int,
+    ym: str,
+    expected: Optional[int],
+    incoming_value: Optional[float],
+    mode: Optional[str],
+    close_idx: Optional[int],
+    meter_index_mode: Optional[str],
+    requested_meter_index: Optional[int],
+    assigned_meter_index: Optional[int],
+    rows_before: list[dict[str, Any]],
+    rows_after: list[dict[str, Any]],
+) -> None:
+    diag["electric_assignment"] = jsonable_encoder(
+        {
+            "apartment_id": int(apartment_id),
+            "ym": str(ym),
+            "expected": (int(expected) if expected is not None else None),
+            "incoming_value": (float(incoming_value) if incoming_value is not None else None),
+            "mode": (str(mode) if mode else None),
+            "close_idx": (int(close_idx) if close_idx is not None else None),
+            "meter_index_mode": (str(meter_index_mode) if meter_index_mode is not None else None),
+            "requested_meter_index": (int(requested_meter_index) if requested_meter_index is not None else None),
+            "assigned_meter_index": (int(assigned_meter_index) if assigned_meter_index is not None else None),
+            "rows_before": rows_before,
+            "rows_after": rows_after,
+        }
+    )
+
+
 def _set_api_review_trace(
     diag: dict[str, Any],
     *,
@@ -1522,6 +1581,22 @@ def _set_api_review_trace(
             suspicious_flags=(winner or {}).get("suspicious_flags"),
             override=water_decision.get("override"),
             serial_tail_like=water_decision.get("serial_tail_like"),
+        )
+
+    electric_assignment = diag.get("electric_assignment") if isinstance(diag.get("electric_assignment"), dict) else None
+    if electric_assignment:
+        _append(
+            "electric_assignment",
+            "electric_assignment",
+            expected=electric_assignment.get("expected"),
+            incoming_value=electric_assignment.get("incoming_value"),
+            mode=electric_assignment.get("mode"),
+            close_idx=electric_assignment.get("close_idx"),
+            meter_index_mode=electric_assignment.get("meter_index_mode"),
+            requested_meter_index=electric_assignment.get("requested_meter_index"),
+            assigned_meter_index=electric_assignment.get("assigned_meter_index"),
+            rows_before=electric_assignment.get("rows_before"),
+            rows_after=electric_assignment.get("rows_after"),
         )
 
     _append(
@@ -2794,6 +2869,11 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
             # 6.1) write meter_readings and get assigned_meter_index
             water_write_blocked = False
+            electric_expected = None
+            electric_assignment_mode = None
+            electric_close_idx = None
+            electric_rows_before: list[dict[str, Any]] = []
+            electric_rows_after: list[dict[str, Any]] = []
 
             if kind == "electric":
                 # By default always auto-sort.
@@ -2802,6 +2882,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 prev_manual = None
                 prev_manual_value = None
                 with engine.begin() as conn:
+                    electric_expected = _get_apartment_electric_expected(conn, int(apartment_id))
+                    electric_rows_before = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
                     rows = conn.execute(
                         text(
                             """
@@ -2851,6 +2933,9 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 source="ocr",
                             )
                             assigned_meter_index = int(close_idx)
+                            electric_close_idx = int(close_idx)
+                            electric_assignment_mode = "retake_overwrite"
+                            electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
                             diag["warnings"].append({"retake_overwrite": {"meter_type": "electric", "meter_index": int(close_idx)}})
 
                 if close_idx is None:
@@ -2880,6 +2965,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                 int(meter_index),
                                 float(value_float),
                             )
+                            electric_assignment_mode = "explicit_write"
+                            electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
                     else:
                         with engine.begin() as conn:
                             # find closest existing manual value for potential overwrite notice
@@ -2911,6 +2998,24 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             ym,
                             float(value_float),
                         )
+                        electric_assignment_mode = "auto_sorted_write"
+                        with engine.begin() as conn:
+                            electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
+
+                _set_electric_assignment_debug(
+                    diag,
+                    apartment_id=int(apartment_id),
+                    ym=str(ym),
+                    expected=(int(electric_expected) if electric_expected is not None else None),
+                    incoming_value=(float(value_float) if value_float is not None else None),
+                    mode=electric_assignment_mode,
+                    close_idx=electric_close_idx,
+                    meter_index_mode=meter_index_mode,
+                    requested_meter_index=(int(raw_meter_index) if raw_meter_index is not None else None),
+                    assigned_meter_index=int(assigned_meter_index),
+                    rows_before=electric_rows_before,
+                    rows_after=electric_rows_after,
+                )
 
             else:
                 # water (cold/hot): always meter_index=1
