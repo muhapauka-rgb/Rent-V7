@@ -140,6 +140,29 @@ def _queue_progress_message(chat_id: int, text: str) -> None:
     _track_background_task(asyncio.create_task(_safe_progress_message(chat_id, text)))
 
 
+def _start_delayed_progress_message(chat_id: int, text: str, *, delay_sec: float) -> Optional[asyncio.Task]:
+    if delay_sec <= 0:
+        return None
+
+    async def _runner() -> None:
+        try:
+            await asyncio.sleep(delay_sec)
+            await _safe_progress_message(chat_id, text)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logging.exception("delayed_progress_message failed: chat_id=%s", chat_id)
+
+    task = asyncio.create_task(_runner())
+    _track_background_task(task)
+    return task
+
+
+def _cancel_background_task(task: Optional[asyncio.Task]) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+
+
 # -------------------------
 # DEBUG middleware: prints every incoming update (message/callback)
 # (IMPORTANT: only one middleware, no duplicates)
@@ -194,6 +217,7 @@ SEQUENTIAL_PHOTO_ACKED: set[int] = set()
 SEQUENTIAL_PHOTO_COLLECT_SEC = float(os.getenv("SEQUENTIAL_PHOTO_COLLECT_SEC", "0.6"))
 SEQUENTIAL_PHOTO_MAX_BATCH = max(1, int(os.getenv("SEQUENTIAL_PHOTO_MAX_BATCH", "4")))
 BACKGROUND_FILE_TASKS: set[asyncio.Task] = set()
+LONG_PROCESS_NOTICE_SEC = float(os.getenv("LONG_PROCESS_NOTICE_SEC", "18"))
 
 # Manual entry flow
 MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step, meter_type, meter_index}
@@ -951,6 +975,7 @@ async def _handle_file_message(
     mime_type: Optional[str] = None,
     file_payloads: Optional[List[Tuple[bytes, str, str]]] = None,
     response_prefix: str = "",
+    allow_long_progress: bool = True,
 ):
     username = message.from_user.username if message.from_user else None
     phone = CHAT_PHONES.get(message.chat.id)  # берём телефон, который пользователь отправил кнопкой
@@ -977,6 +1002,14 @@ async def _handle_file_message(
     except Exception:
         meter_index = 1
 
+    delayed_notice_task: Optional[asyncio.Task] = None
+    if allow_long_progress:
+        delayed_notice_task = _start_delayed_progress_message(
+            message.chat.id,
+            f"{response_prefix}Распознавание еще идет. Как только закончим, сразу пришлю результат.",
+            delay_sec=float(LONG_PROCESS_NOTICE_SEC),
+        )
+
     try:
         r = await _post_photo_event(
             chat_id=message.chat.id,
@@ -990,19 +1023,22 @@ async def _handle_file_message(
     except requests.exceptions.ReadTimeout:
         await message.reply(
             f"{response_prefix}Фото получено, но backend долго обрабатывает запрос (возможно загрузка на диск).\n"
-            "Попробуйте отправить ещё раз через минуту.",
+            "Если итоговый ответ не придёт в течение пары минут, отправьте фото ещё раз.",
             reply_markup=_kb_main(),
         )
+        _cancel_background_task(delayed_notice_task)
         return
     except Exception:
         await message.reply(
             f"{response_prefix}Фото получено, но backend сейчас недоступен. Попробуйте ещё раз позже.",
             reply_markup=_kb_main(),
         )
+        _cancel_background_task(delayed_notice_task)
         return
 
     if not r.get("ok"):
         await message.reply(f"{response_prefix}Ошибка отправки в backend: HTTP {r.get('status_code')}", reply_markup=_kb_main())
+        _cancel_background_task(delayed_notice_task)
         return
 
     js = r.get("json") or {}
@@ -1052,6 +1088,7 @@ async def _handle_file_message(
         )
         MANUAL_CTX[message.chat.id] = {"ym": ym, "step": "idle"}
         logging.info(f"MANUAL_CTX set for chat_id={message.chat.id} ym={ym!r} step='idle'")
+        _cancel_background_task(delayed_notice_task)
         return
 
     if (meter_written is False) and (ocr_reading is not None):
@@ -1071,6 +1108,7 @@ async def _handle_file_message(
             f"{serial_line}{conf_line}{reason_line}"
         )
         await message.reply(msg, reply_markup=_kb_main())
+        _cancel_background_task(delayed_notice_task)
         return
 
     shown_reading = ocr_reading
@@ -1116,6 +1154,7 @@ async def _handle_file_message(
             if missing:
                 await message.reply(f"{response_prefix}Сейчас не хватает: " + _missing_to_text(missing), reply_markup=_kb_main())
                 _schedule_missing_reminder(message.chat.id, ym)
+        _cancel_background_task(delayed_notice_task)
         return
 
     bill = js.get("bill")
@@ -1127,9 +1166,11 @@ async def _handle_file_message(
         else:
             if bill.get("reason") == "missing_photos":
                 _schedule_missing_reminder(message.chat.id, ym)
+    _cancel_background_task(delayed_notice_task)
 
 
 async def _flush_media_group(key: Tuple[int, str]) -> None:
+    batch_notice_task: Optional[asyncio.Task] = None
     try:
         started_at = time.monotonic()
         while True:
@@ -1166,6 +1207,11 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
         items = sorted(items, key=lambda x: x[0])
         payloads_only = [(payload, filename, mime) for _mid, payload, filename, mime in items]
         if len(items) > 1:
+            batch_notice_task = _start_delayed_progress_message(
+                key[0],
+                "Распознавание еще идет. Пришлю результат по каждому фото отдельно.",
+                delay_sec=float(LONG_PROCESS_NOTICE_SEC),
+            )
             logging.info(
                 "TG media_group process individually: chat_id=%s media_group_id=%s items=%s",
                 key[0],
@@ -1178,6 +1224,7 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
                         anchor,
                         file_payloads=[item],
                         response_prefix=f"Фото {idx}/{len(payloads_only)}.\n",
+                        allow_long_progress=False,
                     )
                 except Exception:
                     logging.exception(
@@ -1192,6 +1239,7 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
     except Exception:
         logging.exception("media_group_flush failed")
     finally:
+        _cancel_background_task(batch_notice_task)
         MEDIA_GROUP_TASKS.pop(key, None)
         MEDIA_GROUP_PENDING.pop(key, None)
         MEDIA_GROUP_LAST_ACTIVITY.pop(key, None)
@@ -1199,6 +1247,7 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
 
 
 async def _flush_sequential_photos(chat_id: int) -> None:
+    batch_notice_task: Optional[asyncio.Task] = None
     try:
         await asyncio.sleep(max(0.5, float(SEQUENTIAL_PHOTO_COLLECT_SEC)))
         items = SEQUENTIAL_PHOTO_BUFFER.pop(chat_id, [])
@@ -1212,17 +1261,24 @@ async def _flush_sequential_photos(chat_id: int) -> None:
             len(batch),
         )
         if len(batch) > 1:
+            batch_notice_task = _start_delayed_progress_message(
+                chat_id,
+                "Распознавание еще идет. Пришлю результат по каждому фото отдельно.",
+                delay_sec=float(LONG_PROCESS_NOTICE_SEC),
+            )
             for idx, item in enumerate(batch, start=1):
                 await _handle_file_message(
                     anchor,
                     file_payloads=[item],
                     response_prefix=f"Фото {idx}/{len(batch)}.\n",
+                    allow_long_progress=False,
                 )
         else:
             await _handle_file_message(anchor, file_payloads=batch)
     except Exception:
         logging.exception("sequential_photo_flush failed")
     finally:
+        _cancel_background_task(batch_notice_task)
         SEQUENTIAL_PHOTO_TASKS.pop(chat_id, None)
         SEQUENTIAL_PHOTO_ACKED.discard(chat_id)
 
@@ -1377,7 +1433,7 @@ async def on_photo(message: types.Message):
             MEDIA_GROUP_ACKED.add(key)
             _queue_progress_message(
                 message.chat.id,
-                "Фото получены. Обрабатываем, это может занять до нескольких минут.",
+                "Фото получены. Обрабатываем, это может занять до нескольких минут. Результат пришлю по каждому фото отдельно.",
             )
         MEDIA_GROUP_PENDING[key] = int(MEDIA_GROUP_PENDING.get(key, 0) or 0) + 1
         MEDIA_GROUP_LAST_ACTIVITY[key] = time.monotonic()
