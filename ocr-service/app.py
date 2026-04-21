@@ -3508,6 +3508,21 @@ class WaterDetectionContext(TypedDict, total=False):
     variant_counts: dict[str, int]
 
 
+WATER_ODOMETER_SOURCES = {
+    "face_top_strip",
+    "face_row",
+    "odometer_row",
+    "odometer_window",
+    "odometer_fullframe",
+    "cells",
+    "cells_rescue",
+    "dial",
+    "local_quick",
+    "context_fix",
+    "layout_fix",
+}
+
+
 def _water_candidate_source(item: dict) -> str:
     provider = str(item.get("provider") or "")
     variant = str(item.get("variant") or "")
@@ -3569,6 +3584,35 @@ def _water_geometry_confidence(item: dict) -> float:
     if _is_odometer_variant(variant):
         geom = max(geom, 0.8)
     return _clamp_confidence(geom)
+
+
+def _is_water_serial_candidate_item(item: dict) -> bool:
+    return bool(_normalize_serial(item.get("serial")))
+
+
+def _is_water_odometer_candidate_item(item: dict) -> bool:
+    source = _water_candidate_source(item)
+    if source in WATER_ODOMETER_SOURCES:
+        return True
+    if _is_odometer_variant(str(item.get("variant") or "")):
+        return True
+    return False
+
+
+def _build_water_branch_pools(
+    pool: list[dict],
+    *,
+    all_water_candidates: Optional[list[dict]] = None,
+) -> tuple[list[dict], list[dict]]:
+    serial_source_pool = list(all_water_candidates or pool)
+    serial_pool = [item for item in serial_source_pool if _is_water_serial_candidate_item(item)]
+    if not serial_pool:
+        serial_pool = serial_source_pool
+
+    odometer_pool = [item for item in pool if _is_water_odometer_candidate_item(item)]
+    if not odometer_pool:
+        odometer_pool = list(pool)
+    return serial_pool, odometer_pool
 
 
 def _water_serial_confidence(item: dict, serial_hints: Optional[list[str]] = None) -> float:
@@ -4120,6 +4164,8 @@ def _water_decision_debug(
     strict_pool_size: int,
     strong_pool_size: int,
     selected_pool_size: int,
+    serial_pool_size: int = 0,
+    odometer_pool_size: int = 0,
     override_note: str = "",
     serial_branch: Optional[list[WaterSerialCandidate]] = None,
     detection_debug: Optional[dict[str, Any]] = None,
@@ -4158,6 +4204,8 @@ def _water_decision_debug(
         "pool_size": int(selected_pool_size),
         "strict_pool_size": int(strict_pool_size),
         "strong_pool_size": int(strong_pool_size),
+        "serial_pool_size": int(serial_pool_size),
+        "odometer_pool_size": int(odometer_pool_size),
         "summary": _water_decision_summary(
             winner,
             serial_candidate=serial_candidate if serial_candidate and float(serial_candidate.get("serial_confidence") or 0.0) > 0.0 else None,
@@ -9138,9 +9186,16 @@ async def recognize(
             pool = candidates
     else:
         pool = water_candidates if has_water_candidates else candidates
+    water_serial_pool: list[dict] = []
+    water_odometer_pool: list[dict] = []
+    if has_water_candidates:
+        water_serial_pool, water_odometer_pool = _build_water_branch_pools(
+            pool,
+            all_water_candidates=water_candidates or candidates,
+        )
     water_serial_branch = (
         _rank_water_serial_candidates(
-            water_candidates or candidates,
+            water_serial_pool,
             serial_hints=context_serial_hints,
         )
         if has_water_candidates
@@ -9152,9 +9207,10 @@ async def recognize(
         else ""
     )
     use_water_scorecards = bool(has_water_candidates)
+    water_scorecard_pool = water_odometer_pool if water_odometer_pool else pool
     water_scorecards = (
         _rank_water_candidate_scorecards(
-            pool,
+            water_scorecard_pool,
             all_items=candidates,
             context_prev_values=context_prev_values,
             serial_hints=context_serial_hints,
@@ -9167,7 +9223,7 @@ async def recognize(
     if water_scorecards:
         water_scorecards, template_override_note = _maybe_promote_template_water_scorecard(
             water_scorecards,
-            has_odometer_candidates=has_water_odometer_candidates,
+            has_odometer_candidates=bool(water_odometer_pool),
         )
     best = dict(water_scorecards[0]["candidate"]) if water_scorecards else max(pool, key=lambda x: _candidate_score(x, pool))
     context_override_note = ""
@@ -9732,7 +9788,7 @@ async def recognize(
             blackhat_row_variants=blackhat_row_variants,
         )
         final_scorecards = _rank_water_candidate_scorecards(
-            pool,
+            water_scorecard_pool,
             all_items=candidates,
             context_prev_values=context_prev_values,
             serial_hints=context_serial_hints,
@@ -9754,6 +9810,8 @@ async def recognize(
                 strict_pool_size=len(strict_pool),
                 strong_pool_size=len(strong_water_pool),
                 selected_pool_size=len(pool),
+                serial_pool_size=len(water_serial_pool),
+                odometer_pool_size=len(water_odometer_pool),
                 override_note=context_override_note,
                 serial_branch=water_serial_branch,
                 detection_debug=detection_debug,

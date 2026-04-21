@@ -1,4 +1,5 @@
 from app import (
+    _build_water_branch_pools,
     _build_water_detection_context,
     _build_water_candidate_scorecard,
     _build_water_serial_candidate,
@@ -639,6 +640,57 @@ def test_build_water_serial_candidate_prefers_serial_match_without_overlap_penal
     assert "reading_looks_like_serial" not in sc["suspicious_flags"]
 
 
+def test_build_water_branch_pools_prefers_odometer_items_for_scoring():
+    candidates = [
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-water:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.84,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+    ]
+    serial_pool, odometer_pool = _build_water_branch_pools(candidates, all_water_candidates=candidates)
+    assert len(serial_pool) == 2
+    assert len(odometer_pool) == 1
+    assert odometer_pool[0]["variant"] == "face1_top_strip_2_rescue"
+
+
+def test_build_water_branch_pools_falls_back_when_only_template_exists():
+    candidates = [
+        {
+            "type": "unknown",
+            "reading": 877.0,
+            "serial": "13 076128",
+            "confidence": 0.96,
+            "black_digits": None,
+            "red_digits": None,
+            "provider": "det-water:template",
+            "variant": "water_template",
+            "notes": "",
+        }
+    ]
+    serial_pool, odometer_pool = _build_water_branch_pools(candidates, all_water_candidates=candidates)
+    assert len(serial_pool) == 1
+    assert len(odometer_pool) == 1
+    assert odometer_pool[0]["variant"] == "water_template"
+
+
 def test_water_decision_summary_exposes_branch_winners():
     winner = _build_water_candidate_scorecard(
         {
@@ -674,12 +726,10 @@ def test_water_decision_summary_exposes_branch_winners():
     )
     summary = _water_decision_summary(
         winner=winner,
-        serial_winner=serial_winner,
-        odometer_winner=winner,
-        override_reason=None,
-        context_override_applied=False,
-        serial_tail_like=False,
-        ranked_scorecards=[winner],
+        serial_candidate=serial_winner,
+        odometer_candidate=winner,
+        ranked=[winner],
+        override_note="",
     )
     assert summary["winner"]["source"] == "face_top_strip"
     assert summary["winner"]["serial"] == "13002714"
