@@ -23,6 +23,7 @@ from core.billing import (
     is_ym,
     _calc_month_bill,
     _get_apartment_electric_expected,
+    _get_month_extra_state,
     _get_month_bill_state,
     _set_month_bill_state,
     _same_total,
@@ -1507,6 +1508,8 @@ def _set_electric_assignment_debug(
     apartment_id: int,
     ym: str,
     expected: Optional[int],
+    extra_pending: Optional[bool],
+    expected_snapshot: Optional[int],
     incoming_value: Optional[float],
     mode: Optional[str],
     close_idx: Optional[int],
@@ -1521,6 +1524,8 @@ def _set_electric_assignment_debug(
             "apartment_id": int(apartment_id),
             "ym": str(ym),
             "expected": (int(expected) if expected is not None else None),
+            "extra_pending": (bool(extra_pending) if extra_pending is not None else None),
+            "expected_snapshot": (int(expected_snapshot) if expected_snapshot is not None else None),
             "incoming_value": (float(incoming_value) if incoming_value is not None else None),
             "mode": (str(mode) if mode else None),
             "close_idx": (int(close_idx) if close_idx is not None else None),
@@ -1531,6 +1536,33 @@ def _set_electric_assignment_debug(
             "rows_after": rows_after,
         }
     )
+
+
+def _resolve_electric_assigned_index(
+    rows_after: list[dict[str, Any]],
+    new_value: Optional[float],
+    fallback_index: Optional[int],
+) -> Optional[int]:
+    if new_value is None or not rows_after:
+        return fallback_index
+
+    matches: list[int] = []
+    for row in rows_after:
+        try:
+            row_value = row.get("value")
+            if row_value is None:
+                continue
+            if _same_total(float(row_value), float(new_value)):
+                matches.append(int(row.get("meter_index") or 0))
+        except Exception:
+            continue
+
+    matches = [idx for idx in matches if idx in (1, 2, 3)]
+    if not matches:
+        return fallback_index
+    if fallback_index in matches:
+        return int(fallback_index)
+    return int(matches[0])
 
 
 def _set_api_review_trace(
@@ -1589,6 +1621,8 @@ def _set_api_review_trace(
             "electric_assignment",
             "electric_assignment",
             expected=electric_assignment.get("expected"),
+            extra_pending=electric_assignment.get("extra_pending"),
+            expected_snapshot=electric_assignment.get("expected_snapshot"),
             incoming_value=electric_assignment.get("incoming_value"),
             mode=electric_assignment.get("mode"),
             close_idx=electric_assignment.get("close_idx"),
@@ -2870,6 +2904,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             # 6.1) write meter_readings and get assigned_meter_index
             water_write_blocked = False
             electric_expected = None
+            electric_extra_pending = None
+            electric_expected_snapshot = None
             electric_assignment_mode = None
             electric_close_idx = None
             electric_rows_before: list[dict[str, Any]] = []
@@ -2883,6 +2919,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 prev_manual_value = None
                 with engine.begin() as conn:
                     electric_expected = _get_apartment_electric_expected(conn, int(apartment_id))
+                    electric_extra_state = _get_month_extra_state(conn, int(apartment_id), str(ym))
+                    electric_extra_pending = bool((electric_extra_state or {}).get("pending"))
+                    snap = (electric_extra_state or {}).get("snapshot")
+                    electric_expected_snapshot = int(snap) if snap is not None else None
                     electric_rows_before = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
                     rows = conn.execute(
                         text(
@@ -3002,11 +3042,19 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         with engine.begin() as conn:
                             electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
 
+                assigned_meter_index = _resolve_electric_assigned_index(
+                    electric_rows_after,
+                    (float(value_float) if value_float is not None else None),
+                    assigned_meter_index,
+                )
+
                 _set_electric_assignment_debug(
                     diag,
                     apartment_id=int(apartment_id),
                     ym=str(ym),
                     expected=(int(electric_expected) if electric_expected is not None else None),
+                    extra_pending=electric_extra_pending,
+                    expected_snapshot=electric_expected_snapshot,
                     incoming_value=(float(value_float) if value_float is not None else None),
                     mode=electric_assignment_mode,
                     close_idx=electric_close_idx,
