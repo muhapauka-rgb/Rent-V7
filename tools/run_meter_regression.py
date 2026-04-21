@@ -4,7 +4,7 @@ import json
 import math
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
@@ -136,9 +136,42 @@ def _load_golden_manifest(path: Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
     return cases
 
 
+def _collect_files(
+    cli_paths: List[str],
+    golden_cases: Dict[str, Dict[str, Dict[str, Any]]],
+    *,
+    manifest_path: Optional[Path],
+    dataset_root: Optional[Path],
+) -> List[Tuple[Path, str]]:
+    if cli_paths:
+        files = [(Path(p).expanduser().resolve(), Path(p).expanduser().resolve().name) for p in cli_paths]
+        return files
+
+    collected: List[Tuple[Path, str]] = []
+    for case_name, case in golden_cases.items():
+        case_path = case.get("path")
+        if not case_path:
+            continue
+        path = Path(str(case_path))
+        if not path.is_absolute():
+            if dataset_root is not None:
+                path = (dataset_root / path).resolve()
+            elif manifest_path is not None:
+                path = (manifest_path.parent / path).resolve()
+            else:
+                path = path.resolve()
+        else:
+            path = path.resolve()
+        collected.append((path, str(case_name)))
+
+    if not collected:
+        raise SystemExit("no input paths provided and no runnable cases with 'path' in manifest")
+    return collected
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run focused OCR/API regression checks for meter photos")
-    ap.add_argument("paths", nargs="+", help="Absolute or relative image paths to test")
+    ap.add_argument("paths", nargs="*", help="Absolute or relative image paths to test")
     ap.add_argument("--mode", choices=("ocr", "api", "both"), default="ocr")
     ap.add_argument("--ocr-endpoint", default="http://127.0.0.1:8002/recognize")
     ap.add_argument("--api-endpoint", default="http://127.0.0.1:8001/events/photo")
@@ -151,27 +184,42 @@ def main() -> int:
         default=None,
         help="Path to JSON manifest with golden cases. If omitted and --check-golden=current is set, uses the repo manifest.",
     )
+    ap.add_argument(
+        "--dataset-root",
+        default=None,
+        help="Optional root directory for manifest-relative case paths.",
+    )
     args = ap.parse_args()
 
-    files = [Path(p).expanduser().resolve() for p in args.paths]
+    golden_cases: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    manifest_path: Optional[Path] = None
+    if args.golden_manifest:
+        manifest_path = Path(args.golden_manifest).expanduser().resolve()
+        golden_cases = _load_golden_manifest(manifest_path)
+    elif args.check_golden == "current":
+        manifest_path = DEFAULT_GOLDEN_MANIFEST
+        golden_cases = _load_golden_manifest(manifest_path)
+
+    dataset_root = Path(args.dataset_root).expanduser().resolve() if args.dataset_root else None
+    file_cases = _collect_files(
+        args.paths,
+        golden_cases,
+        manifest_path=manifest_path,
+        dataset_root=dataset_root,
+    )
+    files = [path for path, _case_name in file_cases]
     missing = [str(p) for p in files if not p.exists()]
     if missing:
         raise SystemExit(f"missing files: {missing}")
 
-    golden_cases: Dict[str, Dict[str, Dict[str, Any]]] = {}
-    if args.golden_manifest:
-        golden_cases = _load_golden_manifest(Path(args.golden_manifest).expanduser().resolve())
-    elif args.check_golden == "current":
-        golden_cases = _load_golden_manifest(DEFAULT_GOLDEN_MANIFEST)
-
     all_mismatches: List[str] = []
-    for path in files:
-        golden_scope = golden_cases.get(path.name, {})
+    for path, case_name in file_cases:
+        golden_scope = golden_cases.get(case_name, {})
         if args.mode in ("ocr", "both"):
             row = _ocr_row(args.ocr_endpoint, path, args.timeout_sec)
             print(json.dumps(row, ensure_ascii=False))
             if golden_scope:
-                all_mismatches.extend([f"{path.name}: {m}" for m in _check_golden_row(row, golden_scope)])
+                all_mismatches.extend([f"{case_name}: {m}" for m in _check_golden_row(row, golden_scope)])
         if args.mode in ("api", "both"):
             row = _api_row(args.api_endpoint, path, args.timeout_sec, args.chat_id, args.ym)
             print(
@@ -181,7 +229,7 @@ def main() -> int:
                 )
             )
             if golden_scope:
-                all_mismatches.extend([f"{path.name}: {m}" for m in _check_golden_row(row, golden_scope)])
+                all_mismatches.extend([f"{case_name}: {m}" for m in _check_golden_row(row, golden_scope)])
     if all_mismatches:
         for mismatch in all_mismatches:
             print(f"GOLDEN_MISMATCH: {mismatch}", file=sys.stderr)

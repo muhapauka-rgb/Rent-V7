@@ -1,8 +1,10 @@
 {
-  "description": "Current safe regression baseline for meter OCR/API checks.",
+  "description": "Curated water hard-cases for OCR iteration. Paths are relative to the local dataset root.",
   "cases": {
     "5.jpeg": {
       "path": "тест/5.jpeg",
+      "tags": ["water", "telegram-hardcase", "serial-13002714", "winner-face-top-strip"],
+      "notes": "Telegram-compressed water hard-case. Current expected reading is 991.89 with final API resolution to ХВС.",
       "ocr": {
         "type": "ГВС",
         "reading": 991.89,
@@ -26,6 +28,8 @@
     },
     "4.jpeg": {
       "path": "тест/4.jpeg",
+      "tags": ["water", "template-fallback", "serial-13076128"],
+      "notes": "Water hard-case currently stabilized by template-backed ranking fallback. Expected OCR reading is 877.00.",
       "ocr": {
         "type": "unknown",
         "reading": 877.0,
@@ -47,34 +51,14 @@
         "meter_written": true
       }
     },
-    "31.jpg": {
-      "path": "31.jpg",
+    "photo_2025-12-10 23.31.39.jpeg": {
+      "path": "photo_2025-12-10 23.31.39.jpeg",
+      "tags": ["water", "itelma", "serial-15122066", "round-meter"],
+      "notes": "Round ITELMA water meter. OCR-level expectation is stable reading 148.00 and serial 15-122066.",
       "ocr": {
-        "type": "Электро",
-        "reading": 4737.21,
-        "serial": "25564336"
-      },
-      "api": {
-        "meter_kind": "electric",
-        "meter_type_label": "Электро T1",
-        "ocr_reading": 4737.21,
-        "ocr_serial": "25564336",
-        "meter_written": true
-      }
-    },
-    "32.jpg": {
-      "path": "32.jpg",
-      "ocr": {
-        "type": "Электро",
-        "reading": 5680.55,
-        "serial": "25564336"
-      },
-      "api": {
-        "meter_kind": "electric",
-        "meter_type_label": "Электро T1",
-        "ocr_reading": 5680.55,
-        "ocr_serial": "25564336",
-        "meter_written": true
+        "type": "ГВС",
+        "reading": 148.0,
+        "serial": "15-122066"
       }
     }
   }
