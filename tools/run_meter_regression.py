@@ -9,80 +9,8 @@ from typing import Any, Dict, List, Optional
 import requests
 
 
-CURRENT_GOLDEN_SET: Dict[str, Dict[str, Dict[str, Any]]] = {
-    "5.jpeg": {
-        "ocr": {
-            "type": "ГВС",
-            "reading": 991.89,
-            "serial": "13 002714",
-            "winner_source": "face_top_strip",
-            "winner_serial": "13002714",
-            "serial_branch_serial": "13002714",
-            "odometer_branch_source": "face_top_strip",
-        },
-        "api": {
-            "meter_kind": "cold",
-            "meter_type_label": "ХВС",
-            "ocr_reading": 991.89,
-            "ocr_serial": "13 002714",
-            "winner_source": "face_top_strip",
-            "winner_serial": "13002714",
-            "serial_branch_serial": "13002714",
-            "odometer_branch_source": "face_top_strip",
-            "meter_written": True,
-        },
-    },
-    "4.jpeg": {
-        "ocr": {
-            "type": "unknown",
-            "reading": 877.00,
-            "serial": "13076128",
-            "winner_source": "template",
-            "winner_serial": "13076128",
-            "serial_branch_serial": "13076128",
-            "odometer_branch_source": None,
-        },
-        "api": {
-            "meter_kind": "hot",
-            "meter_type_label": "ГВС",
-            "ocr_reading": 877.00,
-            "ocr_serial": "13076128",
-            "winner_source": "template",
-            "winner_serial": "13076128",
-            "serial_branch_serial": "13076128",
-            "odometer_branch_source": None,
-            "meter_written": True,
-        },
-    },
-    "31.jpg": {
-        "ocr": {
-            "type": "Электро",
-            "reading": 4737.21,
-            "serial": "25564336",
-        },
-        "api": {
-            "meter_kind": "electric",
-            "meter_type_label": "Электро T1",
-            "ocr_reading": 4737.21,
-            "ocr_serial": "25564336",
-            "meter_written": True,
-        },
-    },
-    "32.jpg": {
-        "ocr": {
-            "type": "Электро",
-            "reading": 5680.55,
-            "serial": "25564336",
-        },
-        "api": {
-            "meter_kind": "electric",
-            "meter_type_label": "Электро T3",
-            "ocr_reading": 5680.55,
-            "ocr_serial": "25564336",
-            "meter_written": True,
-        },
-    },
-}
+TOOLS_DIR = Path(__file__).resolve().parent
+DEFAULT_GOLDEN_MANIFEST = TOOLS_DIR / "regression_sets" / "current_golden.json"
 
 
 def _top_candidates(water_decision: Optional[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -192,6 +120,22 @@ def _check_golden_row(row: Dict[str, Any], golden_scope: Dict[str, Dict[str, Any
     return mismatches
 
 
+def _load_golden_manifest(path: Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise SystemExit(f"golden manifest not found: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"invalid golden manifest JSON: {path}: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise SystemExit(f"golden manifest must be a JSON object: {path}")
+    cases = payload.get("cases")
+    if not isinstance(cases, dict):
+        raise SystemExit(f"golden manifest must contain object field 'cases': {path}")
+    return cases
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Run focused OCR/API regression checks for meter photos")
     ap.add_argument("paths", nargs="+", help="Absolute or relative image paths to test")
@@ -202,6 +146,11 @@ def main() -> int:
     ap.add_argument("--ym", default="2026-04")
     ap.add_argument("--timeout-sec", type=float, default=180.0)
     ap.add_argument("--check-golden", choices=("current",), default=None)
+    ap.add_argument(
+        "--golden-manifest",
+        default=None,
+        help="Path to JSON manifest with golden cases. If omitted and --check-golden=current is set, uses the repo manifest.",
+    )
     args = ap.parse_args()
 
     files = [Path(p).expanduser().resolve() for p in args.paths]
@@ -209,9 +158,15 @@ def main() -> int:
     if missing:
         raise SystemExit(f"missing files: {missing}")
 
+    golden_cases: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    if args.golden_manifest:
+        golden_cases = _load_golden_manifest(Path(args.golden_manifest).expanduser().resolve())
+    elif args.check_golden == "current":
+        golden_cases = _load_golden_manifest(DEFAULT_GOLDEN_MANIFEST)
+
     all_mismatches: List[str] = []
     for path in files:
-        golden_scope = CURRENT_GOLDEN_SET.get(path.name, {}) if args.check_golden == "current" else {}
+        golden_scope = golden_cases.get(path.name, {})
         if args.mode in ("ocr", "both"):
             row = _ocr_row(args.ocr_endpoint, path, args.timeout_sec)
             print(json.dumps(row, ensure_ascii=False))
