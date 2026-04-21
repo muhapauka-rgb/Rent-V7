@@ -2908,6 +2908,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             electric_expected_snapshot = None
             electric_assignment_mode = None
             electric_close_idx = None
+            electric_retake_warning = None
             electric_rows_before: list[dict[str, Any]] = []
             electric_rows_after: list[dict[str, Any]] = []
 
@@ -2975,8 +2976,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             assigned_meter_index = int(close_idx)
                             electric_close_idx = int(close_idx)
                             electric_assignment_mode = "retake_overwrite"
+                            electric_retake_warning = int(close_idx)
                             electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
-                            diag["warnings"].append({"retake_overwrite": {"meter_type": "electric", "meter_index": int(close_idx)}})
 
                 if close_idx is None:
                     if (meter_index_mode == "explicit") and (raw_meter_index is not None):
@@ -3047,6 +3048,15 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     (float(value_float) if value_float is not None else None),
                     assigned_meter_index,
                 )
+                if electric_retake_warning is not None:
+                    warning_payload: dict[str, Any] = {
+                        "meter_type": "electric",
+                        "meter_index": int(electric_retake_warning),
+                        "initial_meter_index": int(electric_retake_warning),
+                    }
+                    if assigned_meter_index is not None:
+                        warning_payload["final_meter_index"] = int(assigned_meter_index)
+                    diag["warnings"].append({"retake_overwrite": warning_payload})
 
                 _set_electric_assignment_debug(
                     diag,
