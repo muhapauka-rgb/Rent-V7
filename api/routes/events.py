@@ -1677,6 +1677,55 @@ def _set_api_review_trace(
     diag["api_review_trace"] = entries
 
 
+def _ocr_payload_quality(payload: Any) -> float:
+    if not isinstance(payload, dict):
+        return -1.0
+    score = 0.0
+    reading = _parse_reading_to_float(payload.get("reading"))
+    if reading is not None:
+        score += 1.0
+    ocr_type = str(payload.get("type") or "").strip().lower()
+    variant = str(payload.get("variant") or "").strip().lower()
+    provider = str(payload.get("provider") or "").strip().lower()
+    notes = str(payload.get("notes") or "").strip().lower()
+    digits = "".join(ch for ch in str(payload.get("digits") or "") if ch.isdigit())
+    if ocr_type == "электро":
+        score += 0.25
+    if digits:
+        score += 0.2
+    if len(digits) >= 6:
+        score += 0.9
+    if "electric_seed_display_fast_path" in notes:
+        score += 2.5
+    if any(tag in variant for tag in ("direct_bridge", "prefix_tail", "integer_bridge", "display", "cells", "template", "det_", "tess")):
+        score += 1.2
+    if any(tag in provider for tag in (":display", ":cells", ":integer", ":fraction", "display-hybrid")):
+        score += 0.9
+    if "orig_fullframe" in variant:
+        score -= 1.5
+    if "provider=openai:gpt-4o; variant=orig_fullframe" in notes:
+        score -= 1.0
+    return score
+
+
+def _needs_electric_quality_retry(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("type") or "").strip().lower() != "электро":
+        return False
+    variant = str(payload.get("variant") or "").strip().lower()
+    provider = str(payload.get("provider") or "").strip().lower()
+    notes = str(payload.get("notes") or "").strip().lower()
+    digits = "".join(ch for ch in str(payload.get("digits") or "") if ch.isdigit())
+    if "electric_seed_display_fast_path" in notes:
+        return False
+    if any(tag in variant for tag in ("direct_bridge", "prefix_tail", "integer_bridge")):
+        return False
+    if ("orig_fullframe" in variant) or (provider == "openai:gpt-4o") or ("variant=orig_fullframe" in notes):
+        return True
+    return len(digits) < 6
+
+
 @router.post("/events/photo")
 async def photo_event(request: Request, file: UploadFile = File(None)):
     diag = {"errors": [], "warnings": []}
@@ -2034,6 +2083,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 existing_type in ("", "unknown") or "openai_empty_response" in existing_notes
             ):
                 single_retry_needed = True
+            elif _needs_electric_quality_retry(ocr_data):
+                single_retry_needed = True
     if single_retry_needed:
         diag["warnings"].append("ocr_single_second_pass")
         try:
@@ -2050,11 +2101,36 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 retry_json = retry_resp.json()
                 retry_type = str((retry_json or {}).get("type") or "").strip().lower()
                 retry_reading = _parse_reading_to_float((retry_json or {}).get("reading"))
+                current_score = _ocr_payload_quality(ocr_data)
+                retry_score = _ocr_payload_quality(retry_json)
                 if retry_reading is not None or retry_type not in ("", "unknown"):
-                    ocr_data = retry_json
+                    if (not isinstance(ocr_data, dict)) or (retry_score > current_score + 0.05):
+                        ocr_data = retry_json
+                        diag["warnings"].append(
+                            {
+                                "ocr_single_second_pass_quality": {
+                                    "current_score": round(float(current_score), 4),
+                                    "retry_score": round(float(retry_score), 4),
+                                    "chosen": "retry",
+                                }
+                            }
+                        )
+                    else:
+                        diag["warnings"].append(
+                            {
+                                "ocr_single_second_pass_quality": {
+                                    "current_score": round(float(current_score), 4),
+                                    "retry_score": round(float(retry_score), 4),
+                                    "chosen": "current",
+                                }
+                            }
+                        )
                     ocr_http_ok = True
                     ocr_http_status = int(retry_resp.status_code)
-                    diag["warnings"].append("ocr_single_second_pass_improved")
+                    if isinstance(ocr_data, dict) and ocr_data is retry_json:
+                        diag["warnings"].append("ocr_single_second_pass_improved")
+                    else:
+                        diag["warnings"].append("ocr_single_second_pass_no_improve")
                 else:
                     diag["warnings"].append("ocr_single_second_pass_no_improve")
             else:
@@ -2501,8 +2577,9 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         if isinstance(ocr_data, dict):
             ocr_data["reading"] = value_float
 
-    # 2.1) optional heuristic fix (disabled by default): one missed digit in electric reading
-    if ENABLE_AGGRESSIVE_OCR_AUTOFIX and db_ready() and apartment_id and kind == "electric" and value_float is not None:
+    # 2.1) history-safe electric repair: if OCR likely dropped a single integer digit,
+    # recover it only when one inserted-digit candidate is meaningfully closer to prior values.
+    if db_ready() and apartment_id and kind == "electric" and value_float is not None:
         try:
             with engine.begin() as conn:
                 fixed_value, fix_diag = _maybe_fix_missing_digit_electric(conn, int(apartment_id), str(ym), float(value_float))

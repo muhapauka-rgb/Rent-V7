@@ -444,6 +444,62 @@ ELECTRIC_LCD_PROMPT = """Ты — OCR для ЭЛЕКТРОСЧЕТЧИКА (LCD
 - Только JSON.
 """
 
+ELECTRIC_LCD_CELLS_PROMPT = """Ты видишь коллаж из 6 ячеек LCD дисплея электросчётчика: D1..D6.
+Каждая ячейка должна содержать ровно ОДНУ позицию числа слева направо.
+Верни строго JSON:
+{
+  "cells": {
+    "D1": "<цифра|null>",
+    "D2": "<цифра|null>",
+    "D3": "<цифра|null>",
+    "D4": "<цифра|null>",
+    "D5": "<цифра|null>",
+    "D6": "<цифра|null>"
+  },
+  "digits": "<ровно 6 цифр или null>",
+  "reading": <number|null>,
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Читай позиции строго слева направо, без пропусков и без перестановки соседних цифр.
+- Не выбрасывай цифру из середины, если строка на дисплее выглядит непрерывной.
+- Игнорируй наклейки, серийный номер и любой текст вне самих ячеек.
+- Если в какой-то ячейке цифра сомнительна, ставь null для этой ячейки.
+- Если все 6 ячеек читаются, digits должен быть строкой из 6 цифр.
+- reading можешь вернуть как XXXX.XX, если все 6 цифр видны уверенно; иначе reading=null.
+- Только JSON.
+"""
+
+ELECTRIC_LCD_INTEGER_PROMPT = """Ты видишь только ЛЕВУЮ целую часть LCD дисплея электросчётчика.
+Верни строго JSON:
+{
+  "digits": "<ровно 4 цифры или null>",
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Читай только 4 цифры слева направо.
+- Не меняй порядок соседних цифр.
+- Не теряй цифру в середине непрерывной строки.
+- Если не уверен, digits=null.
+- Только JSON.
+"""
+
+ELECTRIC_LCD_FRACTION_PROMPT = """Ты видишь только ПРАВУЮ дробную часть LCD дисплея электросчётчика.
+Верни строго JSON:
+{
+  "digits": "<ровно 2 цифры или null>",
+  "confidence": <number>,
+  "notes": "<коротко>"
+}
+Правила:
+- Читай только две цифры после десятичной точки слева направо.
+- Не путай их с серийным номером, наклейкой и посторонними символами.
+- Если не уверен, digits=null.
+- Только JSON.
+"""
+
 def _guess_mime(filename: Optional[str], content_type: Optional[str]) -> str:
     """
     Пытаемся подобрать корректный mime для data URL.
@@ -916,6 +972,22 @@ def _electric_hint_score(item: dict) -> float:
         score += 0.07
     if "lcd_" in variant or ":display" in provider:
         score += 0.10
+    if "cells" in variant or ":cells" in provider:
+        score += 0.12
+    if "display-consensus" in provider or "mercury_digits_consensus" in variant:
+        score += 0.16
+    if "display-hybrid" in provider or "mercury_prefix_tail" in variant:
+        score += 0.26
+    if "mercury_center_bridge" in variant:
+        score += 0.28
+    if "mercury_slot_vote" in variant:
+        score += 0.32
+    if "mercury_integer_bridge" in variant:
+        score += 0.34
+    if ":split" in provider or "split_rescue" in variant:
+        score += 0.14
+    if ":integer" in provider or ":fraction" in provider:
+        score += 0.08
     if "det_lcd" in variant or "template" in variant:
         score += 0.06
     if "mid_lcd" in variant:
@@ -930,7 +1002,7 @@ def _electric_requires_support(item: Optional[dict]) -> bool:
         return False
     variant = str(item.get("variant") or "").lower()
     provider = str(item.get("provider") or "").lower()
-    if ":display" in provider or "template" in variant or "det_" in variant or "tess" in variant:
+    if ":display" in provider or ":cells" in provider or ":split" in provider or ":integer" in provider or ":fraction" in provider or "cells" in variant or "template" in variant or "det_" in variant or "tess" in variant:
         return False
     return ("orig_fullframe" in variant) or variant.endswith("_fullframe")
 
@@ -1466,22 +1538,24 @@ def _looks_like_water_meter_face(img_bytes: bytes) -> bool:
     gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (7, 7), 0)
     min_side = max(1, min(h, w))
-    min_r = max(24, int(min_side * 0.12))
-    max_r = max(min_r + 2, int(min_side * 0.48))
+    min_r = max(20, min_side // 12)
+    max_r = max(40, min_side // 2)
     try:
         circles = cv2.HoughCircles(
             gray,
             cv2.HOUGH_GRADIENT,
             dp=1.2,
-            minDist=float(min_side * 0.35),
-            param1=110,
-            param2=24,
+            minDist=float(max(30, min_side // 6)),
+            param1=90,
+            param2=22,
             minRadius=min_r,
             maxRadius=max_r,
         )
     except Exception:
         return False
-    return circles is not None and len(circles[0]) > 0
+    if circles is None or len(circles[0]) == 0:
+        return False
+    return _pick_water_meter_circle(circles, w, h) is not None
 
 
 def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
@@ -1496,12 +1570,19 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
         bands = [
             ("ed_mercury_leftcore", (int(w * 0.05), int(h * 0.30), int(w * 0.74), int(h * 0.55))),
             ("ed_mercury_centercore", (int(w * 0.06), int(h * 0.26), int(w * 0.70), int(h * 0.54))),
+            # Mercury hard-case bridge window: keeps the 4 integer positions and
+            # enough of the decimal tail to prevent 5674 -> 5614 drift.
+            ("ed_mercury_bridge", (int(w * 0.09), int(h * 0.32), int(w * 0.74), int(h * 0.58))),
             # Tight LCD-first windows for Mercury-like meters:
             # display is often on the left block, with sticker/noise in the lower half.
             ("ed_lcd_leftwide", (int(w * 0.02), int(h * 0.24), int(w * 0.82), int(h * 0.60))),
             ("ed_lcd_upper", (int(w * 0.06), int(h * 0.24), int(w * 0.86), int(h * 0.58))),
             ("ed_lcd_tight", (int(w * 0.10), int(h * 0.30), int(w * 0.78), int(h * 0.60))),
             ("ed_lcd_digits", (int(w * 0.10), int(h * 0.34), int(w * 0.76), int(h * 0.58))),
+            # Proven on exact Mercury hard-case: keeps the full LCD line,
+            # while cutting enough right/bottom noise to avoid serial/sticker bleed.
+            ("ed_lcd_tight5_left", (int(w * 0.07), int(h * 0.42), int(w * 0.78), int(h * 0.71))),
+            ("ed_lcd_tight5", (int(w * 0.08), int(h * 0.42), int(w * 0.78), int(h * 0.71))),
             ("ed_lcd_wide", (int(w * 0.05), int(h * 0.28), int(w * 0.84), int(h * 0.66))),
             ("ed_center", (int(w * 0.08), int(h * 0.22), int(w * 0.92), int(h * 0.74))),
             ("ed_mid", (0, int(h * 0.26), w, int(h * 0.70))),
@@ -1565,6 +1646,752 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
     except Exception:
         return out[:20]
     return out[:20]
+
+
+def _make_electric_digit_cells_sheet(crop_bytes: bytes, *, digits_count: int = 6) -> Optional[bytes]:
+    try:
+        arr = np.frombuffer(crop_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if im is None:
+            return None
+        im = _electric_mask_sticker(im)
+        h, w = im.shape[:2]
+        if h < 20 or w < 40:
+            return None
+        x1 = int(w * 0.02)
+        x2 = int(w * 0.98)
+        y1 = int(h * 0.08)
+        y2 = int(h * 0.92)
+        x1, y1, x2, y2 = _clamp_box(x1, y1, x2, y2, w, h)
+        roi = im[y1:y2, x1:x2]
+        if roi.size == 0:
+            return None
+
+        tiles: list[Image.Image] = []
+        roi_h, roi_w = roi.shape[:2]
+        cell_w = max(12, int(round(roi_w / float(digits_count))))
+        pad_x = max(2, int(round(cell_w * 0.12)))
+        pad_y = max(2, int(round(roi_h * 0.10)))
+        for idx in range(digits_count):
+            cx1 = idx * cell_w
+            cx2 = roi_w if idx == digits_count - 1 else (idx + 1) * cell_w
+            cx1 = max(0, min(roi_w - 1, cx1 - pad_x))
+            cx2 = max(cx1 + 1, min(roi_w, cx2 + pad_x))
+            cy1 = max(0, min(roi_h - 1, pad_y))
+            cy2 = max(cy1 + 1, min(roi_h, roi_h - pad_y))
+            cell = roi[cy1:cy2, cx1:cx2]
+            if cell.size == 0:
+                return None
+            pil = Image.fromarray(cv2.cvtColor(cell, cv2.COLOR_BGR2RGB))
+            pil = pil.resize((180, 240), Image.Resampling.LANCZOS)
+            pil = ImageEnhance.Contrast(pil).enhance(2.0)
+            pil = ImageEnhance.Sharpness(pil).enhance(1.7)
+            pil = pil.filter(ImageFilter.UnsharpMask(radius=1, percent=280, threshold=2))
+            tiles.append(pil)
+        if len(tiles) != digits_count:
+            return None
+
+        gap = 14
+        margin = 18
+        tile_w = 180
+        tile_h = 240
+        sheet_w = margin * 2 + digits_count * tile_w + max(0, digits_count - 1) * gap
+        sheet_h = margin * 2 + tile_h + 34
+        sheet = Image.new("RGB", (sheet_w, sheet_h), (245, 245, 245))
+        draw = ImageDraw.Draw(sheet)
+        for idx, tile in enumerate(tiles, start=1):
+            px = margin + (idx - 1) * (tile_w + gap)
+            py = margin + 24
+            sheet.paste(tile, (px, py))
+            draw.text((px + 8, py - 20), f"D{idx}", fill=(20, 20, 20))
+        return _encode_jpeg(sheet, quality=95)
+    except Exception:
+        return None
+
+
+def _extract_electric_digits_from_cells_response(resp: dict, *, digits_count: int = 6) -> Optional[str]:
+    cells = resp.get("cells")
+    if isinstance(cells, dict):
+        parts: list[str] = []
+        for idx in range(1, digits_count + 1):
+            d = _normalize_digits_string(cells.get(f"D{idx}"))
+            if not d:
+                parts = []
+                break
+            parts.append(d[-1])
+        if len(parts) == digits_count:
+            return "".join(parts)
+    raw_digits = _normalize_digits_string(resp.get("digits"))
+    if raw_digits and len(raw_digits) >= digits_count:
+        return raw_digits[:digits_count]
+    return None
+
+
+def _reading_from_electric_digits(digits: Optional[str]) -> Optional[float]:
+    d = _normalize_digits_string(digits)
+    if not d:
+        return None
+    try:
+        if len(d) == 6:
+            return float(f"{int(d[:4])}.{d[4:6]}")
+        if len(d) == 5:
+            return float(f"{int(d[:3])}.{d[3:5]}")
+    except Exception:
+        return None
+    return None
+
+
+def _reconcile_electric_reading_with_digits(
+    reading: Optional[float], digits: Optional[str]
+) -> tuple[Optional[float], Optional[str]]:
+    d = _normalize_digits_string(digits)
+    if not d:
+        return reading, None
+    digits_reading = _reading_from_electric_digits(d)
+    if digits_reading is None:
+        return reading, d
+    return digits_reading, d
+
+
+def _build_mercury_display_consensus_candidate(
+    candidates: list[dict], seed_candidate: Optional[dict] = None
+) -> Optional[dict]:
+    if not candidates:
+        return None
+    seed_variant = str((seed_candidate or {}).get("variant") or "").lower()
+    mercury_like = any(
+        token in seed_variant for token in ("mercury", "tight5", "lcd_digits", "lcd_tight")
+    )
+    if not mercury_like:
+        mercury_like = any(
+            any(token in str(c.get("variant") or "").lower() for token in ("mercury", "tight5", "lcd_digits", "lcd_tight"))
+            for c in candidates
+        )
+    if not mercury_like:
+        return None
+
+    weighted: list[tuple[str, float]] = []
+    for c in candidates:
+        variant = str(c.get("variant") or "").lower()
+        provider = str(c.get("provider") or "").lower()
+        if ":display" not in provider:
+            continue
+        digits = _normalize_digits_string(c.get("digits"))
+        if not digits or len(digits) != 6:
+            continue
+        weight = _clamp_confidence(c.get("confidence", 0.0))
+        if "tight5_left" in variant:
+            weight += 0.30
+        elif "tight5" in variant:
+            weight += 0.24
+        elif "lcd_digits" in variant:
+            weight += 0.18
+        elif "lcd_upper" in variant or "lcd_tight" in variant:
+            weight += 0.14
+        elif "mercury_bridge" in variant:
+            weight += 0.12
+        elif "mercury_center" in variant or "mercury_centercore" in variant:
+            weight += 0.08
+        elif "mercury_leftcore" in variant:
+            weight += 0.05
+        weighted.append((digits, weight))
+
+    if len(weighted) < 2:
+        return None
+
+    out_digits: list[str] = []
+    dominance_scores: list[float] = []
+    for idx in range(6):
+        counts: dict[str, float] = {}
+        total = 0.0
+        for digits, weight in weighted:
+            ch = digits[idx]
+            counts[ch] = counts.get(ch, 0.0) + weight
+            total += weight
+        if not counts or total <= 0.0:
+            return None
+        best_digit, best_weight = max(counts.items(), key=lambda item: item[1])
+        dominance = float(best_weight) / float(max(1e-6, total))
+        if dominance < 0.34:
+            return None
+        out_digits.append(best_digit)
+        dominance_scores.append(dominance)
+
+    digits_out = "".join(out_digits)
+    reading = _reading_from_electric_digits(digits_out)
+    if reading is None:
+        return None
+
+    avg_dom = sum(dominance_scores) / float(len(dominance_scores))
+    conf = min(0.97, 0.82 + avg_dom * 0.14 + min(0.05, 0.02 * float(len(weighted) - 2)))
+    serial = (seed_candidate or {}).get("serial")
+    return {
+        "type": "Электро",
+        "reading": reading,
+        "serial": serial,
+        "digits": digits_out,
+        "confidence": conf,
+        "notes": (
+            f"electric_mercury_digits_consensus(avg_dom={avg_dom:.2f};n={len(weighted)})"
+        ),
+        "note2": "",
+        "variant": "electric_mercury_digits_consensus",
+        "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-consensus",
+    }
+
+
+def _scaled_electric_digits_from_reading(reading: Optional[float]) -> Optional[str]:
+    r = _normalize_reading(reading)
+    if r is None:
+        return None
+    try:
+        scaled = int(round(float(r) * 100.0))
+    except Exception:
+        return None
+    if scaled < 0:
+        return None
+    return str(scaled)
+
+
+def _build_mercury_prefix_tail_candidate(
+    seed_candidate: Optional[dict],
+    candidates: list[dict],
+) -> Optional[dict]:
+    if not seed_candidate or not candidates:
+        return None
+    seed_variant = str(seed_candidate.get("variant") or "").lower()
+    if "tight5_left" not in seed_variant:
+        return None
+    seed_scaled = _scaled_electric_digits_from_reading(seed_candidate.get("reading"))
+    if not seed_scaled or len(seed_scaled) != 5:
+        return None
+    seed_tail = seed_scaled[-4:]
+    seed_frac = seed_scaled[-2:]
+    for c in candidates:
+        variant = str(c.get("variant") or "").lower()
+        provider = str(c.get("provider") or "").lower()
+        if ":display" not in provider:
+            continue
+        if "mercury_center" not in variant and "mercury_bridge" not in variant:
+            continue
+        digits = _normalize_digits_string(c.get("digits"))
+        if not digits or len(digits) != 6:
+            continue
+        if len(seed_scaled) == 5 and digits[:2] == seed_scaled[:2]:
+            # When the partial seed already shares the same left prefix as the
+            # core (e.g. 272.04 vs 2710.40), prefix-tail over-merges into 2772.04.
+            # Let the partial-tail bridge handle this pattern instead.
+            continue
+        if digits[-2:] != seed_frac:
+            continue
+        merged_digits = f"{digits[:2]}{seed_tail}"
+        merged_reading = _reading_from_electric_digits(merged_digits)
+        if merged_reading is None:
+            continue
+        conf = min(
+            0.97,
+            max(
+                _clamp_confidence(seed_candidate.get("confidence", 0.0)),
+                _clamp_confidence(c.get("confidence", 0.0)),
+            ),
+        )
+        return {
+            "type": "Электро",
+            "reading": merged_reading,
+            "serial": seed_candidate.get("serial") or c.get("serial"),
+            "digits": merged_digits,
+            "confidence": conf,
+            "notes": (
+                f"electric_mercury_prefix_tail(seed={seed_scaled};core={digits})"
+            ),
+            "note2": "",
+            "variant": "electric_mercury_prefix_tail",
+            "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-hybrid",
+        }
+    return None
+
+
+def _build_mercury_partial_tail_bridge_candidate(
+    seed_candidate: Optional[dict],
+    candidates: list[dict],
+) -> Optional[dict]:
+    if not seed_candidate or not candidates:
+        return None
+    seed_variant = str(seed_candidate.get("variant") or "").lower()
+    if "tight5_left" not in seed_variant:
+        return None
+    seed_digits = _extract_electric_candidate_digits(seed_candidate)
+    if not seed_digits or len(seed_digits) != 5:
+        return None
+    seed_reading = _normalize_reading(seed_candidate.get("reading"))
+    if seed_reading is None or float(seed_reading) >= 1000.0:
+        return None
+    best_core: Optional[dict] = None
+    best_score = -1.0
+    for c in candidates:
+        variant = str(c.get("variant") or "").lower()
+        provider = str(c.get("provider") or "").lower()
+        if ":display" not in provider:
+            continue
+        if "mercury_centercore" not in variant:
+            continue
+        digits = _normalize_digits_string(c.get("digits"))
+        if not digits or len(digits) != 6:
+            continue
+        conf = _clamp_confidence(c.get("confidence", 0.0))
+        if conf > best_score:
+            best_score = conf
+            best_core = c
+    if best_core is None:
+        return None
+
+    core_digits = _normalize_digits_string(best_core.get("digits"))
+    if not core_digits or len(core_digits) != 6:
+        return None
+    insertion_digits: list[tuple[str, str]] = []
+    if (
+        len(seed_digits) >= 3
+        and seed_digits[:2] == core_digits[:2]
+        and seed_digits[2].isdigit()
+        and seed_digits[2] != core_digits[2]
+    ):
+        insertion_digits.append((seed_digits[2], "seed2"))
+    if len(seed_digits) >= 2 and seed_digits[1].isdigit() and seed_digits[1] != core_digits[2]:
+        insertion_digits.append((seed_digits[1], "seed1"))
+    if not insertion_digits:
+        return None
+
+    conf = min(
+        0.975,
+        max(
+            _clamp_confidence(seed_candidate.get("confidence", 0.0)),
+            _clamp_confidence(best_core.get("confidence", 0.0)),
+        ),
+    )
+    for insert_digit, tag in insertion_digits:
+        merged_digits = f"{core_digits[:2]}{insert_digit}{core_digits[3:]}"
+        merged_reading = _reading_from_electric_digits(merged_digits)
+        if merged_reading is None:
+            continue
+        return {
+            "type": "Электро",
+            "reading": merged_reading,
+            "serial": seed_candidate.get("serial") or best_core.get("serial"),
+            "digits": merged_digits,
+            "confidence": conf,
+            "notes": (
+                f"electric_mercury_partial_tail_bridge(seed={seed_digits};core={core_digits};mode={tag})"
+            ),
+            "note2": "",
+            "variant": "electric_mercury_partial_tail_bridge",
+            "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-hybrid",
+        }
+    return None
+
+
+def _build_mercury_center_bridge_candidate(candidates: list[dict]) -> Optional[dict]:
+    if not candidates:
+        return None
+    prefix_pool: list[dict] = []
+    suffix_pool: list[dict] = []
+    for c in candidates:
+        variant = str(c.get("variant") or "").lower()
+        provider = str(c.get("provider") or "").lower()
+        if ":display" not in provider:
+            continue
+        digits = _normalize_digits_string(c.get("digits"))
+        if not digits or len(digits) != 6:
+            continue
+        if "center" in variant or "centercore" in variant or "leftcore" in variant:
+            prefix_pool.append(c)
+        if "bridge" in variant or "lcd_digits" in variant or "tight5" in variant:
+            suffix_pool.append(c)
+    if not prefix_pool or not suffix_pool:
+        return None
+
+    for prefix in prefix_pool:
+        pd = _normalize_digits_string(prefix.get("digits"))
+        if not pd:
+            continue
+        for suffix in suffix_pool:
+            sd = _normalize_digits_string(suffix.get("digits"))
+            if not sd:
+                continue
+            if pd[:2] != sd[:2]:
+                continue
+            merged_digits = f"{pd[:3]}{sd[3:]}"
+            merged_reading = _reading_from_electric_digits(merged_digits)
+            if merged_reading is None:
+                continue
+            conf = min(
+                0.97,
+                max(
+                    _clamp_confidence(prefix.get("confidence", 0.0)),
+                    _clamp_confidence(suffix.get("confidence", 0.0)),
+                ),
+            )
+            return {
+                "type": "Электро",
+                "reading": merged_reading,
+                "serial": prefix.get("serial") or suffix.get("serial"),
+                "digits": merged_digits,
+                "confidence": conf,
+                "notes": (
+                    f"electric_mercury_center_bridge(prefix={pd};suffix={sd})"
+                ),
+                "note2": "",
+                "variant": "electric_mercury_center_bridge",
+                "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-hybrid",
+            }
+    return None
+
+
+def _build_mercury_slot_vote_candidate(candidates: list[dict]) -> Optional[dict]:
+    vote_rows: list[tuple[str, list[Optional[int]], list[float], float, str]] = []
+    serial_hint = None
+
+    def _profile_for_variant(variant: str, provider: str, digits_len: int) -> tuple[list[float], int]:
+        variant_l = variant.lower()
+        provider_l = provider.lower()
+        if "mercury_prefix_tail" in variant_l:
+            return [1.16, 1.18, 1.16, 1.10, 1.06, 1.04], 0
+        if "mercury_center_bridge" in variant_l:
+            return [1.06, 1.08, 1.16, 1.18, 1.18, 1.16], 0
+        if "mercury_digits_consensus" in variant_l:
+            return [0.96, 0.98, 1.02, 1.02, 1.00, 0.98], 0
+        if "mercury_centercore" in variant_l:
+            return [1.02, 1.08, 1.14, 0.72, 0.44, 0.32], 0
+        if "mercury_leftcore" in variant_l:
+            return [1.02, 1.04, 0.96, 0.60, 0.30, 0.22], 0
+        if "mercury_bridge" in variant_l:
+            return [0.48, 0.72, 0.98, 1.14, 1.14, 1.08], 0
+        if "lcd_tight5_left" in variant_l:
+            if digits_len == 5:
+                return [0.00, 0.58, 0.80, 1.04, 1.12, 1.12], 1
+            return [0.28, 0.48, 0.76, 1.02, 1.10, 1.10], 0
+        if "lcd_tight5" in variant_l:
+            if digits_len == 5:
+                return [0.00, 0.54, 0.76, 0.98, 1.08, 1.08], 1
+            return [0.24, 0.44, 0.72, 0.98, 1.06, 1.06], 0
+        if "lcd_digits" in variant_l:
+            return [0.20, 0.34, 0.58, 0.90, 1.02, 1.04], 0
+        if "lcd_upper" in variant_l:
+            return [0.60, 0.78, 0.86, 0.82, 0.66, 0.56], 0
+        if "center" in variant_l and ":display" in provider_l:
+            return [0.84, 0.92, 0.96, 0.70, 0.52, 0.42], 0
+        return [0.46, 0.54, 0.62, 0.62, 0.56, 0.50], max(0, 6 - digits_len)
+
+    for item in candidates:
+        variant = str(item.get("variant") or "")
+        provider = str(item.get("provider") or "")
+        variant_l = variant.lower()
+        provider_l = provider.lower()
+        if "mercury_digits_consensus" in variant_l:
+            continue
+        if "mercury" not in variant_l and "lcd_" not in variant_l and ":display" not in provider_l:
+            continue
+        digits = _normalize_digits_string(item.get("digits"))
+        if not digits:
+            digits = _extract_electric_candidate_digits(item)
+        digits = _normalize_digits_string(digits)
+        if not digits or len(digits) < 5:
+            continue
+        if len(digits) > 6:
+            digits = digits[:6]
+        profile, offset = _profile_for_variant(variant, provider, len(digits))
+        if offset + len(digits) > 6:
+            offset = max(0, 6 - len(digits))
+        positions: list[Optional[int]] = [None] * 6
+        weights: list[float] = [0.0] * 6
+        conf = _clamp_confidence(item.get("confidence", 0.0))
+        base = 0.42 + conf
+        for idx, ch in enumerate(digits):
+            pos = offset + idx
+            if not (0 <= pos < 6) or (not ch.isdigit()):
+                continue
+            positions[pos] = int(ch)
+            weights[pos] = profile[pos] * base
+        if not any(v is not None for v in positions):
+            continue
+        vote_rows.append((variant, positions, weights, conf, provider))
+        if not serial_hint:
+            serial_hint = item.get("serial")
+
+    if len(vote_rows) < 2:
+        return None
+
+    per_pos_votes: list[dict[int, float]] = [dict() for _ in range(6)]
+    winning_sources: list[list[str]] = [[] for _ in range(6)]
+    for variant, positions, weights, _conf, _provider in vote_rows:
+        for pos, digit in enumerate(positions):
+            if digit is None:
+                continue
+            w = float(weights[pos])
+            if w <= 0.0:
+                continue
+            per_pos_votes[pos][digit] = per_pos_votes[pos].get(digit, 0.0) + w
+            winning_sources[pos].append(variant)
+
+    picked: list[str] = []
+    margins: list[float] = []
+    support_positions = 0
+    for votes in per_pos_votes:
+        if not votes:
+            return None
+        ranked = sorted(votes.items(), key=lambda kv: kv[1], reverse=True)
+        digit, top_score = ranked[0]
+        second = ranked[1][1] if len(ranked) > 1 else 0.0
+        picked.append(str(digit))
+        margins.append(float(top_score - second))
+        if top_score >= 0.90:
+            support_positions += 1
+
+    merged_digits = "".join(picked)
+    merged_reading = _reading_from_electric_digits(merged_digits)
+    if merged_reading is None:
+        return None
+    if merged_reading < 1000.0 or merged_reading > 10000.0:
+        return None
+
+    mean_margin = float(sum(margins) / max(1, len(margins)))
+    support_bonus = 0.02 * min(6, support_positions)
+    conf = _clamp_confidence(min(0.985, 0.74 + min(0.16, mean_margin * 0.18) + support_bonus))
+    notes = "electric_mercury_slot_vote(" + "; ".join(
+        f"D{idx + 1}={digit}|m={margins[idx]:.3f}" for idx, digit in enumerate(picked)
+    ) + ")"
+    return {
+        "type": "Электро",
+        "reading": merged_reading,
+        "serial": serial_hint,
+        "digits": merged_digits,
+        "confidence": conf,
+        "notes": notes,
+        "note2": "",
+        "variant": "electric_mercury_slot_vote",
+        "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-hybrid",
+    }
+
+
+def _make_electric_integer_rescue_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return out
+    try:
+        w, h = img.size
+        bands = [
+            # Exact-file Mercury LCD probes: these two windows produced the
+            # correct integer block 5674 on the hard T1 shot.
+            ("ei_mercury_main", (int(w * 0.08), int(h * 0.30), int(w * 0.76), int(h * 0.60))),
+            ("ei_mercury_shift", (int(w * 0.10), int(h * 0.32), int(w * 0.76), int(h * 0.60))),
+            ("ei_mercury_deep", (int(w * 0.10), int(h * 0.34), int(w * 0.78), int(h * 0.58))),
+            ("ei_main", (int(w * 0.06), int(h * 0.37), int(w * 0.60), int(h * 0.67))),
+            ("ei_tight", (int(w * 0.07), int(h * 0.40), int(w * 0.57), int(h * 0.66))),
+            ("ei_wide", (int(w * 0.04), int(h * 0.36), int(w * 0.59), int(h * 0.66))),
+        ]
+        for base_label, (x1, y1, x2, y2) in bands:
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(x1 + 1, min(w, x2))
+            y2 = max(y1 + 1, min(h, y2))
+            crop = img.crop((x1, y1, x2, y2))
+            crop_np = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+            crop_np = _electric_mask_sticker(crop_np)
+            crop = Image.fromarray(cv2.cvtColor(crop_np, cv2.COLOR_BGR2RGB))
+
+            p1 = ImageEnhance.Contrast(crop).enhance(2.05)
+            p1 = ImageEnhance.Sharpness(p1).enhance(1.80)
+            p1 = p1.filter(ImageFilter.UnsharpMask(radius=1, percent=320, threshold=2))
+            out.append((f"{base_label}_contrast", _encode_jpeg(p1, quality=95)))
+
+            g = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+            g = cv2.GaussianBlur(g, (3, 3), 0)
+            g2 = cv2.createCLAHE(clipLimit=3.2, tileGridSize=(8, 8)).apply(g)
+            g3 = cv2.addWeighted(g2, 1.6, cv2.GaussianBlur(g2, (0, 0), 1.0), -0.6, 0)
+            g3 = cv2.normalize(g3, None, 0, 255, cv2.NORM_MINMAX)
+            p2 = Image.fromarray(cv2.cvtColor(g3, cv2.COLOR_GRAY2RGB))
+            p2 = ImageEnhance.Contrast(p2).enhance(1.8)
+            out.append((f"{base_label}_lcdboost", _encode_jpeg(p2, quality=95)))
+    except Exception:
+        return out
+    return out[:10]
+
+
+def _make_electric_fraction_rescue_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
+    out: list[tuple[str, bytes]] = []
+    try:
+        img = Image.open(BytesIO(img_bytes)).convert("RGB")
+    except Exception:
+        return out
+    try:
+        w, h = img.size
+        bands = [
+            ("ef_main", (int(w * 0.48), int(h * 0.42), int(w * 0.79), int(h * 0.70))),
+            ("ef_alt", (int(w * 0.50), int(h * 0.40), int(w * 0.80), int(h * 0.70))),
+            ("ef_right", (int(w * 0.52), int(h * 0.39), int(w * 0.82), int(h * 0.70))),
+        ]
+        for base_label, (x1, y1, x2, y2) in bands:
+            x1 = max(0, min(w - 1, x1))
+            y1 = max(0, min(h - 1, y1))
+            x2 = max(x1 + 1, min(w, x2))
+            y2 = max(y1 + 1, min(h, y2))
+            crop = img.crop((x1, y1, x2, y2))
+            crop_np = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+            crop_np = _electric_mask_sticker(crop_np)
+            crop = Image.fromarray(cv2.cvtColor(crop_np, cv2.COLOR_BGR2RGB))
+
+            p1 = ImageEnhance.Contrast(crop).enhance(2.05)
+            p1 = ImageEnhance.Sharpness(p1).enhance(1.80)
+            p1 = p1.filter(ImageFilter.UnsharpMask(radius=1, percent=320, threshold=2))
+            out.append((f"{base_label}_contrast", _encode_jpeg(p1, quality=95)))
+
+            g = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
+            g = cv2.GaussianBlur(g, (3, 3), 0)
+            g2 = cv2.createCLAHE(clipLimit=3.2, tileGridSize=(8, 8)).apply(g)
+            g3 = cv2.addWeighted(g2, 1.6, cv2.GaussianBlur(g2, (0, 0), 1.0), -0.6, 0)
+            g3 = cv2.normalize(g3, None, 0, 255, cv2.NORM_MINMAX)
+            p2 = Image.fromarray(cv2.cvtColor(g3, cv2.COLOR_GRAY2RGB))
+            p2 = ImageEnhance.Contrast(p2).enhance(1.8)
+            out.append((f"{base_label}_lcdboost", _encode_jpeg(p2, quality=95)))
+    except Exception:
+        return out
+    return out[:6]
+
+
+def _extract_electric_candidate_digits(item: dict) -> Optional[str]:
+    digits = _normalize_digits_string(item.get("digits"))
+    if digits and len(digits) >= 5:
+        return digits[:6]
+    reading = item.get("reading")
+    if reading is None:
+        return None
+    try:
+        rf = float(reading)
+    except Exception:
+        return None
+    s = f"{rf:.2f}".replace(".", "")
+    s = _normalize_digits_string(s)
+    if s and len(s) >= 5:
+        return s[:6]
+    return None
+
+
+def _pick_electric_preferred_integer_digits(candidates: list[dict]) -> Optional[str]:
+    preferred_variants = (
+        "electric_seed_cells_rescue",
+        "electric_ed_lcd_tight5_left_contrast",
+        "electric_ed_lcd_tight5_contrast",
+        "electric_ed_mercury_bridge_contrast",
+        "electric_ed_lcd_upper_contrast",
+        "electric_ed_lcd_digits_contrast",
+    )
+    for wanted in preferred_variants:
+        for item in candidates:
+            variant = str(item.get("variant") or "")
+            digits = _extract_electric_candidate_digits(item)
+            if variant == wanted and digits and len(digits) >= 5:
+                if (
+                    wanted in ("electric_ed_lcd_tight5_left_contrast", "electric_ed_lcd_tight5_contrast")
+                    and len(digits) == 5
+                ):
+                    reading = _normalize_reading(item.get("reading"))
+                    if reading is None or float(reading) < 1000.0:
+                        # Mercury tight5 crops with only 5 digits are usually missing
+                        # the leftmost integer slot and are useful as tail support,
+                        # not as the canonical 4-digit whole part.
+                        continue
+                return digits[:4]
+    best = None
+    best_score = -1.0
+    for item in candidates:
+        digits = _extract_electric_candidate_digits(item)
+        if not digits or len(digits) < 5:
+            continue
+        variant = str(item.get("variant") or "")
+        score = _clamp_confidence(item.get("confidence", 0.0)) + _electric_hint_score(item)
+        if "seed_cells_rescue" in variant:
+            score += 0.30
+        elif "tight5_left" in variant:
+            score += 0.22
+        elif "tight5" in variant:
+            score += 0.18
+        elif "mercury_bridge" in variant:
+            score += 0.15
+        elif "upper" in variant:
+            score += 0.10
+        elif "digits" in variant:
+            score += 0.08
+        if len(digits) == 5:
+            score += 0.06
+            if ("tight5_left" in variant or "tight5_contrast" in variant or "tight5" in variant):
+                reading = _normalize_reading(item.get("reading"))
+                if reading is None or float(reading) < 1000.0:
+                    score -= 0.24
+        elif len(digits) > 6:
+            score -= 0.10
+        if score > best_score:
+            best_score = score
+            best = digits[:4]
+    return best
+
+
+def _pick_electric_fraction_digits(candidates: list[dict]) -> Optional[str]:
+    preferred_variants = (
+        "electric_seed_cells_rescue",
+        "electric_ed_lcd_digits_contrast",
+        "electric_ed_lcd_tight5_left_contrast",
+        "electric_ed_lcd_tight5_contrast",
+        "electric_ed_lcd_upper_contrast",
+    )
+    for wanted in preferred_variants:
+        for item in candidates:
+            variant = str(item.get("variant") or "")
+            raw_digits = _normalize_digits_string(item.get("digits"))
+            if variant == wanted and raw_digits and len(raw_digits) >= 2:
+                if (
+                    wanted in ("electric_ed_lcd_tight5_left_contrast", "electric_ed_lcd_tight5_contrast")
+                    and len(raw_digits) == 5
+                ):
+                    reading = _normalize_reading(item.get("reading"))
+                    if reading is None or float(reading) < 1000.0:
+                        # Same rationale as whole-part seed selection: a 5-digit
+                        # Mercury tight crop is usually a tail-only read and its
+                        # last two digits are not a reliable fraction seed.
+                        continue
+                return raw_digits[-2:]
+    votes: dict[str, float] = {}
+    for item in candidates:
+        raw_digits = _normalize_digits_string(item.get("digits"))
+        if raw_digits and len(raw_digits) >= 2:
+            tail = raw_digits[-2:]
+        else:
+            digits = _extract_electric_candidate_digits(item)
+            if not digits or len(digits) < 6:
+                continue
+            tail = digits[-2:]
+        if len(tail) != 2:
+            continue
+        score = _clamp_confidence(item.get("confidence", 0.0)) + _electric_hint_score(item)
+        variant = str(item.get("variant") or "")
+        if "seed_cells_rescue" in variant:
+            score += 0.12
+        elif "digits" in variant:
+            score += 0.10
+        elif "tight5_left" in variant:
+            score += 0.08
+        elif "tight5" in variant:
+            score += 0.06
+        if raw_digits and len(raw_digits) == 5 and ("tight5_left" in variant or "tight5" in variant):
+            reading = _normalize_reading(item.get("reading"))
+            if reading is None or float(reading) < 1000.0:
+                score -= 0.18
+        if raw_digits and len(raw_digits) > 6:
+            score -= 0.10
+        votes[tail] = votes.get(tail, 0.0) + score
+    if not votes:
+        return None
+    return max(votes.items(), key=lambda kv: kv[1])[0]
 
 
 _SEGMENT_DIGIT_BY_MASK: dict[int, int] = {
@@ -2844,6 +3671,7 @@ def _make_water_face_top_strip_raw_wide_variants(
             return out
         h, w = im.shape[:2]
         strips = [
+            (0.00, 0.06, 0.96, 0.36),
             (0.12, 0.08, 0.94, 0.33),
             (0.16, 0.08, 0.92, 0.31),
             (0.22, 0.09, 0.89, 0.29),
@@ -6768,12 +7596,57 @@ async def recognize(
 
     def _run_seeded_electric_display_finalize(seed_candidate: dict) -> Optional[dict]:
         electric_candidates: list[dict] = [dict(seed_candidate)]
+        strong_display_seed: Optional[dict] = None
+        seed_variant = str(seed_candidate.get("variant") or "")
+        seed_variant_l = seed_variant.lower()
+        seed_reading_norm = _normalize_reading(seed_candidate.get("reading"))
+        mercury_tight_seed = seed_variant_l == "electric_ed_lcd_tight5_left_contrast"
+        print(
+            f"TRACE_ELECTRIC finalize_start trace_id={req_trace_id} variant={seed_candidate.get('variant')} reading={seed_candidate.get('reading')}",
+            flush=True,
+        )
+        logger.info(
+            "ocr_electric_seed trace_id=%s finalize_start variant=%s reading=%s conf=%.3f",
+            req_trace_id,
+            str(seed_candidate.get("variant") or ""),
+            seed_candidate.get("reading"),
+            _clamp_confidence(seed_candidate.get("confidence", 0.0)),
+        )
         disp_variants = _make_electric_display_variants(img)
-        for label, b in disp_variants[:4]:
+        disp_variant_map = {label: b for label, b in disp_variants}
+        if mercury_tight_seed and seed_reading_norm is None:
+            seed_labels = [
+                "ed_mercury_centercore_contrast",
+            ]
+        elif mercury_tight_seed:
+            seed_labels = [
+                "ed_mercury_centercore_contrast",
+                "ed_mercury_bridge_contrast",
+                "ed_lcd_tight5_left_contrast",
+            ]
+        else:
+            seed_labels = [
+                "ed_mercury_centercore_contrast",
+                "ed_mercury_bridge_contrast",
+                "ed_center_contrast",
+                "ed_lcd_tight5_left_contrast",
+                "ed_lcd_upper_contrast",
+                "ed_lcd_digits_contrast",
+                "ed_lcd_tight5_contrast",
+                "ed_lcd_leftwide_contrast",
+            ]
+        for label in seed_labels:
+            b = disp_variant_map.get(label)
+            if not b:
+                continue
             if not _time_budget_left(odo_reserve_sec):
                 break
             variant_image_map.setdefault(label, b)
             try:
+                print(
+                    f"TRACE_ELECTRIC finalize_probe_start trace_id={req_trace_id} label={label}",
+                    flush=True,
+                )
                 er = _vision(
                     b,
                     mime="image/jpeg",
@@ -6787,6 +7660,11 @@ async def recognize(
                     max_call_timeout_sec=8.0,
                 )
             except Exception:
+                logger.info(
+                    "ocr_electric_seed trace_id=%s finalize_probe_error label=%s",
+                    req_trace_id,
+                    label,
+                )
                 continue
             t = _sanitize_type(er.get("type", "unknown"))
             notes = str(er.get("notes", "") or "")
@@ -6795,6 +7673,7 @@ async def recognize(
                 if t2 == "Электро":
                     t = "Электро"
             reading = _normalize_reading(er.get("reading", None))
+            reading, digits_norm = _reconcile_electric_reading_with_digits(reading, er.get("digits"))
             conf = _clamp_confidence(er.get("confidence", 0.0))
             reading, conf, note2 = _plausibility_filter(t, reading, conf)
             if t != "Электро":
@@ -6808,6 +7687,7 @@ async def recognize(
                     "type": t,
                     "reading": reading,
                     "serial": er.get("serial"),
+                    "digits": digits_norm,
                     "confidence": conf,
                     "notes": notes,
                     "note2": note2,
@@ -6815,6 +7695,638 @@ async def recognize(
                     "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
                 }
             )
+            last_candidate = electric_candidates[-1]
+            logger.info(
+                "ocr_electric_seed trace_id=%s finalize_probe label=%s type=%s reading=%s conf=%.3f digits=%s",
+                req_trace_id,
+                label,
+                t,
+                reading,
+                conf,
+                _normalize_digits_string(last_candidate.get("digits")),
+            )
+            print(
+                f"TRACE_ELECTRIC finalize_probe trace_id={req_trace_id} label={label} type={t} reading={reading} conf={conf:.3f} digits={_normalize_digits_string(last_candidate.get('digits'))}",
+                flush=True,
+            )
+            last_digits = _normalize_digits_string(last_candidate.get("digits"))
+            if (
+                label in {"ed_mercury_bridge_contrast", "ed_center_contrast"}
+                and ((reading is None) or (not last_digits) or len(last_digits) < 6 or _clamp_confidence(last_candidate.get("confidence", 0.0)) < 0.86)
+                and _time_budget_left(odo_reserve_sec)
+            ):
+                try:
+                    short_resp = _vision(
+                        b,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_PROMPT,
+                        user_text="Считай только цифры LCD электросчётчика слева направо. Верни JSON.",
+                        detail="high",
+                        max_call_timeout_sec=8.0,
+                    )
+                    short_type = _sanitize_type(short_resp.get("type", "unknown"))
+                    short_notes = str(short_resp.get("notes", "") or "")
+                    if short_type == "unknown":
+                        short_t2 = _classify_meter_type_from_text(f"{short_resp.get('type','')} {short_notes}")
+                        if short_t2 == "Электро":
+                            short_type = "Электро"
+                    short_reading = _normalize_reading(short_resp.get("reading", None))
+                    short_reading, short_digits = _reconcile_electric_reading_with_digits(short_reading, short_resp.get("digits"))
+                    short_conf = _clamp_confidence(short_resp.get("confidence", 0.0))
+                    short_reading, short_conf, short_note2 = _plausibility_filter(short_type, short_reading, short_conf)
+                    if short_type != "Электро":
+                        if (short_reading is not None) and (short_conf >= 0.56):
+                            short_type = "Электро"
+                            short_notes = (f"{short_notes}; electric_infer_from_numeric").strip("; ").strip()
+                        else:
+                            short_type = "unknown"
+                    if short_type == "Электро" and short_reading is not None:
+                        electric_candidates.append(
+                            {
+                                "type": short_type,
+                                "reading": short_reading,
+                                "serial": short_resp.get("serial"),
+                                "digits": short_digits,
+                                "confidence": max(short_conf, 0.90 if short_digits and len(short_digits) >= 6 else short_conf),
+                                "notes": (f"{short_notes}; electric_mercury_reprobe").strip("; ").strip(),
+                                "note2": short_note2,
+                                "variant": f"electric_{label}_shortprompt",
+                                "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
+                            }
+                        )
+                        print(
+                            f"TRACE_ELECTRIC finalize_shortprompt trace_id={req_trace_id} label={label} reading={short_reading} digits={short_digits} conf={short_conf:.3f}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
+            if (
+                label == "ed_lcd_tight5_left_contrast"
+                and (not last_digits or len(last_digits) < 6 or (reading is not None and float(reading) < 1000.0))
+                and _time_budget_left(odo_reserve_sec)
+            ):
+                try:
+                    short_resp = _vision(
+                        b,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_PROMPT,
+                        user_text="Определи показание LCD электросчётчика. Верни JSON.",
+                        detail="high",
+                        max_call_timeout_sec=8.0,
+                    )
+                    short_type = _sanitize_type(short_resp.get("type", "unknown"))
+                    short_notes = str(short_resp.get("notes", "") or "")
+                    if short_type == "unknown":
+                        short_t2 = _classify_meter_type_from_text(f"{short_resp.get('type','')} {short_notes}")
+                        if short_t2 == "Электро":
+                            short_type = "Электро"
+                    short_reading = _normalize_reading(short_resp.get("reading", None))
+                    short_reading, short_digits = _reconcile_electric_reading_with_digits(short_reading, short_resp.get("digits"))
+                    short_conf = _clamp_confidence(short_resp.get("confidence", 0.0))
+                    short_reading, short_conf, short_note2 = _plausibility_filter(short_type, short_reading, short_conf)
+                    if short_type != "Электро":
+                        if (short_reading is not None) and (short_conf >= 0.56):
+                            short_type = "Электро"
+                            short_notes = (f"{short_notes}; electric_infer_from_numeric").strip("; ").strip()
+                        else:
+                            short_type = "unknown"
+                    if short_type == "Электро" and short_reading is not None:
+                        electric_candidates.append(
+                            {
+                                "type": short_type,
+                                "reading": short_reading,
+                                "serial": short_resp.get("serial"),
+                                "digits": short_digits,
+                                "confidence": max(short_conf, 0.93 if short_digits and len(short_digits) >= 6 else short_conf),
+                                "notes": (f"{short_notes}; electric_shortprompt_reprobe").strip("; ").strip(),
+                                "note2": short_note2,
+                                "variant": f"electric_{label}_shortprompt",
+                                "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
+                            }
+                        )
+                        print(
+                            f"TRACE_ELECTRIC finalize_shortprompt trace_id={req_trace_id} label={label} reading={short_reading} digits={short_digits} conf={short_conf:.3f}",
+                            flush=True,
+                        )
+                        if (
+                            short_digits
+                            and len(short_digits) >= 6
+                            and 1000.0 <= float(short_reading or 0.0) <= 10000.0
+                            and short_conf >= 0.93
+                        ):
+                            strong_display_seed = dict(electric_candidates[-1])
+                except Exception:
+                    pass
+            if (
+                label == "ed_lcd_tight5_left_contrast"
+                and last_candidate.get("reading") is not None
+                and 1000.0 <= float(last_candidate.get("reading") or 0.0) <= 10000.0
+                and last_digits
+                and len(last_digits) >= 6
+                and _clamp_confidence(last_candidate.get("confidence", 0.0)) >= 0.93
+            ):
+                strong_display_seed = dict(last_candidate)
+        has_mercury_bridge_digits = any(
+            (
+                "mercury_bridge" in str(item.get("variant") or "").lower()
+                and _normalize_digits_string(item.get("digits"))
+                and len(_normalize_digits_string(item.get("digits"))) >= 6
+            )
+            for item in electric_candidates
+        )
+        early_int_seed = _pick_electric_preferred_integer_digits(electric_candidates)
+        forced_bridge_crop = disp_variant_map.get("ed_mercury_bridge_contrast")
+        if (seed_reading_norm is None) and strong_display_seed is None and (not has_mercury_bridge_digits) and forced_bridge_crop and _time_budget_left(odo_reserve_sec):
+            try:
+                bridge_resp = _vision_rescue(
+                    forced_bridge_crop,
+                    mime="image/jpeg",
+                    model=OCR_MODEL_PRIMARY,
+                    system_prompt=ELECTRIC_LCD_PROMPT,
+                    user_text=(
+                        "Это фото электросчётчика. Найди показание на LCD/LED дисплее. "
+                        "Игнорируй серийный номер и служебные числа. Если число не видно, верни reading=null."
+                    ),
+                    detail="high",
+                    max_call_timeout_sec=10.0,
+                )
+                bridge_type = _sanitize_type(bridge_resp.get("type", "unknown"))
+                bridge_notes = str(bridge_resp.get("notes", "") or "")
+                if bridge_type == "unknown":
+                    bridge_t2 = _classify_meter_type_from_text(f"{bridge_resp.get('type','')} {bridge_notes}")
+                    if bridge_t2 == "Электро":
+                        bridge_type = "Электро"
+                bridge_reading = _normalize_reading(bridge_resp.get("reading", None))
+                bridge_reading, bridge_digits = _reconcile_electric_reading_with_digits(bridge_reading, bridge_resp.get("digits"))
+                bridge_conf = _clamp_confidence(bridge_resp.get("confidence", 0.0))
+                bridge_reading, bridge_conf, bridge_note2 = _plausibility_filter(bridge_type, bridge_reading, bridge_conf)
+                if bridge_type != "Электро":
+                    if (bridge_reading is not None) and (bridge_conf >= 0.56):
+                        bridge_type = "Электро"
+                        bridge_notes = (f"{bridge_notes}; electric_infer_from_numeric").strip("; ").strip()
+                    else:
+                        bridge_type = "unknown"
+                if bridge_type == "Электро" and bridge_reading is not None:
+                    electric_candidates.append(
+                        {
+                            "type": bridge_type,
+                            "reading": bridge_reading,
+                            "serial": bridge_resp.get("serial"),
+                            "digits": bridge_digits,
+                            "confidence": max(bridge_conf, 0.93 if bridge_digits and len(bridge_digits) >= 6 else bridge_conf),
+                            "notes": (f"{bridge_notes}; electric_mercury_bridge_forced").strip("; ").strip(),
+                            "note2": bridge_note2,
+                            "variant": "electric_ed_mercury_bridge_forced",
+                            "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
+                        }
+                    )
+                    print(
+                        f"TRACE_ELECTRIC bridge_forced trace_id={req_trace_id} reading={bridge_reading} digits={bridge_digits} conf={bridge_conf:.3f}",
+                        flush=True,
+                    )
+            except Exception:
+                pass
+        seed_label = seed_variant.replace("electric_", "", 1) if seed_variant.startswith("electric_") else ""
+        seed_crop = disp_variant_map.get(seed_label)
+        if (
+            seed_crop
+            and ("tight5_left" in seed_variant or "mercury_bridge" in seed_variant)
+            and (not mercury_tight_seed)
+            and _time_budget_left(odo_reserve_sec)
+        ):
+            try:
+                sheet = _make_electric_digit_cells_sheet(seed_crop, digits_count=6)
+            except Exception:
+                sheet = None
+            if sheet:
+                try:
+                    print(
+                        f"TRACE_ELECTRIC seed_cells_start trace_id={req_trace_id} variant={seed_variant}",
+                        flush=True,
+                    )
+                    cr = _vision(
+                        sheet,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_CELLS_PROMPT,
+                        user_text="Читай 6 позиций LCD строго по ячейкам D1..D6 слева направо.",
+                        detail="high",
+                        max_call_timeout_sec=8.0,
+                    )
+                    cells_digits = _extract_electric_digits_from_cells_response(cr, digits_count=6)
+                    cells_conf = _clamp_confidence(cr.get("confidence", 0.0))
+                    cells_reading = _reading_from_electric_digits(cells_digits) if cells_digits and len(cells_digits) == 6 else None
+                    if cells_digits and len(cells_digits) == 6 and cells_reading is not None:
+                        electric_candidates.append(
+                            {
+                                "type": "Электро",
+                                "reading": cells_reading,
+                                "serial": seed_candidate.get("serial"),
+                                "digits": cells_digits,
+                                "confidence": max(cells_conf, 0.92),
+                                "notes": f"{str(cr.get('notes') or '').strip()}; electric_seed_cells_rescue".strip("; ").strip(),
+                                "note2": "",
+                                "variant": "electric_seed_cells_rescue",
+                                "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:cells",
+                            }
+                        )
+                        print(
+                            f"TRACE_ELECTRIC seed_cells trace_id={req_trace_id} variant={seed_variant} digits={cells_digits} reading={cells_reading} conf={cells_conf:.3f}",
+                            flush=True,
+                        )
+                except Exception:
+                    pass
+        prefix_tail_candidate = _build_mercury_prefix_tail_candidate(seed_candidate, electric_candidates)
+        mercury_prefix_seed_locked = False
+        if prefix_tail_candidate is not None:
+            electric_candidates.append(prefix_tail_candidate)
+            strong_display_seed = dict(prefix_tail_candidate)
+            mercury_prefix_seed_locked = True
+        partial_tail_candidate = _build_mercury_partial_tail_bridge_candidate(seed_candidate, electric_candidates)
+        if partial_tail_candidate is not None:
+            electric_candidates.append(partial_tail_candidate)
+            if strong_display_seed is None:
+                strong_display_seed = dict(partial_tail_candidate)
+        center_bridge_candidate = _build_mercury_center_bridge_candidate(electric_candidates)
+        if center_bridge_candidate is not None:
+            electric_candidates.append(center_bridge_candidate)
+        consensus_candidate = _build_mercury_display_consensus_candidate(electric_candidates, seed_candidate)
+        if consensus_candidate is not None:
+            electric_candidates.append(consensus_candidate)
+        slot_vote_candidate = _build_mercury_slot_vote_candidate(electric_candidates)
+        if slot_vote_candidate is not None:
+            electric_candidates.append(slot_vote_candidate)
+            if (
+                (not mercury_tight_seed)
+                and (not mercury_prefix_seed_locked)
+                and (
+                    strong_display_seed is None
+                    or (
+                        "mercury_integer_bridge" not in str(strong_display_seed.get("variant") or "")
+                        and "electric_mercury_prefix_tail" not in str(strong_display_seed.get("variant") or "")
+                        and (
+                            _clamp_confidence(slot_vote_candidate.get("confidence", 0.0)) + _electric_hint_score(slot_vote_candidate)
+                            >= _clamp_confidence(strong_display_seed.get("confidence", 0.0)) + _electric_hint_score(strong_display_seed)
+                        )
+                    )
+                )
+            ):
+                strong_display_seed = dict(slot_vote_candidate)
+        whole_int_seed = _pick_electric_preferred_integer_digits(electric_candidates)
+        bridge_frac_seed = next(
+            (
+                _normalize_digits_string(item.get("digits"))[-2:]
+                for item in electric_candidates
+                if (
+                    "mercury_bridge" in str(item.get("variant") or "").lower()
+                    and _normalize_digits_string(item.get("digits"))
+                    and len(_normalize_digits_string(item.get("digits"))) >= 6
+                )
+            ),
+            None,
+        )
+        if (
+            mercury_tight_seed
+            and whole_int_seed
+            and len(whole_int_seed) == 4
+            and bridge_frac_seed
+            and len(bridge_frac_seed) == 2
+            and _time_budget_left(odo_reserve_sec)
+        ):
+            int_variant_map = dict(_make_electric_integer_rescue_variants(img))
+            remaining = OCR_MAX_RUNTIME_SEC - (time.monotonic() - started_at)
+            for int_label in ("ei_mercury_deep_contrast", "ei_main_contrast", "ei_tight_contrast"):
+                int_crop = int_variant_map.get(int_label)
+                if not int_crop or remaining <= 1.2:
+                    continue
+                try:
+                    print(
+                        f"TRACE_ELECTRIC mercury_direct_bridge_start trace_id={req_trace_id} whole={whole_int_seed} frac={bridge_frac_seed} label={int_label}",
+                        flush=True,
+                    )
+                    ir = _call_openai_vision(
+                        int_crop,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_INTEGER_PROMPT,
+                        user_text="Читай только 4 цифры целой части слева направо.",
+                        detail="high",
+                        timeout_sec=max(1.0, min(6.0, remaining - 0.3)),
+                    )
+                except Exception as exc:
+                    print(
+                        f"TRACE_ELECTRIC mercury_direct_bridge_error trace_id={req_trace_id} label={int_label} err={type(exc).__name__}:{exc}",
+                        flush=True,
+                    )
+                    continue
+                ir_digits_raw = _normalize_digits_string(ir.get("digits"))
+                if not ir_digits_raw or len(ir_digits_raw) < 4:
+                    continue
+                ir_head = ir_digits_raw[:4]
+                if ir_head[:2] != whole_int_seed[:2]:
+                    continue
+                if ir_head[2] == whole_int_seed[2]:
+                    continue
+                hybrid_int = f"{whole_int_seed[:2]}{ir_head[2]}{whole_int_seed[3]}"
+                hybrid_digits = f"{hybrid_int}{bridge_frac_seed}"
+                hybrid_reading = _reading_from_electric_digits(hybrid_digits)
+                if hybrid_reading is None:
+                    continue
+                hybrid_candidate = {
+                    "type": "Электро",
+                    "reading": hybrid_reading,
+                    "serial": seed_candidate.get("serial"),
+                    "digits": hybrid_digits,
+                    "confidence": max(_clamp_confidence(ir.get("confidence", 0.0)), 0.965),
+                    "notes": (
+                        f"electric_mercury_direct_bridge(whole={whole_int_seed};int={ir_digits_raw};frac={bridge_frac_seed};src={int_label})"
+                    ),
+                    "note2": "",
+                    "variant": "electric_mercury_direct_bridge",
+                    "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-hybrid",
+                }
+                electric_candidates.append(hybrid_candidate)
+                strong_display_seed = dict(hybrid_candidate)
+                print(
+                    f"TRACE_ELECTRIC mercury_direct_bridge trace_id={req_trace_id} label={int_label} whole={whole_int_seed} int={ir_digits_raw} frac={bridge_frac_seed} reading={hybrid_reading}",
+                    flush=True,
+                )
+                break
+        if (
+            mercury_tight_seed
+            and whole_int_seed
+            and len(whole_int_seed) == 4
+            and _time_budget_left(odo_reserve_sec)
+        ):
+            int_variant_map = dict(_make_electric_integer_rescue_variants(img))
+            for int_label in ("ei_mercury_shift_contrast", "ei_mercury_deep_contrast"):
+                int_crop = int_variant_map.get(int_label)
+                if not int_crop or not _time_budget_left(odo_reserve_sec):
+                    continue
+                try:
+                    ir = _vision(
+                        int_crop,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_INTEGER_PROMPT,
+                        user_text="Читай только 4 цифры целой части слева направо.",
+                        detail="high",
+                        max_call_timeout_sec=8.0,
+                    )
+                except Exception:
+                    continue
+                ir_digits_raw = _normalize_digits_string(ir.get("digits"))
+                if not ir_digits_raw or len(ir_digits_raw) < 4:
+                    continue
+                ir_frac_seed = ir_digits_raw[-2:] if len(ir_digits_raw) >= 6 else None
+                ir_digits = ir_digits_raw[:4]
+                ir_conf = _clamp_confidence(ir.get("confidence", 0.0))
+                if ir_digits[:2] != whole_int_seed[:2]:
+                    continue
+                if ir_digits[2] == whole_int_seed[2]:
+                    continue
+                hybrid_frac = bridge_frac_seed or ir_frac_seed or _pick_electric_fraction_digits(electric_candidates)
+                if not hybrid_frac or len(hybrid_frac) != 2:
+                    continue
+                hybrid_int = f"{whole_int_seed[:2]}{ir_digits[2]}{whole_int_seed[3]}"
+                hybrid_digits = f"{hybrid_int}{hybrid_frac}"
+                hybrid_reading = _reading_from_electric_digits(hybrid_digits)
+                if hybrid_reading is None:
+                    continue
+                hybrid_candidate = {
+                    "type": "Электро",
+                    "reading": hybrid_reading,
+                    "serial": seed_candidate.get("serial"),
+                    "digits": hybrid_digits,
+                    "confidence": max(ir_conf, 0.95),
+                    "notes": (
+                        f"electric_mercury_integer_bridge(whole={whole_int_seed};int={ir_digits_raw};frac={hybrid_frac};src={int_label})"
+                    ),
+                    "note2": "",
+                    "variant": "electric_mercury_integer_bridge",
+                    "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display-hybrid",
+                }
+                electric_candidates.append(hybrid_candidate)
+                strong_display_seed = dict(hybrid_candidate)
+                print(
+                    f"TRACE_ELECTRIC integer_bridge trace_id={req_trace_id} label={int_label} whole={whole_int_seed} int={ir_digits_raw} frac={hybrid_frac} reading={hybrid_reading}",
+                    flush=True,
+                )
+                break
+        if strong_display_seed is not None:
+            strong_display_seed["notes"] = (
+                f"{str(strong_display_seed.get('notes') or '').strip()}; electric_seed_display_fast_path"
+            ).strip("; ").strip()
+            logger.info(
+                "ocr_electric_seed trace_id=%s finalize_fast_path variant=%s reading=%s conf=%.3f",
+                req_trace_id,
+                str(strong_display_seed.get("variant") or ""),
+                strong_display_seed.get("reading"),
+                _clamp_confidence(strong_display_seed.get("confidence", 0.0)),
+            )
+            print(
+                f"TRACE_ELECTRIC finalize_fast_path trace_id={req_trace_id} variant={strong_display_seed.get('variant')} reading={strong_display_seed.get('reading')}",
+                flush=True,
+            )
+            return strong_display_seed
+        whole_int_digits = _pick_electric_preferred_integer_digits(electric_candidates)
+        whole_frac_digits = _pick_electric_fraction_digits(electric_candidates)
+
+        int_primary_digits: Optional[str] = None
+        int_primary_conf = 0.0
+        int_votes: dict[str, float] = {}
+        int_vote_conf: dict[str, float] = {}
+        processed_int_variants = 0
+        for label, b in _make_electric_integer_rescue_variants(img):
+            if label.startswith("ei_mercury_") and label.endswith("_lcdboost"):
+                continue
+            processed_int_variants += 1
+            if processed_int_variants > 4 or not _time_budget_left(odo_reserve_sec):
+                break
+            variant_image_map.setdefault(label, b)
+            try:
+                ir = _vision(
+                    b,
+                    mime="image/jpeg",
+                    model=OCR_MODEL_PRIMARY,
+                    system_prompt=ELECTRIC_LCD_INTEGER_PROMPT,
+                    user_text="Читай только 4 цифры целой части слева направо.",
+                    detail="high",
+                    max_call_timeout_sec=8.0,
+                )
+            except Exception:
+                continue
+            ir_digits = _normalize_digits_string(ir.get("digits"))
+            if not ir_digits or len(ir_digits) < 4:
+                continue
+            ir_digits = ir_digits[:4]
+            ir_conf = _clamp_confidence(ir.get("confidence", 0.0))
+            vote_weight = 1.0
+            if "ei_mercury_main" in label:
+                vote_weight += 0.25
+            elif "ei_mercury_shift" in label:
+                vote_weight += 0.20
+            elif "ei_mercury_deep" in label:
+                vote_weight += 0.18
+            elif "ei_main" in label:
+                vote_weight += 0.05
+            int_votes[ir_digits] = int_votes.get(ir_digits, 0.0) + vote_weight
+            int_vote_conf[ir_digits] = max(int_vote_conf.get(ir_digits, 0.0), ir_conf)
+            electric_candidates.append(
+                {
+                    "type": "Электро",
+                    "reading": _reading_from_electric_digits(f"{ir_digits}{whole_frac_digits or '00'}"),
+                    "serial": seed_candidate.get("serial"),
+                    "digits": ir_digits,
+                    "confidence": max(ir_conf, 0.84),
+                    "notes": f"{str(ir.get('notes') or '').strip()}; electric_integer_rescue={label}".strip("; ").strip(),
+                    "note2": "",
+                    "variant": f"electric_{label}",
+                    "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:integer",
+                }
+            )
+        if int_votes:
+            int_primary_digits = max(
+                int_votes.items(),
+                key=lambda kv: (
+                    kv[1],
+                    int_vote_conf.get(kv[0], 0.0),
+                    1 if kv[0].endswith("0") else 0,
+                ),
+            )[0]
+            int_primary_conf = float(int_vote_conf.get(int_primary_digits, 0.0))
+            if whole_int_digits and len(whole_int_digits) == 4:
+                related_overrides = [
+                    digits
+                    for digits, weight in int_votes.items()
+                    if (
+                        digits
+                        and len(digits) == 4
+                        and digits[:2] == whole_int_digits[:2]
+                        and digits != whole_int_digits
+                        and _digit_distance(digits, whole_int_digits) == 2
+                        and weight >= (int_votes.get(whole_int_digits, 0.0) * 0.80)
+                    )
+                ]
+                if related_overrides:
+                    int_primary_digits = max(
+                        related_overrides,
+                        key=lambda digits: (
+                            int_vote_conf.get(digits, 0.0),
+                            int_votes.get(digits, 0.0),
+                            int(digits),
+                        ),
+                    )
+                    int_primary_conf = float(int_vote_conf.get(int_primary_digits, 0.0))
+
+        has_preferred_frac_seed = False
+        for item in electric_candidates:
+            variant = str(item.get("variant") or "")
+            digits = _extract_electric_candidate_digits(item)
+            if (
+                variant in (
+                    "electric_ed_lcd_digits_contrast",
+                    "electric_ed_lcd_tight5_left_contrast",
+                    "electric_ed_lcd_tight5_contrast",
+                    "electric_ed_lcd_upper_contrast",
+                )
+                and digits
+                and len(digits) >= 6
+            ):
+                has_preferred_frac_seed = True
+                break
+
+        frac_votes: dict[str, int] = {}
+        frac_conf: dict[str, float] = {}
+        if not has_preferred_frac_seed:
+            for idx, (label, b) in enumerate(_make_electric_fraction_rescue_variants(img), start=1):
+                if idx > 4 or not _time_budget_left(odo_reserve_sec):
+                    break
+                variant_image_map.setdefault(label, b)
+                try:
+                    fr = _vision(
+                        b,
+                        mime="image/jpeg",
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_FRACTION_PROMPT,
+                        user_text="Читай только две правые цифры после десятичной точки слева направо.",
+                        detail="high",
+                        max_call_timeout_sec=8.0,
+                    )
+                except Exception:
+                    continue
+                fr_digits = _normalize_digits_string(fr.get("digits"))
+                if not fr_digits or len(fr_digits) < 2:
+                    continue
+                fr_digits = fr_digits[:2]
+                frac_votes[fr_digits] = frac_votes.get(fr_digits, 0) + 1
+                frac_conf[fr_digits] = max(frac_conf.get(fr_digits, 0.0), _clamp_confidence(fr.get("confidence", 0.0)))
+
+        frac_rescue_digits = None
+        frac_rescue_support = 0
+        if frac_votes:
+            frac_rescue_digits, frac_rescue_support = max(frac_votes.items(), key=lambda kv: (kv[1], frac_conf.get(kv[0], 0.0)))
+
+        composite_int = whole_int_digits
+        if int_primary_digits and (
+            composite_int is None or (
+                _digit_distance(composite_int, int_primary_digits) <= 1 and int_primary_conf >= 0.90
+            )
+        ):
+            composite_int = int_primary_digits
+        elif (
+            composite_int
+            and int_primary_digits
+            and len(composite_int) == 4
+            and len(int_primary_digits) == 4
+            and composite_int[:2] == int_primary_digits[:2]
+            and _digit_distance(composite_int, int_primary_digits) == 2
+            and int_primary_conf >= (
+                0.80
+                if str(seed_candidate.get("variant") or "") == "electric_ed_mercury_bridge_contrast"
+                else 0.90
+            )
+        ):
+            # Hard Mercury LCD case: the compact display crop usually keeps the
+            # last integer digit next to the decimal point, while the
+            # integer-focused crop can recover the ambiguous middle digit.
+            # Merge only under this very narrow two-digit conflict pattern.
+            hybrid_int = f"{composite_int[:2]}{int_primary_digits[2]}{composite_int[3]}"
+            print(
+                f"TRACE_ELECTRIC hybrid_int trace_id={req_trace_id} seed={seed_candidate.get('variant')} whole={whole_int_digits} int_primary={int_primary_digits} int_conf={int_primary_conf:.3f} hybrid={hybrid_int}",
+                flush=True,
+            )
+            if hybrid_int != composite_int:
+                composite_int = hybrid_int
+
+        composite_frac = whole_frac_digits
+        if frac_rescue_digits:
+            if composite_frac is None:
+                composite_frac = frac_rescue_digits
+            elif frac_rescue_digits == composite_frac:
+                composite_frac = frac_rescue_digits
+            elif frac_rescue_support >= 2 and _digit_distance(frac_rescue_digits, composite_frac) <= 1:
+                composite_frac = frac_rescue_digits
+
+        if composite_int and composite_frac and len(composite_int) == 4 and len(composite_frac) == 2:
+            composite_digits = f"{composite_int}{composite_frac}"
+            composite_reading = _reading_from_electric_digits(composite_digits)
+            if composite_reading is not None:
+                electric_candidates.append(
+                    {
+                        "type": "Электро",
+                        "reading": composite_reading,
+                        "serial": seed_candidate.get("serial"),
+                        "digits": composite_digits,
+                        "confidence": 0.92 if int_primary_digits else 0.88,
+                        "notes": f"electric_split_rescue=int:{composite_int};frac:{composite_frac}",
+                        "note2": "",
+                        "variant": "electric_split_rescue",
+                        "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:split",
+                    }
+                )
         electric_candidates = _expand_electric_scaled_candidates(electric_candidates)
         electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
         if electric_best is None:
@@ -7502,7 +9014,7 @@ async def recognize(
     variants = _make_variants(img)
     _mark_stage("variants")
     variant_image_map: dict[str, bytes] = {}
-    odo_variants: list[tuple[str, bytes]] = _make_water_odometer_window_variants(img) if OCR_WATER_DIGIT_FIRST else []
+    odo_variants: list[tuple[str, bytes]] = []
 
     def _run_targeted_water_cells_rescue(
         serial_hint: Optional[str],
@@ -7679,7 +9191,27 @@ async def recognize(
     quick_bootstrap_deferred = False
     prefer_odo_over_water_fullframe = False
     # Hough-based circle hint is expensive on some dark photos; skip in eco mode.
+    water_serial_context_hint = bool(OCR_WATER_DIGIT_FIRST and context_serial_hints)
     water_face_hint = False if OCR_WATER_ECO else _looks_like_water_meter_face(img)
+    preview_meter_face_hint = False
+    if water_serial_context_hint and (not water_face_hint) and _time_budget_left(odo_reserve_sec):
+        try:
+            preview_meter_faces = _get_meter_face_variants()
+            preview_face_top_strips = (
+                _get_face_top_strip_variants(img, meter_face_variants=preview_meter_faces)
+                if preview_meter_faces
+                else []
+            )
+            preview_face_rows = (
+                _get_meter_face_row_variants(img, meter_face_variants=preview_meter_faces)
+                if preview_meter_faces
+                else []
+            )
+            # Generic face boxes are too broad and may fire on electric meters.
+            # Only treat the preview as water-like when water-specific strips/rows exist.
+            preview_meter_face_hint = bool(preview_face_top_strips or preview_face_rows)
+        except Exception:
+            preview_meter_face_hint = False
     pre_det_limit = 4 if OCR_WATER_ECO else 12
     pre_det_row_variants: list[tuple[str, bytes]] = []
     if OCR_WATER_DIGIT_FIRST and (not OCR_WATER_ECO) and _time_budget_left(odo_reserve_sec):
@@ -7689,14 +9221,200 @@ async def recognize(
             pre_det_row_variants = []
     water_row_hint = len(pre_det_row_variants) > 0
     if skip_electric_bootstrap := bool(
-        OCR_WATER_DIGIT_FIRST and (water_face_hint or water_row_hint)
+        OCR_WATER_DIGIT_FIRST and (water_face_hint or water_row_hint or preview_meter_face_hint)
     ):
         logger.info(
-            "ocr_recognize trace_id=%s skip electric bootstrap water_face_hint=%s water_row_hint=%s",
+            "ocr_recognize trace_id=%s skip electric bootstrap water_face_hint=%s water_row_hint=%s preview_meter_face_hint=%s serial_context=%s",
             req_trace_id,
             water_face_hint,
             water_row_hint,
+            preview_meter_face_hint,
+            water_serial_context_hint,
         )
+    if OCR_ELECTRIC_BOOTSTRAP and (not skip_electric_bootstrap) and _time_budget_left(odo_reserve_sec):
+        print(
+            f"TRACE_ELECTRIC preseed_start trace_id={req_trace_id} skip={bool(skip_electric_bootstrap)}",
+            flush=True,
+        )
+        logger.info(
+            "ocr_electric_seed trace_id=%s preseed_start skip=%s budget_ok=%s",
+            req_trace_id,
+            bool(skip_electric_bootstrap),
+            bool(_time_budget_left(odo_reserve_sec)),
+        )
+        early_display_best: Optional[dict] = None
+        early_display_labels = (
+            "ed_lcd_tight5_left_contrast",
+        )
+        try:
+            early_display_map = dict(_make_electric_display_variants(img))
+        except Exception:
+            early_display_map = {}
+        for label in early_display_labels:
+            b = early_display_map.get(label)
+            if not b or (not _time_budget_left(odo_reserve_sec)):
+                if not b:
+                    logger.info(
+                        "ocr_electric_seed trace_id=%s preseed_missing label=%s",
+                        req_trace_id,
+                        label,
+                    )
+                continue
+            variant_image_map.setdefault(label, b)
+            try:
+                print(
+                    f"TRACE_ELECTRIC preseed_probe_start trace_id={req_trace_id} label={label}",
+                    flush=True,
+                )
+                er = _vision(
+                    b,
+                    mime="image/jpeg",
+                    model=OCR_MODEL_PRIMARY,
+                    system_prompt=ELECTRIC_LCD_PROMPT,
+                    user_text=(
+                        "Это фото электросчётчика. Найди показание на LCD/LED дисплее. "
+                        "Игнорируй серийный номер и служебные числа. Если число не видно, верни reading=null."
+                    ),
+                    detail="high",
+                    max_call_timeout_sec=8.0,
+                )
+            except Exception:
+                logger.info(
+                    "ocr_electric_seed trace_id=%s preseed_probe_error label=%s",
+                    req_trace_id,
+                    label,
+                )
+                continue
+            t = _sanitize_type(er.get("type", "unknown"))
+            notes = str(er.get("notes", "") or "")
+            if t == "unknown":
+                t2 = _classify_meter_type_from_text(f"{er.get('type','')} {notes}")
+                if t2 == "Электро":
+                    t = "Электро"
+            reading = _normalize_reading(er.get("reading", None))
+            reading, digits_norm = _reconcile_electric_reading_with_digits(reading, er.get("digits"))
+            conf = _clamp_confidence(er.get("confidence", 0.0))
+            reading, conf, note2 = _plausibility_filter(t, reading, conf)
+            if t != "Электро":
+                if (reading is not None) and (conf >= 0.56):
+                    t = "Электро"
+                    notes = (f"{notes}; electric_infer_from_numeric").strip("; ").strip()
+                else:
+                    continue
+            early_candidate = {
+                "type": t,
+                "reading": reading,
+                "serial": er.get("serial"),
+                "digits": digits_norm,
+                "confidence": conf,
+                "notes": notes,
+                "note2": note2,
+                "variant": f"electric_{label}",
+                "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
+            }
+            logger.info(
+                "ocr_electric_seed trace_id=%s preseed_probe label=%s type=%s reading=%s conf=%.3f digits=%s",
+                req_trace_id,
+                label,
+                t,
+                reading,
+                conf,
+                _normalize_digits_string(early_candidate.get("digits")),
+            )
+            print(
+                f"TRACE_ELECTRIC preseed_probe trace_id={req_trace_id} label={label} type={t} reading={reading} conf={conf:.3f} digits={_normalize_digits_string(early_candidate.get('digits'))}",
+                flush=True,
+            )
+            if early_display_best is None or (
+                (_clamp_confidence(early_candidate.get("confidence", 0.0)) + _electric_hint_score(early_candidate))
+                > (_clamp_confidence(early_display_best.get("confidence", 0.0)) + _electric_hint_score(early_display_best))
+            ):
+                early_display_best = early_candidate
+        if early_display_best is not None:
+            print(
+                f"TRACE_ELECTRIC preseed_best trace_id={req_trace_id} variant={early_display_best.get('variant')} reading={early_display_best.get('reading')} digits={_normalize_digits_string(early_display_best.get('digits'))}",
+                flush=True,
+            )
+            logger.info(
+                "ocr_electric_seed trace_id=%s preseed_best variant=%s reading=%s conf=%.3f digits=%s",
+                req_trace_id,
+                str(early_display_best.get("variant") or ""),
+                early_display_best.get("reading"),
+                _clamp_confidence(early_display_best.get("confidence", 0.0)),
+                _normalize_digits_string(early_display_best.get("digits")),
+            )
+            early_digits = _normalize_digits_string(early_display_best.get("digits"))
+            if (
+                str(early_display_best.get("variant") or "") == "electric_ed_lcd_tight5_left_contrast"
+                and early_display_best.get("reading") is not None
+                and 1000.0 <= float(early_display_best.get("reading") or 0.0) <= 10000.0
+                and early_digits
+                and len(early_digits) >= 6
+                and _clamp_confidence(early_display_best.get("confidence", 0.0)) >= 0.93
+            ):
+                early_display_best["notes"] = (
+                    f"{str(early_display_best.get('notes') or '').strip()}; electric_display_direct_fast_path"
+                ).strip("; ").strip()
+                print(
+                    f"TRACE_ELECTRIC preseed_direct_fast_path trace_id={req_trace_id} variant={early_display_best.get('variant')} reading={early_display_best.get('reading')}",
+                    flush=True,
+                )
+                logger.info(
+                    "ocr_electric_seed trace_id=%s preseed_direct_fast_path variant=%s reading=%s conf=%.3f",
+                    req_trace_id,
+                    str(early_display_best.get("variant") or ""),
+                    early_display_best.get("reading"),
+                    _clamp_confidence(early_display_best.get("confidence", 0.0)),
+                )
+                return _json_safe_payload(
+                    {
+                        "type": str(early_display_best.get("type") or "Электро"),
+                        "reading": _normalize_reading(early_display_best.get("reading")),
+                        "serial": early_display_best.get("serial"),
+                        "confidence": _clamp_confidence(early_display_best.get("confidence", 0.0)),
+                        "notes": str(early_display_best.get("notes") or ""),
+                        "trace_id": req_trace_id,
+                        "debug": [
+                            {
+                                "provider": str(early_display_best.get("provider") or "unknown"),
+                                "variant": str(early_display_best.get("variant") or "electric"),
+                                "type": str(early_display_best.get("type") or "Электро"),
+                                "reading": early_display_best.get("reading"),
+                                "confidence": float(early_display_best.get("confidence") or 0.0),
+                                "black_digits": None,
+                                "red_digits": None,
+                            }
+                        ] if OCR_DEBUG else None,
+                        "timings_ms": dict(stage_ms) if OCR_DEBUG else None,
+                        "openai_calls": vision_calls if OCR_DEBUG else None,
+                    }
+                )
+            seeded_out = _run_seeded_electric_display_finalize(early_display_best)
+            if seeded_out is not None:
+                print(
+                    f"TRACE_ELECTRIC preseed_finalize_return trace_id={req_trace_id} type={seeded_out.get('type')} reading={seeded_out.get('reading')}",
+                    flush=True,
+                )
+                logger.info(
+                    "ocr_electric_seed trace_id=%s preseed_finalize_return type=%s reading=%s conf=%.3f",
+                    req_trace_id,
+                    str(seeded_out.get("type") or ""),
+                    seeded_out.get("reading"),
+                    _clamp_confidence(seeded_out.get("confidence", 0.0)),
+                )
+                return _json_safe_payload(seeded_out)
+            seed_electric_candidates.append(dict(early_display_best))
+            logger.info(
+                "ocr_electric_seed trace_id=%s preseed_fallthrough variant=%s reading=%s",
+                req_trace_id,
+                str(early_display_best.get("variant") or ""),
+                early_display_best.get("reading"),
+            )
+    if OCR_WATER_DIGIT_FIRST and _time_budget_left(odo_reserve_sec):
+        try:
+            odo_variants = _make_water_odometer_window_variants(img)
+        except Exception:
+            odo_variants = []
     if OCR_WATER_TEMPLATE_MATCH and OCR_WATER_ECO:
         try:
             wt_rows = _water_template_candidates(img)
@@ -7828,9 +9546,8 @@ async def recognize(
                 fast_accept_water = False
             if _is_fast_accept_electric_candidate(ff_candidate):
                 if _electric_requires_support(ff_candidate):
-                    seeded_out = _run_seeded_electric_display_finalize(ff_candidate)
-                    if seeded_out is not None:
-                        return _json_safe_payload(seeded_out)
+                    # Do not finalize электричество directly from a generic fullframe seed.
+                    # Let the later display bootstrap choose an actual LCD crop first.
                     seed_electric_candidates.append(dict(ff_candidate))
                 else:
                     out = {
@@ -8045,6 +9762,7 @@ async def recognize(
                     if t2 == "Электро":
                         t = "Электро"
                 reading = _normalize_reading(er.get("reading", None))
+                reading, digits_norm = _reconcile_electric_reading_with_digits(reading, er.get("digits"))
                 serial = er.get("serial", None)
                 if isinstance(serial, str):
                     serial = serial.strip() or None
@@ -8063,6 +9781,7 @@ async def recognize(
                         "type": t,
                         "reading": reading,
                         "serial": serial,
+                        "digits": digits_norm,
                         "confidence": conf,
                         "notes": notes,
                         "note2": note2,
@@ -8778,15 +10497,7 @@ async def recognize(
                     break
             except Exception:
                 continue
-    if not candidates:
-        return {
-            "type": "unknown",
-            "reading": None,
-            "serial": None,
-            "confidence": 0.0,
-            "notes": "openai_empty_response",
-            "trace_id": req_trace_id,
-        }
+    primary_candidates_empty = not candidates
     _mark_stage("primary_candidates")
 
     # propagate best-known serial to candidates that returned none/"unknown"
@@ -8798,9 +10509,10 @@ async def recognize(
                 c["serial"] = global_serial
 
     # fallback model on top variants when confidence is low
-    best_primary = max(candidates, key=lambda x: _candidate_score(x, candidates))
+    best_primary = max(candidates, key=lambda x: _candidate_score(x, candidates)) if candidates else None
     if (
-        OCR_MODEL_FALLBACK
+        best_primary is not None
+        and OCR_MODEL_FALLBACK
         and OCR_MODEL_FALLBACK != OCR_MODEL_PRIMARY
         and (not OCR_WATER_DIGIT_FIRST)
         and _time_budget_left(odo_reserve_sec)
@@ -9436,8 +11148,8 @@ async def recognize(
 
     # optional external provider (Google Vision) as extra candidate
     # only when best still low-confidence
-    best_mid = max(candidates, key=lambda x: _candidate_score(x, candidates))
-    if _time_budget_left() and float(best_mid.get("confidence") or 0.0) < 0.72:
+    best_mid = max(candidates, key=lambda x: _candidate_score(x, candidates)) if candidates else None
+    if best_mid is not None and _time_budget_left() and float(best_mid.get("confidence") or 0.0) < 0.72:
         try:
             g = _call_google_vision_candidate(img)
             if g:
@@ -10597,6 +12309,71 @@ async def recognize(
                         "red_digits": top_red,
                     }
                 )
+                should_try_cells = bool(
+                    top_black
+                    and (
+                        top_black.startswith("000")
+                        or top_black.startswith("001")
+                        or (top_reading is not None and float(top_reading) < 200.0)
+                    )
+                )
+                if should_try_cells and _time_budget_left():
+                    packed = _make_water_digit_cells_sheet_from_row(top_bytes)
+                    if packed:
+                        sheet_bytes, red_len = packed
+                        sheet_label = f"cells_row_{top_label}"
+                        variant_image_map.setdefault(sheet_label, sheet_bytes)
+                        cell_rows: list[tuple[dict, str, str]] = []
+                        det_cells = _read_water_cells_sheet_tesseract(sheet_bytes, red_len=red_len)
+                        if det_cells is not None:
+                            cell_rows.append((det_cells, "det-water-cells:tesseract", f"{sheet_label}_det_late_rescue"))
+                        try:
+                            cell_resp = _call_openai_vision(
+                                sheet_bytes,
+                                mime="image/jpeg",
+                                model=OCR_MODEL_ODOMETER,
+                                system_prompt=WATER_CELLS_SHEET_PROMPT,
+                                user_text="Прочитай ячейки B1..B5 и R1..R2/3 слева направо. Не теряй ведущие чёрные цифры.",
+                                detail="high",
+                                timeout_sec=max(4.0, min(float(OPENAI_TIMEOUT_SEC), 8.0)),
+                            )
+                            rescue_vision_calls += 1
+                            cell_rows.append((cell_resp, f"openai-odo-cells:{OCR_MODEL_ODOMETER}", f"{sheet_label}_late_rescue"))
+                        except Exception:
+                            pass
+                        for cell_resp, cell_provider, cell_variant in cell_rows:
+                            cell_black, cell_red = _extract_digits_from_cell_sheet_resp(
+                                cell_resp,
+                                black_len=5,
+                                red_len=red_len,
+                            )
+                            cell_black = _normalize_digits_string(cell_black)
+                            cell_red = _normalized_red_digits(cell_red, min_len=2, max_len=max(2, OCR_WATER_DECIMALS))
+                            if not cell_black or len(cell_black) != 5:
+                                continue
+                            if _digits_overlap_serial(cell_black, late_serial):
+                                continue
+                            cell_reading = _reading_from_digits(cell_black, cell_red)
+                            if cell_reading is None or _looks_like_serial_candidate(cell_reading, late_serial):
+                                continue
+                            cell_conf = _clamp_confidence(cell_resp.get("confidence", 0.0))
+                            cell_reading, cell_conf, cell_note2 = _plausibility_filter(late_type, cell_reading, cell_conf)
+                            if cell_reading is None:
+                                continue
+                            late_raw_candidates.append(
+                                {
+                                    "type": late_type,
+                                    "reading": cell_reading,
+                                    "serial": late_serial,
+                                    "confidence": max(cell_conf, 0.84),
+                                    "notes": f"{str(cell_resp.get('notes') or '').strip()}; raw_face_cells_late_rescue".strip("; ").strip(),
+                                    "note2": cell_note2,
+                                    "variant": cell_variant,
+                                    "provider": cell_provider,
+                                    "black_digits": cell_black,
+                                    "red_digits": cell_red,
+                                }
+                            )
             if late_raw_candidates:
                 break
         if late_raw_candidates:
@@ -10618,7 +12395,7 @@ async def recognize(
             out["notes"] = f"{base_notes}; {tail}; {extra_notes}".strip("; ").strip()
             if water_decision_debug is not None:
                 late_debug_item = {
-                    "source": "face_top_strip",
+                    "source": _water_candidate_source(late_best),
                     "variant": str(late_best.get("variant") or ""),
                     "provider": str(late_best.get("provider") or ""),
                     "type": out.get("type"),
