@@ -237,7 +237,7 @@ CURRENT_CHAT_ID: ContextVar[Optional[int]] = ContextVar("current_chat_id", defau
 SENT_BILL: set[Tuple[int, str]] = set()          # (chat_id, ym)
 PENDING_NOTICE: set[Tuple[int, str]] = set()     # (chat_id, ym)
 REMIND_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
-MEDIA_GROUP_BUFFER: Dict[Tuple[int, str], List[Tuple[int, bytes, str, str]]] = {}
+MEDIA_GROUP_BUFFER: Dict[Tuple[int, str], List[Tuple[int, types.Message, bytes, str, str]]] = {}
 MEDIA_GROUP_ANCHOR: Dict[Tuple[int, str], types.Message] = {}
 MEDIA_GROUP_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
 MEDIA_GROUP_PENDING: Dict[Tuple[int, str], int] = {}
@@ -1023,6 +1023,49 @@ async def _handle_file_message(
         await message.reply("Не удалось прочитать файл(ы). Пришлите фото ещё раз.", reply_markup=_kb_main())
         return _build_batch_result("error", reason="empty_payload")
 
+    payload_summary = [
+        {
+            "filename": str(fn or "file.bin"),
+            "bytes": len(b or b""),
+            "mime": str(mt or "application/octet-stream"),
+        }
+        for b, fn, mt in payloads
+    ]
+    logging.info(
+        "HANDLE_FILE start: chat_id=%s message_id=%s prefix=%r payloads=%s",
+        message.chat.id,
+        message.message_id,
+        response_prefix,
+        payload_summary,
+    )
+
+    async def _reply_here(label: str, text: str, **kwargs):
+        logging.info(
+            "HANDLE_FILE reply_start: chat_id=%s message_id=%s label=%s prefix=%r",
+            message.chat.id,
+            message.message_id,
+            label,
+            response_prefix,
+        )
+        try:
+            resp = await message.reply(text, **kwargs)
+            logging.info(
+                "HANDLE_FILE reply_done: chat_id=%s message_id=%s label=%s reply_message_id=%s",
+                message.chat.id,
+                message.message_id,
+                label,
+                getattr(resp, "message_id", None),
+            )
+            return resp
+        except Exception:
+            logging.exception(
+                "HANDLE_FILE reply_failed: chat_id=%s message_id=%s label=%s",
+                message.chat.id,
+                message.message_id,
+                label,
+            )
+            raise
+
     preview_bytes, preview_name, _preview_mime = payloads[0]
 
     ym = _current_ym()
@@ -1046,6 +1089,14 @@ async def _handle_file_message(
 
     try:
         try:
+            logging.info(
+                "HANDLE_FILE backend_start: chat_id=%s message_id=%s prefix=%r meter_index=%s payload_count=%s",
+                message.chat.id,
+                message.message_id,
+                response_prefix,
+                meter_index,
+                len(payloads),
+            )
             r = await _post_photo_event(
                 chat_id=message.chat.id,
                 telegram_username=username,
@@ -1055,22 +1106,62 @@ async def _handle_file_message(
                 meter_index_mode="auto",
                 file_payloads=payloads,
             )
+            logging.info(
+                "HANDLE_FILE backend_done: chat_id=%s message_id=%s prefix=%r http=%s trace_id=%s server_trace_id=%s",
+                message.chat.id,
+                message.message_id,
+                response_prefix,
+                r.get("status_code"),
+                r.get("trace_id"),
+                r.get("server_trace_id"),
+            )
         except requests.exceptions.ReadTimeout:
-            await message.reply(
+            await _reply_here(
+                "backend_timeout",
                 f"{response_prefix}Фото получено, но backend долго обрабатывает запрос (возможно загрузка на диск).\n"
                 "Если итоговый ответ не придёт в течение пары минут, отправьте фото ещё раз.",
                 reply_markup=_kb_main(),
             )
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s",
+                message.chat.id,
+                message.message_id,
+                "backend_timeout",
+            )
             return _build_batch_result("backend_timeout")
         except Exception:
-            await message.reply(
+            logging.exception(
+                "HANDLE_FILE backend_failed: chat_id=%s message_id=%s prefix=%r",
+                message.chat.id,
+                message.message_id,
+                response_prefix,
+            )
+            await _reply_here(
+                "backend_unavailable",
                 f"{response_prefix}Фото получено, но backend сейчас недоступен. Попробуйте ещё раз позже.",
                 reply_markup=_kb_main(),
+            )
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s",
+                message.chat.id,
+                message.message_id,
+                "backend_unavailable",
             )
             return _build_batch_result("backend_unavailable")
 
         if not r.get("ok"):
-            await message.reply(f"{response_prefix}Ошибка отправки в backend: HTTP {r.get('status_code')}", reply_markup=_kb_main())
+            await _reply_here(
+                "backend_http",
+                f"{response_prefix}Ошибка отправки в backend: HTTP {r.get('status_code')}",
+                reply_markup=_kb_main(),
+            )
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s status_code=%s",
+                message.chat.id,
+                message.message_id,
+                "backend_http",
+                r.get("status_code"),
+            )
             return _build_batch_result("backend_http", status_code=r.get("status_code"))
 
         js = r.get("json") or {}
@@ -1111,7 +1202,8 @@ async def _handle_file_message(
                     f"\n\nОпределили прибор: {resolved_type or '—'}"
                     + (f"\nСерийный номер: {ocr_serial}" if ocr_serial else "")
                 )
-            await message.reply(
+            await _reply_here(
+                "ocr_failed_manual",
                 f"{response_prefix}Фото получено, но не удалось распознать показания (нечётко/блики/обрезано).\n"
                 "Пожалуйста, пришлите фото лучшего качества.\n\n"
                 "Если удобнее — можно ввести вручную (только для незаполненных полей)."
@@ -1120,6 +1212,13 @@ async def _handle_file_message(
             )
             MANUAL_CTX[message.chat.id] = {"ym": ym, "step": "idle"}
             logging.info(f"MANUAL_CTX set for chat_id={message.chat.id} ym={ym!r} step='idle'")
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s trace_id=%s",
+                message.chat.id,
+                message.message_id,
+                "manual",
+                trace_id,
+            )
             return _build_batch_result("manual", resolved_type=resolved_type, serial=ocr_serial)
 
         if (meter_written is False) and (ocr_reading is not None):
@@ -1138,7 +1237,14 @@ async def _handle_file_message(
                 f"Значение выглядит спорным: мы отметили «Проверить» для администратора."
                 f"{serial_line}{conf_line}{reason_line}"
             )
-            await message.reply(msg, reply_markup=_kb_main())
+            await _reply_here("review", msg, reply_markup=_kb_main())
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s trace_id=%s",
+                message.chat.id,
+                message.message_id,
+                "review",
+                trace_id,
+            )
             return _build_batch_result("review", resolved_type=resolved_type, reading=shown_reading, serial=ocr_serial)
 
         shown_reading = ocr_reading
@@ -1156,7 +1262,7 @@ async def _handle_file_message(
             msg += f"\nПричина проверки: {review_reason}"
         if anomaly_info:
             msg += "\nЗначение выглядит подозрительным, но мы сохранили его и отметили «Проверить значение» для администратора."
-        await message.reply(msg, reply_markup=_kb_main())
+        await _reply_here("accepted", msg, reply_markup=_kb_main())
 
 
         dup = _extract_duplicate_info(js)
@@ -1176,7 +1282,7 @@ async def _handle_file_message(
                     reply_markup=_kb_main(),
                 )
             except Exception:
-                await message.reply(caption, reply_markup=_kb_main())
+                await _reply_here("duplicate_fallback", caption, reply_markup=_kb_main())
 
             bill = js.get("bill")
             if isinstance(bill, dict) and bill.get("reason") == "missing_photos":
@@ -1204,6 +1310,12 @@ async def _handle_file_message(
             meter_index=assigned,
         )
     finally:
+        logging.info(
+            "HANDLE_FILE finally: chat_id=%s message_id=%s prefix=%r",
+            message.chat.id,
+            message.message_id,
+            response_prefix,
+        )
         _cancel_background_task(delayed_notice_task)
 
 
@@ -1244,7 +1356,6 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
             len(items),
         )
         items = sorted(items, key=lambda x: x[0])
-        payloads_only = [(payload, filename, mime) for _mid, payload, filename, mime in items]
         if len(items) > 1:
             batch_notice_task = _start_delayed_progress_message(
                 key[0],
@@ -1257,27 +1368,48 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
                 key[1],
                 len(items),
             )
-            for idx, item in enumerate(payloads_only, start=1):
+            total_items = len(items)
+            for idx, (_mid, item_message, payload, filename, mime) in enumerate(items, start=1):
+                logging.info(
+                    "TG media_group item_start: chat_id=%s media_group_id=%s item=%s/%s message_id=%s filename=%s bytes=%s",
+                    key[0],
+                    key[1],
+                    idx,
+                    total_items,
+                    item_message.message_id,
+                    filename,
+                    len(payload),
+                )
                 try:
                     result = await _handle_file_message(
-                        anchor,
-                        file_payloads=[item],
-                        response_prefix=f"Фото {idx}/{len(payloads_only)}.\n",
+                        item_message,
+                        file_payloads=[(payload, filename, mime)],
+                        response_prefix=f"Фото {idx}/{total_items}.\n",
                         allow_long_progress=False,
                     )
                     if result:
                         batch_results.append(result)
+                    logging.info(
+                        "TG media_group item_done: chat_id=%s media_group_id=%s item=%s/%s message_id=%s result=%s",
+                        key[0],
+                        key[1],
+                        idx,
+                        total_items,
+                        item_message.message_id,
+                        (result or {}).get("status"),
+                    )
                 except Exception:
                     logging.exception(
                         "media_group item failed: chat_id=%s media_group_id=%s item=%s/%s",
                         key[0],
                         key[1],
                         idx,
-                        len(payloads_only),
+                        total_items,
                     )
                     batch_results.append(_build_batch_result("error", reason="handler_exception"))
         else:
-            await _handle_file_message(anchor, file_payloads=payloads_only)
+            _mid, item_message, payload, filename, mime = items[0]
+            await _handle_file_message(item_message, file_payloads=[(payload, filename, mime)])
         summary_text = _build_batch_summary(batch_results)
         if summary_text:
             await _safe_progress_message(key[0], summary_text)
@@ -1393,6 +1525,7 @@ async def _download_and_queue_media_group_photo(
         MEDIA_GROUP_BUFFER.setdefault(key, []).append(
             (
                 int(message.message_id),
+                message,
                 payload,
                 f"photo_{file_unique_id}.jpg",
                 "image/jpeg",
