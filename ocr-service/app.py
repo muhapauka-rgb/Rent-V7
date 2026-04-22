@@ -8,6 +8,7 @@ import uuid
 import logging
 import hashlib
 import threading
+import math
 from collections import Counter
 from io import BytesIO
 from datetime import datetime
@@ -434,6 +435,9 @@ ELECTRIC_LCD_PROMPT = """Ты — OCR для ЭЛЕКТРОСЧЕТЧИКА (LCD
 Правила:
 - Читай ТОЛЬКО число на экране дисплея (темный прямоугольник с крупными сегментными цифрами).
 - Игнорируй серийный номер, наклейки, кнопки, светодиоды и любой текст вне экрана.
+- Число на дисплее — это одна непрерывная строка цифр. Нельзя "отрезать" левую часть строки,
+  если слева на том же экране видны еще цифры.
+- Нельзя менять порядок соседних цифр в середине строки. Читай позиции слева направо как на экране.
 - Не добавляй лишние ведущие/хвостовые цифры, которых нет на дисплее.
 - Если на дисплее есть десятичная точка — сохрани дробную часть.
 - Если число не видно уверенно, верни reading=null.
@@ -626,6 +630,20 @@ def _clamp_confidence(value) -> float:
     if c > 1.0:
         c = 1.0
     return c
+
+
+def _json_safe_payload(value):
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe_payload(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_json_safe_payload(v) for v in value]
+    if isinstance(value, tuple):
+        return [_json_safe_payload(v) for v in value]
+    return value
 
 
 def _sanitize_type(t: str) -> str:
@@ -885,19 +903,36 @@ def _normalize_serial(value: Optional[str]) -> str:
 def _electric_hint_score(item: dict) -> float:
     txt = f"{item.get('type','')} {item.get('notes','')}".lower()
     variant = str(item.get("variant") or "").lower()
+    provider = str(item.get("provider") or "").lower()
     score = 0.0
     for token in ("квт", "kwh", "1.8.", "t1", "t2", "t3", "электро"):
         if token in txt:
             score += 0.08
+    if "orig_fullframe" in variant or variant.endswith("_fullframe"):
+        score -= 0.12
     if "focused_crop" in variant:
         score += 0.05
     if "center" in variant:
         score += 0.07
+    if "lcd_" in variant or ":display" in provider:
+        score += 0.10
+    if "det_lcd" in variant or "template" in variant:
+        score += 0.06
     if "mid_lcd" in variant:
         score -= 0.06
     if variant.endswith("_bw"):
         score -= 0.03
     return min(0.24, score)
+
+
+def _electric_requires_support(item: Optional[dict]) -> bool:
+    if not item:
+        return False
+    variant = str(item.get("variant") or "").lower()
+    provider = str(item.get("provider") or "").lower()
+    if ":display" in provider or "template" in variant or "det_" in variant or "tess" in variant:
+        return False
+    return ("orig_fullframe" in variant) or variant.endswith("_fullframe")
 
 
 def _pick_electric_bootstrap(candidates: list[dict]) -> tuple[Optional[dict], int]:
@@ -937,6 +972,8 @@ def _pick_electric_bootstrap(candidates: list[dict]) -> tuple[Optional[dict], in
     top_score, top, top_agree = ranked[0]
     top_conf = _clamp_confidence(top.get("confidence", 0.0))
     if top_conf >= 0.90:
+        if _electric_requires_support(top) and top_agree < 1:
+            return None, top_agree
         return top, top_agree
     if top_conf >= 0.72 and top_agree >= 1:
         return top, top_agree
@@ -1455,15 +1492,20 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
         return out
     try:
         w, h = img.size
+        per_band: list[list[tuple[str, bytes]]] = []
         bands = [
-            ("ed_mid", (0, int(h * 0.26), w, int(h * 0.72))),
-            ("ed_center", (int(w * 0.08), int(h * 0.22), int(w * 0.92), int(h * 0.78))),
-            ("ed_lower_mid", (0, int(h * 0.34), w, int(h * 0.82))),
+            ("ed_mercury_leftcore", (int(w * 0.05), int(h * 0.30), int(w * 0.74), int(h * 0.55))),
+            ("ed_mercury_centercore", (int(w * 0.06), int(h * 0.26), int(w * 0.70), int(h * 0.54))),
             # Tight LCD-first windows for Mercury-like meters:
-            # display is often on the left block, with strong glare/noise around.
-            ("ed_lcd_tight", (int(w * 0.10), int(h * 0.33), int(w * 0.78), int(h * 0.66))),
-            ("ed_lcd_wide", (int(w * 0.05), int(h * 0.30), int(w * 0.84), int(h * 0.70))),
-            ("ed_lcd_digits", (int(w * 0.14), int(h * 0.38), int(w * 0.70), int(h * 0.62))),
+            # display is often on the left block, with sticker/noise in the lower half.
+            ("ed_lcd_leftwide", (int(w * 0.02), int(h * 0.24), int(w * 0.82), int(h * 0.60))),
+            ("ed_lcd_upper", (int(w * 0.06), int(h * 0.24), int(w * 0.86), int(h * 0.58))),
+            ("ed_lcd_tight", (int(w * 0.10), int(h * 0.30), int(w * 0.78), int(h * 0.60))),
+            ("ed_lcd_digits", (int(w * 0.10), int(h * 0.34), int(w * 0.76), int(h * 0.58))),
+            ("ed_lcd_wide", (int(w * 0.05), int(h * 0.28), int(w * 0.84), int(h * 0.66))),
+            ("ed_center", (int(w * 0.08), int(h * 0.22), int(w * 0.92), int(h * 0.74))),
+            ("ed_mid", (0, int(h * 0.26), w, int(h * 0.70))),
+            ("ed_lower_mid", (0, int(h * 0.34), w, int(h * 0.80))),
         ]
         for base_label, (x1, y1, x2, y2) in bands:
             x1 = max(0, min(w - 1, x1))
@@ -1471,19 +1513,28 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
             x2 = max(x1 + 1, min(w, x2))
             y2 = max(y1 + 1, min(h, y2))
             crop = img.crop((x1, y1, x2, y2))
+            crop_np = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2BGR)
+            crop_np = _electric_mask_sticker(crop_np)
+            crop = Image.fromarray(cv2.cvtColor(crop_np, cv2.COLOR_BGR2RGB))
+            band_rows: list[tuple[str, bytes]] = []
+            is_mercury_core = base_label.startswith("ed_mercury_")
+            contrast_gain = 1.90 if is_mercury_core else 1.75
+            sharp_gain = 1.50 if is_mercury_core else 1.45
+            unsharp_percent = 240 if is_mercury_core else 220
+            jpeg_quality = 95 if is_mercury_core else 94
 
-            c1 = ImageEnhance.Contrast(crop).enhance(1.75)
-            c1 = ImageEnhance.Sharpness(c1).enhance(1.45)
-            c1 = c1.filter(ImageFilter.UnsharpMask(radius=1, percent=220, threshold=2))
-            out.append((f"{base_label}_contrast", _encode_jpeg(c1, quality=94)))
+            c1 = ImageEnhance.Contrast(crop).enhance(contrast_gain)
+            c1 = ImageEnhance.Sharpness(c1).enhance(sharp_gain)
+            c1 = c1.filter(ImageFilter.UnsharpMask(radius=1, percent=unsharp_percent, threshold=2))
+            band_rows.append((f"{base_label}_contrast", _encode_jpeg(c1, quality=jpeg_quality)))
 
             g = cv2.cvtColor(np.array(crop), cv2.COLOR_RGB2GRAY)
             g = cv2.GaussianBlur(g, (3, 3), 0)
             clahe = cv2.createCLAHE(clipLimit=2.8, tileGridSize=(8, 8))
             g2 = clahe.apply(g)
             rgb2 = Image.fromarray(cv2.cvtColor(g2, cv2.COLOR_GRAY2RGB))
-            rgb2 = ImageEnhance.Contrast(rgb2).enhance(1.38)
-            out.append((f"{base_label}_clahe", _encode_jpeg(rgb2, quality=94)))
+            rgb2 = ImageEnhance.Contrast(rgb2).enhance(1.46 if is_mercury_core else 1.38)
+            band_rows.append((f"{base_label}_clahe", _encode_jpeg(rgb2, quality=jpeg_quality)))
 
             bw = cv2.adaptiveThreshold(
                 g2,
@@ -1494,19 +1545,26 @@ def _make_electric_display_variants(img_bytes: bytes) -> list[tuple[str, bytes]]
                 6,
             )
             rgb3 = Image.fromarray(cv2.cvtColor(bw, cv2.COLOR_GRAY2RGB))
-            out.append((f"{base_label}_bw", _encode_jpeg(rgb3, quality=94)))
+            band_rows.append((f"{base_label}_bw", _encode_jpeg(rgb3, quality=jpeg_quality)))
 
             # LCD-dark enhancement: brighten dark screen while suppressing dust texture.
             g3 = cv2.GaussianBlur(g2, (0, 0), 1.0)
             g3 = cv2.addWeighted(g2, 1.45, g3, -0.45, 0)
             g3 = cv2.normalize(g3, None, 0, 255, cv2.NORM_MINMAX)
             rgb4 = Image.fromarray(cv2.cvtColor(g3, cv2.COLOR_GRAY2RGB))
-            rgb4 = ImageEnhance.Contrast(rgb4).enhance(1.55)
-            out.append((f"{base_label}_lcd", _encode_jpeg(rgb4, quality=94)))
+            rgb4 = ImageEnhance.Contrast(rgb4).enhance(1.62 if is_mercury_core else 1.55)
+            band_rows.append((f"{base_label}_lcd", _encode_jpeg(rgb4, quality=jpeg_quality)))
+            per_band.append(band_rows)
+
+        max_len = max((len(rows) for rows in per_band), default=0)
+        for idx in range(max_len):
+            for rows in per_band:
+                if idx < len(rows):
+                    out.append(rows[idx])
 
     except Exception:
-        return out[:14]
-    return out[:14]
+        return out[:20]
+    return out[:20]
 
 
 _SEGMENT_DIGIT_BY_MASK: dict[int, int] = {
@@ -2786,8 +2844,9 @@ def _make_water_face_top_strip_raw_wide_variants(
             return out
         h, w = im.shape[:2]
         strips = [
+            (0.12, 0.08, 0.94, 0.33),
+            (0.16, 0.08, 0.92, 0.31),
             (0.22, 0.09, 0.89, 0.29),
-            (0.24, 0.10, 0.88, 0.28),
         ]
         for idx, (x1f, y1f, x2f, y2f) in enumerate(strips, start=1):
             x1 = int(round(w * x1f))
@@ -2801,9 +2860,17 @@ def _make_water_face_top_strip_raw_wide_variants(
             pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
             pil = pil.resize((max(1, pil.width * 4), max(1, pil.height * 4)), Image.Resampling.LANCZOS)
             out.append((f"{prefix}_top_strip_rawwide_{idx}", _encode_jpeg(pil, quality=95)))
+            g = cv2.cvtColor(np.array(pil), cv2.COLOR_RGB2GRAY)
+            g = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(g)
+            out.append(
+                (
+                    f"{prefix}_top_strip_rawwide_clahe_{idx}",
+                    _encode_jpeg(Image.fromarray(cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)), quality=95),
+                )
+            )
     except Exception:
         return out
-    return out[:2]
+    return out[:6]
 
 
 def _make_water_blackhat_row_variants(img_bytes: bytes) -> list[tuple[str, bytes]]:
@@ -6332,6 +6399,44 @@ def _pick_red_digits_by_vote(
     return None
 
 
+def _reconstruct_water_black_from_context(
+    black_digits: Optional[str],
+    red_digits: Optional[str],
+    prev_values: list[float],
+) -> Optional[str]:
+    b = _normalize_digits_string(black_digits)
+    if not b or len(b) != 5 or not prev_values:
+        return None
+    if len(prev_values) != 1:
+        return None
+    if not b.startswith("00"):
+        return None
+    curr_read = _reading_from_digits(b, red_digits)
+    curr_dist = _nearest_prev_distance(curr_read, prev_values)
+    if not math.isfinite(curr_dist) or curr_dist < 150.0:
+        return None
+    nearest_prev = min((float(v) for v in prev_values), key=lambda v: abs(v - float(curr_read or 0.0)))
+    prev_int = int(nearest_prev)
+    prev_str = str(prev_int).zfill(5)[-5:]
+    best_black: Optional[str] = None
+    best_dist = curr_dist
+    for keep_suffix in range(1, len(b)):
+        prefix_len = len(b) - keep_suffix
+        candidate = prev_str[:prefix_len] + b[prefix_len:]
+        if candidate == b:
+            continue
+        reading = _reading_from_digits(candidate, red_digits)
+        if reading is None:
+            continue
+        if abs(int(reading) - prev_int) > 250:
+            continue
+        dist = _nearest_prev_distance(reading, prev_values)
+        if dist + 1.0 < best_dist:
+            best_dist = dist
+            best_black = candidate
+    return best_black
+
+
 def _has_red_disagreement_for_integer(candidates: list[dict], target_int: Optional[int]) -> bool:
     votes, counts, _ = _collect_red_votes_for_integer(candidates, target_int=target_int)
     if not votes:
@@ -6593,6 +6698,7 @@ async def recognize(
 
     # Keep a small reserve for late odometer/cells stages on hard photos.
     odo_reserve_sec = 4.0 if OCR_WATER_DIGIT_FIRST else 0.0
+    seed_electric_candidates: list[dict] = []
 
     def _time_budget_left(min_remaining_sec: float = 0.0) -> bool:
         budget = max(1.0, OCR_MAX_RUNTIME_SEC - max(0.0, min_remaining_sec))
@@ -6659,6 +6765,99 @@ async def recognize(
             detail=detail,
             timeout_sec=call_timeout,
         )
+
+    def _run_seeded_electric_display_finalize(seed_candidate: dict) -> Optional[dict]:
+        electric_candidates: list[dict] = [dict(seed_candidate)]
+        disp_variants = _make_electric_display_variants(img)
+        for label, b in disp_variants[:4]:
+            if not _time_budget_left(odo_reserve_sec):
+                break
+            variant_image_map.setdefault(label, b)
+            try:
+                er = _vision(
+                    b,
+                    mime="image/jpeg",
+                    model=OCR_MODEL_PRIMARY,
+                    system_prompt=ELECTRIC_LCD_PROMPT,
+                    user_text=(
+                        "Это фото электросчётчика. Найди показание на LCD/LED дисплее. "
+                        "Игнорируй серийный номер и служебные числа. Если число не видно, верни reading=null."
+                    ),
+                    detail="high",
+                    max_call_timeout_sec=8.0,
+                )
+            except Exception:
+                continue
+            t = _sanitize_type(er.get("type", "unknown"))
+            notes = str(er.get("notes", "") or "")
+            if t == "unknown":
+                t2 = _classify_meter_type_from_text(f"{er.get('type','')} {notes}")
+                if t2 == "Электро":
+                    t = "Электро"
+            reading = _normalize_reading(er.get("reading", None))
+            conf = _clamp_confidence(er.get("confidence", 0.0))
+            reading, conf, note2 = _plausibility_filter(t, reading, conf)
+            if t != "Электро":
+                if (reading is not None) and (conf >= 0.56):
+                    t = "Электро"
+                    notes = (f"{notes}; electric_infer_from_numeric").strip("; ").strip()
+                else:
+                    continue
+            electric_candidates.append(
+                {
+                    "type": t,
+                    "reading": reading,
+                    "serial": er.get("serial"),
+                    "confidence": conf,
+                    "notes": notes,
+                    "note2": note2,
+                    "variant": f"electric_{label}",
+                    "provider": f"openai-electric:{OCR_MODEL_PRIMARY}:display",
+                }
+            )
+        electric_candidates = _expand_electric_scaled_candidates(electric_candidates)
+        electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
+        if electric_best is None:
+            electric_best, electric_agree = _pick_electric_bootstrap_relaxed(electric_candidates)
+        if electric_best is None:
+            return None
+        e_label = str(electric_best.get("variant") or "electric")
+        e_conf = _clamp_confidence(
+            float(electric_best.get("confidence") or 0.0) + min(0.12, 0.04 * float(electric_agree))
+        )
+        e_notes = str(electric_best.get("notes") or "").strip()
+        e_provider = str(electric_best.get("provider") or "openai-electric")
+        e_tail = f"provider={e_provider}; variant={e_label}; agree={electric_agree+1}/{len(electric_candidates)}; electric_seeded_display"
+        e_notes = f"{e_notes}; {e_tail}".strip("; ").strip()[:240]
+        out = {
+            "type": "Электро",
+            "reading": _normalize_reading(electric_best.get("reading")),
+            "serial": electric_best.get("serial"),
+            "confidence": e_conf,
+            "notes": e_notes,
+            "trace_id": req_trace_id,
+        }
+        if OCR_DEBUG:
+            ranked_e = sorted(
+                electric_candidates,
+                key=lambda x: _clamp_confidence(x.get("confidence", 0.0)) + _electric_hint_score(x),
+                reverse=True,
+            )[:12]
+            out["debug"] = [
+                {
+                    "provider": str(c.get("provider") or "unknown"),
+                    "variant": str(c.get("variant") or "orig"),
+                    "type": str(c.get("type") or "unknown"),
+                    "reading": c.get("reading"),
+                    "confidence": float(c.get("confidence") or 0.0),
+                    "black_digits": c.get("black_digits"),
+                    "red_digits": c.get("red_digits"),
+                }
+                for c in ranked_e
+            ]
+            out["timings_ms"] = dict(stage_ms)
+            out["openai_calls"] = vision_calls + rescue_vision_calls
+        return out
 
     water_dial_variants_cache: Optional[list[tuple[str, bytes]]] = None
     meter_face_variants_cache: Optional[list[tuple[str, bytes]]] = None
@@ -7220,31 +7419,31 @@ async def recognize(
             except Exception:
                 water_best = None
         if det_best is not None and float(det_best.get("confidence") or 0.0) >= 0.5:
-            return {
+            return _json_safe_payload({
                 "type": "Электро",
                 "reading": _normalize_reading(det_best.get("reading")),
                 "serial": None,
                 "confidence": _clamp_confidence(det_best.get("confidence", 0.0)),
                 "notes": "openai_disabled; deterministic_fallback",
                 "trace_id": req_trace_id,
-            }
+            })
         if water_best is not None and float(water_best.get("confidence") or 0.0) >= 0.70:
-            return {
+            return _json_safe_payload({
                 "type": str(water_best.get("type") or "unknown"),
                 "reading": _normalize_reading(water_best.get("reading")),
                 "serial": water_best.get("serial"),
                 "confidence": _clamp_confidence(water_best.get("confidence", 0.0)),
                 "notes": "openai_disabled; water_template_fallback",
                 "trace_id": req_trace_id,
-            }
-        return {
+            })
+        return _json_safe_payload({
             "type": "unknown",
             "reading": None,
             "serial": None,
             "confidence": 0.0,
             "notes": "openai_disabled",
             "trace_id": req_trace_id,
-        }
+        })
 
     # Budget guard: when provider quota is exhausted, skip expensive OpenAI pipeline.
     if _openai_is_blocked_now():
@@ -7265,31 +7464,31 @@ async def recognize(
             except Exception:
                 water_best = None
         if det_best is not None and float(det_best.get("confidence") or 0.0) >= 0.5:
-            return {
+            return _json_safe_payload({
                 "type": "Электро",
                 "reading": _normalize_reading(det_best.get("reading")),
                 "serial": None,
                 "confidence": _clamp_confidence(det_best.get("confidence", 0.0)),
                 "notes": "openai_quota_cooldown; deterministic_fallback",
                 "trace_id": req_trace_id,
-            }
+            })
         if water_best is not None and float(water_best.get("confidence") or 0.0) >= 0.70:
-            return {
+            return _json_safe_payload({
                 "type": str(water_best.get("type") or "unknown"),
                 "reading": _normalize_reading(water_best.get("reading")),
                 "serial": water_best.get("serial"),
                 "confidence": _clamp_confidence(water_best.get("confidence", 0.0)),
                 "notes": "openai_quota_cooldown; water_template_fallback",
                 "trace_id": req_trace_id,
-            }
-        return {
+            })
+        return _json_safe_payload({
             "type": "unknown",
             "reading": None,
             "serial": None,
             "confidence": 0.0,
             "notes": "openai_quota_cooldown",
             "trace_id": req_trace_id,
-        }
+        })
 
     mime = _guess_mime(file.filename, file.content_type)
     logger.info(
@@ -7628,29 +7827,35 @@ async def recognize(
                 # the odometer-window path. Do not short-circuit before the drum rescue gets a chance.
                 fast_accept_water = False
             if _is_fast_accept_electric_candidate(ff_candidate):
-                out = {
-                    "type": str(ff_candidate.get("type") or "unknown"),
-                    "reading": _normalize_reading(ff_candidate.get("reading")),
-                    "serial": ff_candidate.get("serial"),
-                    "confidence": _clamp_confidence(ff_candidate.get("confidence", 0.0)),
-                    "notes": str(ff_candidate.get("notes", "") or ""),
-                    "trace_id": req_trace_id,
-                }
-                if OCR_DEBUG:
-                    out["debug"] = [
-                        {
-                            "provider": str(ff_candidate.get("provider") or "unknown"),
-                            "variant": str(ff_candidate.get("variant") or "orig"),
-                            "type": str(ff_candidate.get("type") or "unknown"),
-                            "reading": ff_candidate.get("reading"),
-                            "confidence": float(ff_candidate.get("confidence") or 0.0),
-                            "black_digits": ff_candidate.get("black_digits"),
-                            "red_digits": ff_candidate.get("red_digits"),
-                        }
-                    ]
-                    out["timings_ms"] = dict(stage_ms)
-                    out["openai_calls"] = vision_calls + rescue_vision_calls
-                return out
+                if _electric_requires_support(ff_candidate):
+                    seeded_out = _run_seeded_electric_display_finalize(ff_candidate)
+                    if seeded_out is not None:
+                        return _json_safe_payload(seeded_out)
+                    seed_electric_candidates.append(dict(ff_candidate))
+                else:
+                    out = {
+                        "type": str(ff_candidate.get("type") or "unknown"),
+                        "reading": _normalize_reading(ff_candidate.get("reading")),
+                        "serial": ff_candidate.get("serial"),
+                        "confidence": _clamp_confidence(ff_candidate.get("confidence", 0.0)),
+                        "notes": str(ff_candidate.get("notes", "") or ""),
+                        "trace_id": req_trace_id,
+                    }
+                    if OCR_DEBUG:
+                        out["debug"] = [
+                            {
+                                "provider": str(ff_candidate.get("provider") or "unknown"),
+                                "variant": str(ff_candidate.get("variant") or "orig"),
+                                "type": str(ff_candidate.get("type") or "unknown"),
+                                "reading": ff_candidate.get("reading"),
+                                "confidence": float(ff_candidate.get("confidence") or 0.0),
+                                "black_digits": ff_candidate.get("black_digits"),
+                                "red_digits": ff_candidate.get("red_digits"),
+                            }
+                        ]
+                        out["timings_ms"] = dict(stage_ms)
+                        out["openai_calls"] = vision_calls + rescue_vision_calls
+                    return _json_safe_payload(out)
             if (
                 any(
                     entry.get("reading") is not None
@@ -7758,7 +7963,7 @@ async def recognize(
                     ]
                     out["timings_ms"] = dict(stage_ms)
                     out["openai_calls"] = 0
-                return out
+                return _json_safe_payload(out)
     # AUTO mode: try deterministic electric path before expensive OpenAI bootstrap.
     if OCR_RUNTIME_MODE == "auto" and OCR_ELECTRIC_DETERMINISTIC and (not skip_electric_bootstrap):
         try:
@@ -7790,7 +7995,7 @@ async def recognize(
                     ]
                     out["timings_ms"] = dict(stage_ms)
                     out["openai_calls"] = 0
-                return out
+                return _json_safe_payload(out)
 
     # Electric bootstrap:
     # When digit-first water mode is enabled, generic passes are mostly skipped.
@@ -7813,68 +8018,77 @@ async def recognize(
             electric_variants.append((s_lbl, vb))
             seen_ev.add(s_lbl)
 
-        electric_candidates: list[dict] = []
-        for label, b in electric_variants[:OCR_ELECTRIC_BOOTSTRAP_VARIANTS]:
-            if not _time_budget_left(odo_reserve_sec):
-                break
-            variant_image_map.setdefault(label, b)
-            try:
-                er = _vision(
-                    b,
-                    mime=mime,
-                    model=OCR_MODEL_PRIMARY,
-                    system_prompt=ELECTRIC_LCD_PROMPT,
-                    user_text=(
-                        "Если это электросчётчик, верни type='Электро' и reading. "
-                        "Игнорируй серийный номер, напряжение и служебные цифры."
-                    ),
-                    max_call_timeout_sec=11.0,
-                )
-            except Exception:
-                continue
-            t = _sanitize_type(er.get("type", "unknown"))
-            notes = str(er.get("notes", "") or "")
-            if t == "unknown":
-                t2 = _classify_meter_type_from_text(f"{er.get('type','')} {notes}")
-                if t2 == "Электро":
-                    t = "Электро"
-            reading = _normalize_reading(er.get("reading", None))
-            serial = er.get("serial", None)
-            if isinstance(serial, str):
-                serial = serial.strip() or None
-            conf = _clamp_confidence(er.get("confidence", 0.0))
-            reading, conf, note2 = _plausibility_filter(t, reading, conf)
-            if t != "Электро":
-                # OCR type can be unknown on dusty LCD, but numeric value is still useful.
-                # Keep only reasonably confident numeric candidates.
-                if (reading is not None) and (conf >= 0.56):
-                    t = "Электро"
-                    notes = (f"{notes}; electric_infer_from_numeric").strip("; ").strip()
-                else:
+        electric_candidates: list[dict] = list(seed_electric_candidates)
+        if not seed_electric_candidates:
+            for label, b in electric_variants[:OCR_ELECTRIC_BOOTSTRAP_VARIANTS]:
+                if not _time_budget_left(odo_reserve_sec):
+                    break
+                variant_image_map.setdefault(label, b)
+                try:
+                    er = _vision(
+                        b,
+                        mime=mime,
+                        model=OCR_MODEL_PRIMARY,
+                        system_prompt=ELECTRIC_LCD_PROMPT,
+                        user_text=(
+                            "Если это электросчётчик, верни type='Электро' и reading. "
+                            "Игнорируй серийный номер, напряжение и служебные цифры."
+                        ),
+                        max_call_timeout_sec=11.0,
+                    )
+                except Exception:
                     continue
-            electric_candidates.append(
-                {
-                    "type": t,
-                    "reading": reading,
-                    "serial": serial,
-                    "confidence": conf,
-                    "notes": notes,
-                    "note2": note2,
-                    "variant": f"electric_{label}",
-                    "provider": f"openai-electric:{OCR_MODEL_PRIMARY}",
-                }
-            )
+                t = _sanitize_type(er.get("type", "unknown"))
+                notes = str(er.get("notes", "") or "")
+                if t == "unknown":
+                    t2 = _classify_meter_type_from_text(f"{er.get('type','')} {notes}")
+                    if t2 == "Электро":
+                        t = "Электро"
+                reading = _normalize_reading(er.get("reading", None))
+                serial = er.get("serial", None)
+                if isinstance(serial, str):
+                    serial = serial.strip() or None
+                conf = _clamp_confidence(er.get("confidence", 0.0))
+                reading, conf, note2 = _plausibility_filter(t, reading, conf)
+                if t != "Электро":
+                    # OCR type can be unknown on dusty LCD, but numeric value is still useful.
+                    # Keep only reasonably confident numeric candidates.
+                    if (reading is not None) and (conf >= 0.56):
+                        t = "Электро"
+                        notes = (f"{notes}; electric_infer_from_numeric").strip("; ").strip()
+                    else:
+                        continue
+                electric_candidates.append(
+                    {
+                        "type": t,
+                        "reading": reading,
+                        "serial": serial,
+                        "confidence": conf,
+                        "notes": notes,
+                        "note2": note2,
+                        "variant": f"electric_{label}",
+                        "provider": f"openai-electric:{OCR_MODEL_PRIMARY}",
+                    }
+                )
 
-        # Deterministic electric pass (7-segment CV decoder) for stability on dark LCD shots.
+        # Deterministic electric pass (7-segment / tesseract) is useful on many photos,
+        # but on hard seeded full-frame Mercury shots it can dominate latency without
+        # adding support. In that mode prefer light local helpers + display-localized OCR.
         try:
-            det_candidates = _electric_deterministic_candidates(img)
+            if seed_electric_candidates:
+                det_candidates = _electric_template_candidates(img)
+            else:
+                det_candidates = _electric_deterministic_candidates(img)
             electric_candidates.extend(det_candidates)
         except Exception:
             pass
 
         electric_candidates = _expand_electric_scaled_candidates(electric_candidates)
         electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
-        if electric_best is None and _time_budget_left(odo_reserve_sec):
+        if (
+            (electric_best is None or (_electric_requires_support(electric_best) and electric_agree < 1))
+            and _time_budget_left(odo_reserve_sec)
+        ):
             disp_variants = _make_electric_display_variants(img)
             for label, b in disp_variants[:4]:
                 if not _time_budget_left(odo_reserve_sec):
@@ -7930,7 +8144,12 @@ async def recognize(
             electric_best, electric_agree = _pick_electric_bootstrap(electric_candidates)
         if electric_best is None:
             electric_best, electric_agree = _pick_electric_bootstrap_relaxed(electric_candidates)
-        if OCR_ELECTRIC_HARD_RECOVERY and _electric_needs_hard_recovery(electric_best, electric_agree) and _time_budget_left(odo_reserve_sec):
+        if (
+            OCR_ELECTRIC_HARD_RECOVERY
+            and (not seed_electric_candidates)
+            and _electric_needs_hard_recovery(electric_best, electric_agree)
+            and _time_budget_left(odo_reserve_sec)
+        ):
             hard_candidates: list[dict] = []
             disp_variants = _make_electric_display_variants(img)
             disp_variants = sorted(disp_variants, key=lambda t: _electric_variant_rank(str(t[0])))
@@ -8061,7 +8280,7 @@ async def recognize(
                 e_provider,
                 True,
             )
-            return out
+            return _json_safe_payload(out)
 
     # Serial-targeted pass for scenes with multiple water meters in one photo.
     # Try to read only the meter whose serial tail matches context hint.
@@ -9587,6 +9806,8 @@ async def recognize(
             or _is_suspicious_water_digits(best)
             or best_variant.startswith("odo_global_")
             or best_variant.startswith("odo_top_strip_")
+            or ("late_rescue" in best_variant)
+            or best_variant.startswith("face")
             or len(best_black) < 5
         )
     )
@@ -10321,6 +10542,7 @@ async def recognize(
             top_variants = _make_water_face_top_strip_raw_wide_variants(face_bytes, prefix=f"face{idx}")
             for top_label, top_bytes in top_variants:
                 try:
+                    variant_image_map.setdefault(top_label, top_bytes)
                     top_resp = _call_openai_vision(
                         top_bytes,
                         mime="image/jpeg",
@@ -10342,6 +10564,15 @@ async def recognize(
                 top_reading = _reading_from_digits(top_black, top_red)
                 if top_reading is None:
                     top_reading = _normalize_reading(top_resp.get("reading"))
+                rebuilt_black = _reconstruct_water_black_from_context(top_black, top_red, context_prev_values)
+                if rebuilt_black:
+                    rebuilt_reading = _reading_from_digits(rebuilt_black, top_red)
+                    if rebuilt_reading is not None:
+                        top_black = rebuilt_black
+                        top_reading = rebuilt_reading
+                        top_resp["notes"] = (
+                            f"{str(top_resp.get('notes') or '').strip()}; context_black_prefix_rebuild={rebuilt_black}"
+                        ).strip("; ").strip()
                 if (
                     top_reading is None
                     or _looks_like_serial_candidate(top_reading, late_serial)
@@ -10459,7 +10690,7 @@ async def recognize(
         chosen_label,
         str(best.get("provider") or ""),
     )
-    return out
+    return _json_safe_payload(out)
 
 
 @app.post("/recognize-series")
@@ -10542,4 +10773,4 @@ async def recognize_series(
         },
         "results": compact_items,
     }
-    return out
+    return _json_safe_payload(out)
