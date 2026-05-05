@@ -5,9 +5,12 @@ import requests
 import io
 import uuid
 import aiohttp
+import time
+import hashlib
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 from contextvars import ContextVar
+from pathlib import Path
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -28,18 +31,43 @@ from aiogram.dispatcher.middlewares import BaseMiddleware
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_BASE = os.getenv("API_BASE", "http://api:8000").strip()
+ACTIVITY_FILE = os.getenv("RENT_ACTIVITY_FILE", "/runtime/last_activity").strip()
+ACTIVITY_TOUCH_ENABLED = os.getenv("RENT_ACTIVITY_TOUCH", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # ---- Timeouts (seconds)
 # IMPORTANT:
 # - bot must not block event-loop; all HTTP is done in threads
 # - API can be slow because of WebDAV upload; allow longer read timeout
-HTTP_CONNECT_TIMEOUT = 10
-HTTP_READ_TIMEOUT_PHOTO = 180
-HTTP_READ_TIMEOUT_FAST = 25
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_READ_TIMEOUT_PHOTO = float(os.getenv("HTTP_READ_TIMEOUT_PHOTO", "360"))
+HTTP_READ_TIMEOUT_FAST = float(os.getenv("HTTP_READ_TIMEOUT_FAST", "25"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
 TG_SEND_RETRIES = int(os.getenv("TG_SEND_RETRIES", "3"))
+TG_FETCH_RETRIES = max(1, int(os.getenv("TG_FETCH_RETRIES", "10")))
+TG_FETCH_RETRY_BASE_SEC = float(os.getenv("TG_FETCH_RETRY_BASE_SEC", "0.8"))
+TG_FETCH_RETRY_MAX_SEC = float(os.getenv("TG_FETCH_RETRY_MAX_SEC", "15"))
+MEDIA_GROUP_MAX_WAIT_SEC = float(os.getenv("MEDIA_GROUP_MAX_WAIT_SEC", "90"))
+TG_FETCH_RETRY_EXC = (
+    tg_exceptions.NetworkError,
+    aiohttp.ClientError,
+    asyncio.TimeoutError,
+    OSError,
+    ConnectionError,
+)
+
+
+def _touch_activity() -> None:
+    if not ACTIVITY_TOUCH_ENABLED or not ACTIVITY_FILE:
+        return
+    try:
+        path = Path(ACTIVITY_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(time.time())), encoding="ascii")
+    except Exception:
+        # Activity tracking must not break Telegram update handling.
+        pass
 
 
 async def _retry_tg_send(coro_factory):
@@ -73,6 +101,126 @@ bot.send_message = _send_message_with_retry
 bot.send_photo = _send_photo_with_retry
 
 
+def _tg_fetch_retry_delay(attempt: int) -> float:
+    return min(float(TG_FETCH_RETRY_MAX_SEC), float(TG_FETCH_RETRY_BASE_SEC) * (1.7 ** max(0, attempt)))
+
+
+async def _retry_tg_fetch(coro_factory, *, op: str, file_id: str):
+    last_exc = None
+    for attempt in range(max(1, TG_FETCH_RETRIES)):
+        try:
+            return await coro_factory()
+        except TG_FETCH_RETRY_EXC as e:
+            last_exc = e
+            if attempt < max(1, TG_FETCH_RETRIES) - 1:
+                delay = _tg_fetch_retry_delay(attempt)
+                logging.warning(
+                    "TG %s retry scheduled: file_id=%s attempt=%s/%s delay=%.2fs error=%s",
+                    op,
+                    file_id,
+                    attempt + 1,
+                    TG_FETCH_RETRIES,
+                    delay,
+                    e,
+                )
+                await asyncio.sleep(delay)
+            else:
+                raise
+    if last_exc:
+        raise last_exc
+
+
+async def _download_tg_file(file_id: str) -> tuple[bytes, str]:
+    f = await _retry_tg_fetch(lambda: bot.get_file(file_id), op="get_file", file_id=file_id)
+    stream = await _retry_tg_fetch(lambda: bot.download_file(f.file_path), op="download_file", file_id=file_id)
+    payload = stream.read()
+    return payload, str(f.file_path or "")
+
+
+def _file_unique_id_from_filename(filename: Optional[str]) -> Optional[str]:
+    name = str(filename or "").strip()
+    m = re.match(r"^photo_(.+)\.[A-Za-z0-9]+$", name)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _track_background_task(task: asyncio.Task) -> None:
+    BACKGROUND_FILE_TASKS.add(task)
+    task.add_done_callback(lambda t: BACKGROUND_FILE_TASKS.discard(t))
+
+
+async def _safe_progress_message(chat_id: int, text: str) -> None:
+    try:
+        await asyncio.wait_for(
+            bot.send_message(chat_id, text, reply_markup=_kb_main(chat_id)),
+            timeout=8.0,
+        )
+    except Exception as e:
+        logging.warning("progress_message skipped: chat_id=%s error=%s", chat_id, e)
+
+
+def _queue_progress_message(chat_id: int, text: str) -> None:
+    _track_background_task(asyncio.create_task(_safe_progress_message(chat_id, text)))
+
+
+def _start_delayed_progress_message(chat_id: int, text: str, *, delay_sec: float) -> Optional[asyncio.Task]:
+    if delay_sec <= 0:
+        return None
+
+    async def _runner() -> None:
+        try:
+            await asyncio.sleep(delay_sec)
+            await _safe_progress_message(chat_id, text)
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            logging.exception("delayed_progress_message failed: chat_id=%s", chat_id)
+
+    task = asyncio.create_task(_runner())
+    _track_background_task(task)
+    return task
+
+
+def _cancel_background_task(task: Optional[asyncio.Task]) -> None:
+    if task is not None and not task.done():
+        task.cancel()
+
+
+def _build_batch_result(kind: str, **extra: Any) -> Dict[str, Any]:
+    out: Dict[str, Any] = {"kind": kind}
+    out.update(extra)
+    return out
+
+
+def _build_batch_summary(results: List[Dict[str, Any]]) -> Optional[str]:
+    if len(results) <= 1:
+        return None
+
+    counts: Dict[str, int] = {}
+    for item in results:
+        kind = str(item.get("kind") or "unknown")
+        counts[kind] = counts.get(kind, 0) + 1
+
+    lines = ["Пачка обработана. Ответ по каждому фото уже отправил выше."]
+    if counts.get("accepted"):
+        lines.append(f"Записано: {counts['accepted']}")
+    if counts.get("review"):
+        lines.append(f"На проверке: {counts['review']}")
+    if counts.get("manual"):
+        lines.append(f"Нужно новое фото или ручной ввод: {counts['manual']}")
+    if counts.get("duplicate"):
+        lines.append(f"Дубликаты: {counts['duplicate']}")
+
+    error_count = sum(counts.get(k, 0) for k in ("error", "backend_timeout", "backend_unavailable", "backend_http"))
+    if error_count:
+        lines.append(f"Технические ошибки: {error_count}")
+
+    if len(lines) == 1:
+        return None
+    return "\n".join(lines)
+
+
 # -------------------------
 # DEBUG middleware: prints every incoming update (message/callback)
 # (IMPORTANT: only one middleware, no duplicates)
@@ -95,6 +243,7 @@ class DebugUpdatesMiddleware(BaseMiddleware):
         except Exception:
             logging.exception("DEBUG_UPDATE failed")
         finally:
+            _touch_activity()
             if chat_id is not None:
                 CURRENT_CHAT_ID.set(chat_id)
 
@@ -113,15 +262,21 @@ CURRENT_CHAT_ID: ContextVar[Optional[int]] = ContextVar("current_chat_id", defau
 SENT_BILL: set[Tuple[int, str]] = set()          # (chat_id, ym)
 PENDING_NOTICE: set[Tuple[int, str]] = set()     # (chat_id, ym)
 REMIND_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
-MEDIA_GROUP_BUFFER: Dict[Tuple[int, str], List[Tuple[bytes, str, str]]] = {}
+MEDIA_GROUP_BUFFER: Dict[Tuple[int, str], List[Tuple[int, types.Message, bytes, str, str]]] = {}
 MEDIA_GROUP_ANCHOR: Dict[Tuple[int, str], types.Message] = {}
 MEDIA_GROUP_TASKS: Dict[Tuple[int, str], asyncio.Task] = {}
+MEDIA_GROUP_PENDING: Dict[Tuple[int, str], int] = {}
+MEDIA_GROUP_LAST_ACTIVITY: Dict[Tuple[int, str], float] = {}
+MEDIA_GROUP_ACKED: set[Tuple[int, str]] = set()
 MEDIA_GROUP_COLLECT_SEC = float(os.getenv("MEDIA_GROUP_COLLECT_SEC", "1.4"))
-SEQUENTIAL_PHOTO_BUFFER: Dict[int, List[Tuple[bytes, str, str]]] = {}
+SEQUENTIAL_PHOTO_BUFFER: Dict[int, List[Tuple[int, types.Message, bytes, str, str]]] = {}
 SEQUENTIAL_PHOTO_ANCHOR: Dict[int, types.Message] = {}
 SEQUENTIAL_PHOTO_TASKS: Dict[int, asyncio.Task] = {}
-SEQUENTIAL_PHOTO_COLLECT_SEC = float(os.getenv("SEQUENTIAL_PHOTO_COLLECT_SEC", "2.2"))
+SEQUENTIAL_PHOTO_ACKED: set[int] = set()
+SEQUENTIAL_PHOTO_COLLECT_SEC = float(os.getenv("SEQUENTIAL_PHOTO_COLLECT_SEC", "0.6"))
 SEQUENTIAL_PHOTO_MAX_BATCH = max(1, int(os.getenv("SEQUENTIAL_PHOTO_MAX_BATCH", "4")))
+BACKGROUND_FILE_TASKS: set[asyncio.Task] = set()
+LONG_PROCESS_NOTICE_SEC = float(os.getenv("LONG_PROCESS_NOTICE_SEC", "18"))
 
 # Manual entry flow
 MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step, meter_type, meter_index}
@@ -132,7 +287,7 @@ MANUAL_CTX: Dict[int, Dict[str, Any]] = {}       # chat_id -> {ym, missing, step
 # -------------------------
 
 def _kb_main(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
-    # Главная клавиатура: контакт + старт месяца + отметки оплат
+    # Главная клавиатура: контакт + отметки оплат
     if chat_id is None:
         chat_id = CURRENT_CHAT_ID.get()
     show_contact = not (chat_id is not None and int(chat_id) in CONTACT_CONFIRMED)
@@ -142,7 +297,6 @@ def _kb_main(chat_id: Optional[int] = None) -> ReplyKeyboardMarkup:
         rows.append([KeyboardButton("Передать контакт", request_contact=True)])
     rows.extend(
         [
-            [KeyboardButton("Старт месяца")],
             [KeyboardButton("Аренда оплачена"), KeyboardButton("Счётчики оплачены")],
             [KeyboardButton("Сообщить об ошибке распознавания")],
         ]
@@ -364,10 +518,17 @@ async def _http_get(url: str, *, params=None, read_timeout=HTTP_READ_TIMEOUT_FAS
 async def _post_photo_event(
     *,
     chat_id: int,
+    telegram_message_id: Optional[int] = None,
+    telegram_media_group_id: Optional[str] = None,
     telegram_username: Optional[str],
     phone: Optional[str],
     ym: str,
     meter_index: int,
+    meter_index_mode: str = "auto",
+    client_file_unique_id: Optional[str] = None,
+    batch_item_index: Optional[int] = None,
+    batch_total: Optional[int] = None,
+    batch_kind: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     filename: Optional[str] = None,
     mime_type: Optional[str] = None,
@@ -403,8 +564,29 @@ async def _post_photo_event(
         "phone": phone or "",
         "ym": ym,
         "meter_index": str(meter_index),
-        "meter_index_mode": "explicit",
+        "meter_index_mode": str(meter_index_mode or "auto"),
     }
+    if file_payloads and len(file_payloads) == 1:
+        fb, fn, _mt = file_payloads[0]
+        data["client_file_sha256"] = hashlib.sha256(fb or b"").hexdigest()
+        data["client_file_size"] = str(len(fb or b""))
+        data["client_original_filename"] = str(fn or "")
+    elif file_bytes is not None:
+        data["client_file_sha256"] = hashlib.sha256(file_bytes or b"").hexdigest()
+        data["client_file_size"] = str(len(file_bytes or b""))
+        data["client_original_filename"] = str(filename or "")
+    if telegram_message_id is not None:
+        data["telegram_message_id"] = str(telegram_message_id)
+    if telegram_media_group_id:
+        data["telegram_media_group_id"] = str(telegram_media_group_id)
+    if client_file_unique_id:
+        data["client_file_unique_id"] = str(client_file_unique_id)
+    if batch_kind:
+        data["client_batch_kind"] = str(batch_kind)
+    if batch_item_index is not None:
+        data["client_batch_item_index"] = str(int(batch_item_index))
+    if batch_total is not None:
+        data["client_batch_total"] = str(int(batch_total))
     resp = await _http_post(url, data=data, files=files, read_timeout=HTTP_READ_TIMEOUT_PHOTO)
     payload = resp.json() if resp.ok else None
     return {
@@ -493,15 +675,6 @@ async def _mark_paid_by_chat(chat_id: int, ym: str, which: str) -> Optional[bool
     except Exception:
         logging.exception("_mark_paid_by_chat failed")
         return None
-
-
-async def _start_month(chat_id: int, ym: str) -> Optional[dict]:
-    # Сброс одноразовых уведомлений на новый месяц
-    key = (chat_id, ym)
-    SENT_BILL.discard(key)
-    PENDING_NOTICE.discard(key)
-    return await _fetch_bill_wrap(chat_id, ym)
-
 
 
 async def _manual_write(chat_id: int, ym: str, meter_type: str, meter_index: int, value: float) -> Optional[dict]:
@@ -763,10 +936,9 @@ async def start_cmd(message: types.Message):
         pass
     await message.reply(
         "Привет!\n"
-        "1) Нажми «Старт месяца» в начале месяца.\n"
-        "2) Пришли фото счётчиков (ХВС/ГВС/Электро).\n"
-        "3) Когда оплатишь — нажми «Аренда оплачена» / «Счётчики оплачены».\n"
-        "4) Здесь вы можете отправлять любые сообщения для администратора.",
+        "1) Пришли фото счётчиков (ХВС/ГВС/Электро).\n"
+        "2) Когда оплатишь — нажми «Аренда оплачена» / «Счётчики оплачены».\n"
+        "3) Здесь вы можете отправлять любые сообщения для администратора.",
         reply_markup=_kb_main(message.chat.id),
     )
 
@@ -840,7 +1012,7 @@ async def on_text(message: types.Message):
     text_in = (message.text or "").strip()
 
     # Любое пользовательское сообщение (кроме служебных кнопок/команд) шлём в уведомления
-    sys_texts = {"Старт месяца", "Аренда оплачена", "Счётчики оплачены", "Сообщить об ошибке распознавания"}
+    sys_texts = {"Аренда оплачена", "Счётчики оплачены", "Сообщить об ошибке распознавания"}
     if text_in and not text_in.startswith("/") and text_in not in sys_texts:
         username = message.from_user.username if message.from_user else None
         await _post_notification(message.chat.id, username, text_in, "user_message")
@@ -848,31 +1020,6 @@ async def on_text(message: types.Message):
 
     # Главные кнопки
     ym = _current_ym()
-
-    if text_in == "Старт месяца":
-        wrap = await _start_month(message.chat.id, ym)
-        if not wrap or not wrap.get("ok"):
-            await message.reply("Я не нашёл вашу квартиру в базе. Напишите администратору.", reply_markup=_kb_main())
-            return
-
-        bill = wrap.get("bill") or {}
-        if bill.get("reason") == "missing_photos":
-            missing = bill.get("missing") or []
-            # If this apartment expects 3 electric photos, explicitly mention T3 as well
-            try:
-                expected = int(bill.get("electric_expected") or 1)
-            except Exception:
-                expected = 1
-            if expected >= 3 and "electric_3" not in missing:
-                missing = list(missing) + ["electric_3"]
-            tail = (("\nНе хватает: " + _missing_to_text(missing)) if missing else "")
-            await message.reply("Месяц начат. Пришлите фото счётчиков." + tail, reply_markup=_kb_main())
-            return
-
-        expected = _expected_missing_from_bill(bill)
-        tail = (("\nЖду: " + _missing_to_text(expected)) if expected else "")
-        await message.reply("Месяц начат. Пришлите фото счётчиков." + tail, reply_markup=_kb_main())
-        return
 
     if text_in == "Аренда оплачена":
         v = await _mark_paid_by_chat(message.chat.id, ym, "rent")
@@ -913,6 +1060,12 @@ async def _handle_file_message(
     filename: Optional[str] = None,
     mime_type: Optional[str] = None,
     file_payloads: Optional[List[Tuple[bytes, str, str]]] = None,
+    client_file_unique_id: Optional[str] = None,
+    batch_item_index: Optional[int] = None,
+    batch_total: Optional[int] = None,
+    batch_kind: Optional[str] = None,
+    response_prefix: str = "",
+    allow_long_progress: bool = True,
 ):
     username = message.from_user.username if message.from_user else None
     phone = CHAT_PHONES.get(message.chat.id)  # берём телефон, который пользователь отправил кнопкой
@@ -924,7 +1077,58 @@ async def _handle_file_message(
         payloads = [(bytes(file_bytes), str(filename or "file.bin"), str(mime_type or "application/octet-stream"))]
     if not payloads:
         await message.reply("Не удалось прочитать файл(ы). Пришлите фото ещё раз.", reply_markup=_kb_main())
-        return
+        return _build_batch_result("error", reason="empty_payload")
+    if client_file_unique_id is None and len(payloads) == 1:
+        client_file_unique_id = _file_unique_id_from_filename(payloads[0][1])
+
+    payload_summary = [
+        {
+            "filename": str(fn or "file.bin"),
+            "bytes": len(b or b""),
+            "mime": str(mt or "application/octet-stream"),
+            "sha16": hashlib.sha256(b or b"").hexdigest()[:16],
+            "file_unique_id": _file_unique_id_from_filename(fn),
+        }
+        for b, fn, mt in payloads
+    ]
+    logging.info(
+        "HANDLE_FILE start: chat_id=%s message_id=%s prefix=%r batch=%s/%s:%s file_unique_id=%s payloads=%s",
+        message.chat.id,
+        message.message_id,
+        response_prefix,
+        batch_item_index,
+        batch_total,
+        batch_kind,
+        client_file_unique_id,
+        payload_summary,
+    )
+
+    async def _reply_here(label: str, text: str, **kwargs):
+        logging.info(
+            "HANDLE_FILE reply_start: chat_id=%s message_id=%s label=%s prefix=%r",
+            message.chat.id,
+            message.message_id,
+            label,
+            response_prefix,
+        )
+        try:
+            resp = await message.reply(text, **kwargs)
+            logging.info(
+                "HANDLE_FILE reply_done: chat_id=%s message_id=%s label=%s reply_message_id=%s",
+                message.chat.id,
+                message.message_id,
+                label,
+                getattr(resp, "message_id", None),
+            )
+            return resp
+        except Exception:
+            logging.exception(
+                "HANDLE_FILE reply_failed: chat_id=%s message_id=%s label=%s",
+                message.chat.id,
+                message.message_id,
+                label,
+            )
+            raise
 
     preview_bytes, preview_name, _preview_mime = payloads[0]
 
@@ -939,148 +1143,282 @@ async def _handle_file_message(
     except Exception:
         meter_index = 1
 
+    delayed_notice_task: Optional[asyncio.Task] = None
+    if allow_long_progress:
+        delayed_notice_task = _start_delayed_progress_message(
+            message.chat.id,
+            f"{response_prefix}Распознавание еще идет. Как только закончим, сразу пришлю результат.",
+            delay_sec=float(LONG_PROCESS_NOTICE_SEC),
+        )
+
     try:
-        r = await _post_photo_event(
-            chat_id=message.chat.id,
-            telegram_username=username,
-            phone=phone,
-            ym=ym,
-            meter_index=meter_index,
-            file_payloads=payloads,
-        )
-    except requests.exceptions.ReadTimeout:
-        await message.reply(
-            "Фото получено, но backend долго обрабатывает запрос (возможно загрузка на диск).\n"
-            "Попробуйте отправить ещё раз через минуту.",
-            reply_markup=_kb_main(),
-        )
-        return
-    except Exception:
-        await message.reply(
-            "Фото получено, но backend сейчас недоступен. Попробуйте ещё раз позже.",
-            reply_markup=_kb_main(),
-        )
-        return
-
-    if not r.get("ok"):
-        await message.reply(f"Ошибка отправки в backend: HTTP {r.get('status_code')}", reply_markup=_kb_main())
-        return
-
-    js = r.get("json") or {}
-    ym = js.get("ym") or ""
-    assigned = js.get("assigned_meter_index", meter_index)
-    trace_id = js.get("trace_id") or r.get("server_trace_id") or r.get("trace_id")
-
-    ocr = js.get("ocr") or {}
-    ocr_type = ocr.get("type")
-    ocr_reading = ocr.get("reading")
-    ocr_conf = ocr.get("confidence")
-
-    meter_written = js.get("meter_written")
-    ocr_failed = bool(js.get("ocr_failed"))
-    review_reason = _extract_review_reason(js)
-    conf_txt = None
-    if isinstance(ocr_conf, (int, float)):
-        conf_txt = f"{float(ocr_conf):.2f}"
-
-    anomaly_info = _extract_anomaly_warning(js)
-    logging.info(
-        "PHOTO_EVENT trace_id=%s meter_written=%s ocr_failed=%s ocr_type=%s ocr_reading=%s ocr_conf=%s review_reason=%s",
-        trace_id,
-        meter_written,
-        ocr_failed,
-        ocr_type,
-        ocr_reading,
-        conf_txt,
-        review_reason,
-    )
-
-    if ocr_failed or ((meter_written is False) and (ocr_reading is None)):
-        await message.reply(
-            "Фото получено, но не удалось распознать показания (нечётко/блики/обрезано).\n"
-            "Пожалуйста, пришлите фото лучшего качества.\n\n"
-            "Если удобнее — можно ввести вручную (только для незаполненных полей).",
-            reply_markup=_kb_manual_start(),
-        )
-        MANUAL_CTX[message.chat.id] = {"ym": ym, "step": "idle"}
-        logging.info(f"MANUAL_CTX set for chat_id={message.chat.id} ym={ym!r} step='idle'")
-        return
-
-    if (meter_written is False) and (ocr_reading is not None):
-        shown_reading = ocr_reading
-        if isinstance(shown_reading, (int, float)):
-            try:
-                shown_reading = f"{float(shown_reading):.2f}"
-            except Exception:
-                pass
-        conf_line = f"\nУверенность OCR: {conf_txt}" if conf_txt is not None else ""
-        reason_line = f"\nПричина проверки: {review_reason}" if review_reason else ""
-        msg = (
-            "Фото получено.\n"
-            f"Распознано: {ocr_type or '—'} / {shown_reading}\n"
-            f"Значение выглядит спорным: мы отметили «Проверить» для администратора."
-            f"{conf_line}{reason_line}"
-        )
-        await message.reply(msg, reply_markup=_kb_main())
-        return
-
-    shown_reading = ocr_reading
-    if shown_reading is None and isinstance(anomaly_info, dict):
-        shown_reading = anomaly_info.get("curr")
-
-    msg = f"Принято. (meter_index={assigned})"
-    if ocr_type or shown_reading is not None:
-        msg += f"\nРаспознано: {ocr_type or '—'} / {shown_reading if shown_reading is not None else '—'}"
-    if conf_txt is not None:
-        msg += f"\nУверенность OCR: {conf_txt}"
-    if review_reason:
-        msg += f"\nПричина проверки: {review_reason}"
-    if anomaly_info:
-        msg += "\nЗначение выглядит подозрительным, но мы сохранили его и отметили «Проверить значение» для администратора."
-    await message.reply(msg, reply_markup=_kb_main())
-
-
-    dup = _extract_duplicate_info(js)
-    if dup and ym:
-        mt = dup.get("meter_type")
-        mi = dup.get("meter_index")
-        val = dup.get("value")
-        caption = (
-            "Похоже, это дубликат уже присланного значения.\n"
-            f"Совпало с: {mt} #{mi}, значение {val}."
-        )
         try:
-            await bot.send_photo(
+            logging.info(
+                "HANDLE_FILE backend_start: chat_id=%s message_id=%s prefix=%r meter_index=%s payload_count=%s",
                 message.chat.id,
-                photo=types.InputFile(io.BytesIO(preview_bytes), filename=preview_name or "duplicate.jpg"),
-                caption=caption,
+                message.message_id,
+                response_prefix,
+                meter_index,
+                len(payloads),
+            )
+            r = await _post_photo_event(
+                chat_id=message.chat.id,
+                telegram_message_id=int(message.message_id),
+                telegram_media_group_id=(str(message.media_group_id) if message.media_group_id else None),
+                telegram_username=username,
+                phone=phone,
+                ym=ym,
+                meter_index=meter_index,
+                meter_index_mode="auto",
+                client_file_unique_id=client_file_unique_id,
+                batch_item_index=batch_item_index,
+                batch_total=batch_total,
+                batch_kind=batch_kind,
+                file_payloads=payloads,
+            )
+            logging.info(
+                "HANDLE_FILE backend_done: chat_id=%s message_id=%s prefix=%r batch=%s/%s:%s http=%s trace_id=%s server_trace_id=%s selected_file=%s",
+                message.chat.id,
+                message.message_id,
+                response_prefix,
+                batch_item_index,
+                batch_total,
+                batch_kind,
+                r.get("status_code"),
+                r.get("trace_id"),
+                r.get("server_trace_id"),
+                ((r.get("json") or {}).get("diag") or {}).get("selected_file") if isinstance(r.get("json"), dict) else None,
+            )
+        except requests.exceptions.ReadTimeout:
+            await _reply_here(
+                "backend_timeout",
+                f"{response_prefix}Фото получено, но backend долго обрабатывает запрос (возможно загрузка на диск).\n"
+                "Если итоговый ответ не придёт в течение пары минут, отправьте фото ещё раз.",
                 reply_markup=_kb_main(),
             )
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s",
+                message.chat.id,
+                message.message_id,
+                "backend_timeout",
+            )
+            return _build_batch_result("backend_timeout")
         except Exception:
-            await message.reply(caption, reply_markup=_kb_main())
+            logging.exception(
+                "HANDLE_FILE backend_failed: chat_id=%s message_id=%s prefix=%r",
+                message.chat.id,
+                message.message_id,
+                response_prefix,
+            )
+            await _reply_here(
+                "backend_unavailable",
+                f"{response_prefix}Фото получено, но backend сейчас недоступен. Попробуйте ещё раз позже.",
+                reply_markup=_kb_main(),
+            )
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s",
+                message.chat.id,
+                message.message_id,
+                "backend_unavailable",
+            )
+            return _build_batch_result("backend_unavailable")
+
+        if not r.get("ok"):
+            await _reply_here(
+                "backend_http",
+                f"{response_prefix}Ошибка отправки в backend: HTTP {r.get('status_code')}",
+                reply_markup=_kb_main(),
+            )
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s status_code=%s",
+                message.chat.id,
+                message.message_id,
+                "backend_http",
+                r.get("status_code"),
+            )
+            return _build_batch_result("backend_http", status_code=r.get("status_code"))
+
+        js = r.get("json") or {}
+        ym = js.get("ym") or ""
+        assigned = js.get("assigned_meter_index", meter_index)
+        trace_id = js.get("trace_id") or r.get("server_trace_id") or r.get("trace_id")
+
+        ocr = js.get("ocr") or {}
+        ocr_type = ocr.get("type")
+        ocr_reading = ocr.get("reading")
+        ocr_conf = ocr.get("confidence")
+        resolved_type = js.get("meter_type_label") or ocr.get("resolved_type") or ocr_type
+        ocr_serial = ocr.get("serial")
+
+        meter_written = js.get("meter_written")
+        ocr_failed = bool(js.get("ocr_failed"))
+        review_reason = _extract_review_reason(js)
+        conf_txt = None
+        if isinstance(ocr_conf, (int, float)):
+            conf_txt = f"{float(ocr_conf):.2f}"
+
+        anomaly_info = _extract_anomaly_warning(js)
+        logging.info(
+            "PHOTO_EVENT trace_id=%s meter_written=%s ocr_failed=%s ocr_type=%s ocr_reading=%s ocr_conf=%s review_reason=%s",
+            trace_id,
+            meter_written,
+            ocr_failed,
+            ocr_type,
+            ocr_reading,
+            conf_txt,
+            review_reason,
+        )
+
+        if ocr_failed or ((meter_written is False) and (ocr_reading is None)):
+            resolved_line = ""
+            if resolved_type or ocr_serial:
+                resolved_line = (
+                    f"\n\nОпределили прибор: {resolved_type or '—'}"
+                    + (f"\nСерийный номер: {ocr_serial}" if ocr_serial else "")
+                )
+            await _reply_here(
+                "ocr_failed_manual",
+                f"{response_prefix}Фото получено, но не удалось распознать показания (нечётко/блики/обрезано).\n"
+                "Пожалуйста, пришлите фото лучшего качества.\n\n"
+                "Если удобнее — можно ввести вручную (только для незаполненных полей)."
+                f"{resolved_line}",
+                reply_markup=_kb_manual_start(),
+            )
+            MANUAL_CTX[message.chat.id] = {"ym": ym, "step": "idle"}
+            logging.info(f"MANUAL_CTX set for chat_id={message.chat.id} ym={ym!r} step='idle'")
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s trace_id=%s",
+                message.chat.id,
+                message.message_id,
+                "manual",
+                trace_id,
+            )
+            return _build_batch_result("manual", resolved_type=resolved_type, serial=ocr_serial)
+
+        if (meter_written is False) and (ocr_reading is not None):
+            shown_reading = ocr_reading
+            if isinstance(shown_reading, (int, float)):
+                try:
+                    shown_reading = f"{float(shown_reading):.2f}"
+                except Exception:
+                    pass
+            conf_line = f"\nУверенность OCR: {conf_txt}" if conf_txt is not None else ""
+            reason_line = f"\nПричина проверки: {review_reason}" if review_reason else ""
+            serial_line = f"\nСерийный номер: {ocr_serial}" if ocr_serial else ""
+            msg = (
+                f"{response_prefix}Фото получено.\n"
+                f"Распознано: {resolved_type or '—'} / {shown_reading}\n"
+                f"Значение выглядит спорным: мы отметили «Проверить» для администратора."
+                f"{serial_line}{conf_line}{reason_line}"
+            )
+            await _reply_here("review", msg, reply_markup=_kb_main())
+            logging.info(
+                "HANDLE_FILE done: chat_id=%s message_id=%s result=%s trace_id=%s",
+                message.chat.id,
+                message.message_id,
+                "review",
+                trace_id,
+            )
+            return _build_batch_result("review", resolved_type=resolved_type, reading=shown_reading, serial=ocr_serial)
+
+        shown_reading = ocr_reading
+        if shown_reading is None and isinstance(anomaly_info, dict):
+            shown_reading = anomaly_info.get("curr")
+
+        msg = f"{response_prefix}Принято. (meter_index={assigned})"
+        if resolved_type or shown_reading is not None:
+            msg += f"\nРаспознано: {resolved_type or '—'} / {shown_reading if shown_reading is not None else '—'}"
+        if ocr_serial:
+            msg += f"\nСерийный номер: {ocr_serial}"
+        if conf_txt is not None:
+            msg += f"\nУверенность OCR: {conf_txt}"
+        if review_reason:
+            msg += f"\nПричина проверки: {review_reason}"
+        if anomaly_info:
+            msg += "\nЗначение выглядит подозрительным, но мы сохранили его и отметили «Проверить значение» для администратора."
+        await _reply_here("accepted", msg, reply_markup=_kb_main())
+
+
+        dup = _extract_duplicate_info(js)
+        if dup and ym:
+            mt = dup.get("meter_type")
+            mi = dup.get("meter_index")
+            val = dup.get("value")
+            caption = (
+                f"{response_prefix}Похоже, это дубликат уже присланного значения.\n"
+                f"Совпало с: {mt} #{mi}, значение {val}."
+            )
+            try:
+                await bot.send_photo(
+                    message.chat.id,
+                    photo=types.InputFile(io.BytesIO(preview_bytes), filename=preview_name or "duplicate.jpg"),
+                    caption=caption,
+                    reply_markup=_kb_main(),
+                )
+            except Exception:
+                await _reply_here("duplicate_fallback", caption, reply_markup=_kb_main())
+
+            bill = js.get("bill")
+            if isinstance(bill, dict) and bill.get("reason") == "missing_photos":
+                missing = bill.get("missing") or []
+                if missing:
+                    await message.reply(f"{response_prefix}Сейчас не хватает: " + _missing_to_text(missing), reply_markup=_kb_main())
+                    _schedule_missing_reminder(message.chat.id, ym)
+            return _build_batch_result("duplicate", meter_type=mt, meter_index=mi, value=val)
 
         bill = js.get("bill")
-        if isinstance(bill, dict) and bill.get("reason") == "missing_photos":
-            missing = bill.get("missing") or []
-            if missing:
-                await message.reply("Сейчас не хватает: " + _missing_to_text(missing), reply_markup=_kb_main())
-                _schedule_missing_reminder(message.chat.id, ym)
-        return
+        if ym and isinstance(bill, dict):
+            res = _try_send_bill_if_ready(message.chat.id, ym, bill)
+            if res:
+                text, kb = res
+                await message.reply(text, reply_markup=kb)
+            else:
+                if bill.get("reason") == "missing_photos":
+                    _schedule_missing_reminder(message.chat.id, ym)
 
-    bill = js.get("bill")
-    if ym and isinstance(bill, dict):
-        res = _try_send_bill_if_ready(message.chat.id, ym, bill)
-        if res:
-            text, kb = res
-            await message.reply(text, reply_markup=kb)
-        else:
-            if bill.get("reason") == "missing_photos":
-                _schedule_missing_reminder(message.chat.id, ym)
+        return _build_batch_result(
+            "accepted",
+            meter_type=resolved_type,
+            reading=shown_reading,
+            serial=ocr_serial,
+            meter_index=assigned,
+        )
+    finally:
+        logging.info(
+            "HANDLE_FILE finally: chat_id=%s message_id=%s prefix=%r",
+            message.chat.id,
+            message.message_id,
+            response_prefix,
+        )
+        _cancel_background_task(delayed_notice_task)
 
 
 async def _flush_media_group(key: Tuple[int, str]) -> None:
+    batch_notice_task: Optional[asyncio.Task] = None
+    batch_results: List[Dict[str, Any]] = []
     try:
-        await asyncio.sleep(max(0.4, float(MEDIA_GROUP_COLLECT_SEC)))
+        started_at = time.monotonic()
+        while True:
+            await asyncio.sleep(max(0.35, float(MEDIA_GROUP_COLLECT_SEC)))
+            pending = int(MEDIA_GROUP_PENDING.get(key, 0) or 0)
+            items = MEDIA_GROUP_BUFFER.get(key, [])
+            anchor = MEDIA_GROUP_ANCHOR.get(key)
+            last_activity = float(MEDIA_GROUP_LAST_ACTIVITY.get(key, started_at) or started_at)
+            quiet_enough = (time.monotonic() - last_activity) >= max(0.35, float(MEDIA_GROUP_COLLECT_SEC))
+            if pending <= 0 and anchor is not None and items and quiet_enough:
+                break
+            if pending <= 0 and not items:
+                return
+            if (time.monotonic() - started_at) >= float(MEDIA_GROUP_MAX_WAIT_SEC):
+                logging.warning(
+                    "TG media_group flush timeout: chat_id=%s media_group_id=%s pending=%s items=%s",
+                    key[0],
+                    key[1],
+                    pending,
+                    len(items),
+                )
+                break
+
         items = MEDIA_GROUP_BUFFER.pop(key, [])
         anchor = MEDIA_GROUP_ANCHOR.pop(key, None)
         if not items or anchor is None:
@@ -1091,41 +1429,301 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
             key[1],
             len(items),
         )
-        await _handle_file_message(anchor, file_payloads=items)
+        items = sorted(items, key=lambda x: x[0])
+        if len(items) > 1:
+            batch_notice_task = _start_delayed_progress_message(
+                key[0],
+                "Распознавание еще идет. Пришлю результат по каждому фото отдельно.",
+                delay_sec=float(LONG_PROCESS_NOTICE_SEC),
+            )
+            logging.info(
+                "TG media_group process individually: chat_id=%s media_group_id=%s items=%s",
+                key[0],
+                key[1],
+                len(items),
+            )
+            total_items = len(items)
+            for idx, (_mid, item_message, payload, filename, mime) in enumerate(items, start=1):
+                logging.info(
+                    "TG media_group item_start: chat_id=%s media_group_id=%s item=%s/%s message_id=%s filename=%s bytes=%s",
+                    key[0],
+                    key[1],
+                    idx,
+                    total_items,
+                    item_message.message_id,
+                    filename,
+                    len(payload),
+                )
+                try:
+                    result = await _handle_file_message(
+                        item_message,
+                        file_payloads=[(payload, filename, mime)],
+                        client_file_unique_id=_file_unique_id_from_filename(filename),
+                        batch_item_index=idx,
+                        batch_total=total_items,
+                        batch_kind="media_group",
+                        response_prefix=f"Фото {idx}/{total_items}.\n",
+                        allow_long_progress=False,
+                    )
+                    if result:
+                        batch_results.append(result)
+                    logging.info(
+                        "TG media_group item_done: chat_id=%s media_group_id=%s item=%s/%s message_id=%s result=%s",
+                        key[0],
+                        key[1],
+                        idx,
+                        total_items,
+                        item_message.message_id,
+                        (result or {}).get("kind"),
+                    )
+                except Exception:
+                    logging.exception(
+                        "media_group item failed: chat_id=%s media_group_id=%s item=%s/%s",
+                        key[0],
+                        key[1],
+                        idx,
+                        total_items,
+                    )
+                    batch_results.append(_build_batch_result("error", reason="handler_exception"))
+        else:
+            _mid, item_message, payload, filename, mime = items[0]
+            await _handle_file_message(
+                item_message,
+                file_payloads=[(payload, filename, mime)],
+                client_file_unique_id=_file_unique_id_from_filename(filename),
+                batch_item_index=1,
+                batch_total=1,
+                batch_kind="media_group",
+            )
+        summary_text = _build_batch_summary(batch_results)
+        if summary_text:
+            await _safe_progress_message(key[0], summary_text)
     except Exception:
         logging.exception("media_group_flush failed")
     finally:
+        _cancel_background_task(batch_notice_task)
         MEDIA_GROUP_TASKS.pop(key, None)
+        MEDIA_GROUP_PENDING.pop(key, None)
+        MEDIA_GROUP_LAST_ACTIVITY.pop(key, None)
+        MEDIA_GROUP_ACKED.discard(key)
 
 
 async def _flush_sequential_photos(chat_id: int) -> None:
+    batch_notice_task: Optional[asyncio.Task] = None
+    batch_results: List[Dict[str, Any]] = []
     try:
         await asyncio.sleep(max(0.5, float(SEQUENTIAL_PHOTO_COLLECT_SEC)))
         items = SEQUENTIAL_PHOTO_BUFFER.pop(chat_id, [])
         anchor = SEQUENTIAL_PHOTO_ANCHOR.pop(chat_id, None)
         if not items or anchor is None:
             return
-        batch = items[:SEQUENTIAL_PHOTO_MAX_BATCH]
+        batch = list(items)
         logging.info(
             "TG sequential flush: chat_id=%s items=%s",
             chat_id,
             len(batch),
         )
-        await _handle_file_message(anchor, file_payloads=batch)
+        if len(batch) > 1:
+            batch_notice_task = _start_delayed_progress_message(
+                chat_id,
+                "Распознавание еще идет. Пришлю результат по каждому фото отдельно.",
+                delay_sec=float(LONG_PROCESS_NOTICE_SEC),
+            )
+            total_items = len(batch)
+            for idx, (_mid, item_message, payload, filename, mime) in enumerate(batch, start=1):
+                try:
+                    logging.info(
+                        "TG sequential item_start: chat_id=%s item=%s/%s message_id=%s filename=%s bytes=%s",
+                        chat_id,
+                        idx,
+                        total_items,
+                        item_message.message_id,
+                        filename,
+                        len(payload),
+                    )
+                    result = await _handle_file_message(
+                        item_message,
+                        file_payloads=[(payload, filename, mime)],
+                        client_file_unique_id=_file_unique_id_from_filename(filename),
+                        batch_item_index=idx,
+                        batch_total=total_items,
+                        batch_kind="sequential",
+                        response_prefix=f"Фото {idx}/{total_items}.\n",
+                        allow_long_progress=False,
+                    )
+                    if result:
+                        batch_results.append(result)
+                    logging.info(
+                        "TG sequential item_done: chat_id=%s item=%s/%s message_id=%s result=%s",
+                        chat_id,
+                        idx,
+                        total_items,
+                        item_message.message_id,
+                        (result or {}).get("kind"),
+                    )
+                except Exception:
+                    logging.exception(
+                        "sequential item failed: chat_id=%s item=%s/%s",
+                        chat_id,
+                        idx,
+                        total_items,
+                    )
+                    batch_results.append(_build_batch_result("error", reason="handler_exception"))
+        else:
+            _mid, item_message, payload, filename, mime = batch[0]
+            await _handle_file_message(
+                item_message,
+                file_payloads=[(payload, filename, mime)],
+                client_file_unique_id=_file_unique_id_from_filename(filename),
+                batch_item_index=1,
+                batch_total=1,
+                batch_kind="sequential",
+            )
+        summary_text = _build_batch_summary(batch_results)
+        if summary_text:
+            await _safe_progress_message(chat_id, summary_text)
     except Exception:
         logging.exception("sequential_photo_flush failed")
     finally:
+        _cancel_background_task(batch_notice_task)
         SEQUENTIAL_PHOTO_TASKS.pop(chat_id, None)
+        SEQUENTIAL_PHOTO_ACKED.discard(chat_id)
 
 
 def _queue_sequential_photo(message: types.Message, payload: bytes, filename: str, mime: str) -> None:
     chat_id = int(message.chat.id)
-    SEQUENTIAL_PHOTO_BUFFER.setdefault(chat_id, []).append((payload, filename, mime))
+    SEQUENTIAL_PHOTO_BUFFER.setdefault(chat_id, []).append((int(message.message_id), message, payload, filename, mime))
     if chat_id not in SEQUENTIAL_PHOTO_ANCHOR:
         SEQUENTIAL_PHOTO_ANCHOR[chat_id] = message
     task = SEQUENTIAL_PHOTO_TASKS.get(chat_id)
     if task is None or task.done():
         SEQUENTIAL_PHOTO_TASKS[chat_id] = asyncio.create_task(_flush_sequential_photos(chat_id))
+
+
+async def _report_download_failure(message: types.Message, *, file_id: str, kind: str, extra: Optional[dict] = None) -> None:
+    username = message.from_user.username if message.from_user else None
+    payload = {
+        "message_id": int(message.message_id),
+        "file_id": str(file_id),
+        "kind": str(kind),
+    }
+    if extra:
+        payload.update(extra)
+    try:
+        await _post_notification(
+            message.chat.id,
+            username,
+            f"Не удалось скачать файл из Telegram после повторных попыток: {kind}",
+            "bot_warning",
+            payload,
+        )
+    except Exception:
+        logging.exception("report_download_failure failed")
+
+
+async def _download_and_queue_media_group_photo(
+    key: Tuple[int, str],
+    message: types.Message,
+    *,
+    file_id: str,
+    file_unique_id: str,
+) -> None:
+    try:
+        payload, _file_path = await _download_tg_file(file_id)
+        logging.info(
+            "TG photo downloaded: chat_id=%s message_id=%s bytes=%s sha16=%s file_id=%s",
+            message.chat.id,
+            message.message_id,
+            len(payload),
+            hashlib.sha256(payload).hexdigest()[:16],
+            file_id,
+        )
+        MEDIA_GROUP_BUFFER.setdefault(key, []).append(
+            (
+                int(message.message_id),
+                message,
+                payload,
+                f"photo_{file_unique_id}.jpg",
+                "image/jpeg",
+            )
+        )
+    except Exception:
+        logging.exception(
+            "TG media_group photo download failed: chat_id=%s message_id=%s file_id=%s media_group_id=%s",
+            message.chat.id,
+            message.message_id,
+            file_id,
+            key[1],
+        )
+        await _report_download_failure(
+            message,
+            file_id=file_id,
+            kind="photo_media_group_download",
+            extra={"media_group_id": key[1]},
+        )
+    finally:
+        MEDIA_GROUP_PENDING[key] = max(0, int(MEDIA_GROUP_PENDING.get(key, 0) or 0) - 1)
+        MEDIA_GROUP_LAST_ACTIVITY[key] = time.monotonic()
+        task = MEDIA_GROUP_TASKS.get(key)
+        if task is None or task.done():
+            MEDIA_GROUP_TASKS[key] = asyncio.create_task(_flush_media_group(key))
+
+
+async def _download_and_queue_single_photo(message: types.Message, *, file_id: str, file_unique_id: str) -> None:
+    try:
+        payload, _file_path = await _download_tg_file(file_id)
+        logging.info(
+            "TG photo downloaded: chat_id=%s message_id=%s bytes=%s sha16=%s file_id=%s",
+            message.chat.id,
+            message.message_id,
+            len(payload),
+            hashlib.sha256(payload).hexdigest()[:16],
+            file_id,
+        )
+        _queue_sequential_photo(
+            message,
+            payload,
+            f"photo_{file_unique_id}.jpg",
+            "image/jpeg",
+        )
+    except Exception:
+        logging.exception(
+            "TG single photo download failed: chat_id=%s message_id=%s file_id=%s",
+            message.chat.id,
+            message.message_id,
+            file_id,
+        )
+        await _report_download_failure(message, file_id=file_id, kind="photo_download")
+
+
+async def _download_and_handle_document(message: types.Message) -> None:
+    doc = message.document
+    if not doc:
+        return
+    try:
+        payload, _file_path = await _download_tg_file(doc.file_id)
+        logging.info(
+            "TG document downloaded: chat_id=%s message_id=%s bytes=%s sha16=%s file_id=%s",
+            message.chat.id,
+            message.message_id,
+            len(payload),
+            hashlib.sha256(payload).hexdigest()[:16],
+            doc.file_id,
+        )
+        await _handle_file_message(
+            message,
+            file_bytes=payload,
+            filename=doc.file_name or "file.bin",
+            mime_type=doc.mime_type or "application/octet-stream",
+        )
+    except Exception:
+        logging.exception(
+            "TG document download failed: chat_id=%s message_id=%s file_id=%s",
+            message.chat.id,
+            message.message_id,
+            doc.file_id,
+        )
+        await _report_download_failure(message, file_id=doc.file_id, kind="document_download")
 
 
 @dp.message_handler(content_types=ContentType.PHOTO)
@@ -1137,37 +1735,47 @@ async def on_photo(message: types.Message):
         len(message.photo or []),
     )
     photo = message.photo[-1]
-    f = await bot.get_file(photo.file_id)
-    stream = await bot.download_file(f.file_path)
-    payload = stream.read()
-    logging.info(
-        "TG photo downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
-        message.chat.id,
-        message.message_id,
-        len(payload),
-        photo.file_id,
-    )
     mgid = str(message.media_group_id or "").strip()
     if mgid:
         key = (int(message.chat.id), mgid)
-        MEDIA_GROUP_BUFFER.setdefault(key, []).append(
-            (
-                payload,
-                f"photo_{photo.file_unique_id}.jpg",
-                "image/jpeg",
-            )
-        )
         if key not in MEDIA_GROUP_ANCHOR:
             MEDIA_GROUP_ANCHOR[key] = message
+        if key not in MEDIA_GROUP_ACKED:
+            MEDIA_GROUP_ACKED.add(key)
+            _queue_progress_message(
+                message.chat.id,
+                "Фото получены. Обрабатываем, это может занять до нескольких минут. Результат пришлю по каждому фото отдельно.",
+            )
+        MEDIA_GROUP_PENDING[key] = int(MEDIA_GROUP_PENDING.get(key, 0) or 0) + 1
+        MEDIA_GROUP_LAST_ACTIVITY[key] = time.monotonic()
         task = MEDIA_GROUP_TASKS.get(key)
         if task is None or task.done():
             MEDIA_GROUP_TASKS[key] = asyncio.create_task(_flush_media_group(key))
+        _track_background_task(
+            asyncio.create_task(
+                _download_and_queue_media_group_photo(
+                    key,
+                    message,
+                    file_id=photo.file_id,
+                    file_unique_id=photo.file_unique_id,
+                )
+            )
+        )
         return
-    _queue_sequential_photo(
-        message,
-        payload,
-        f"photo_{photo.file_unique_id}.jpg",
-        "image/jpeg",
+    if int(message.chat.id) not in SEQUENTIAL_PHOTO_ACKED:
+        SEQUENTIAL_PHOTO_ACKED.add(int(message.chat.id))
+        _queue_progress_message(
+            message.chat.id,
+            "Фото получены. Обрабатываем, это может занять до нескольких минут.",
+        )
+    _track_background_task(
+        asyncio.create_task(
+            _download_and_queue_single_photo(
+                message,
+                file_id=photo.file_id,
+                file_unique_id=photo.file_unique_id,
+            )
+        )
     )
 
 
@@ -1180,23 +1788,11 @@ async def on_document(message: types.Message):
         (message.document.file_name if message.document else None),
         (message.document.mime_type if message.document else None),
     )
-    doc = message.document
-    f = await bot.get_file(doc.file_id)
-    stream = await bot.download_file(f.file_path)
-    payload = stream.read()
-    logging.info(
-        "TG document downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
+    _queue_progress_message(
         message.chat.id,
-        message.message_id,
-        len(payload),
-        doc.file_id,
+        "Файл получен. Обрабатываем, это может занять до нескольких минут.",
     )
-    await _handle_file_message(
-        message,
-        file_bytes=payload,
-        filename=doc.file_name or "file.bin",
-        mime_type=doc.mime_type or "application/octet-stream",
-    )
+    _track_background_task(asyncio.create_task(_download_and_handle_document(message)))
 
 
 # -------------------------

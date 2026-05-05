@@ -74,6 +74,36 @@ def _enhance_row_variants(crop_bgr: np.ndarray, label_prefix: str) -> list[tuple
     return out
 
 
+def _pick_round_meter_circle(circles: list[tuple[int, int, int]], w: int, h: int) -> list[tuple[int, int, int]]:
+    min_side = float(max(1, min(w, h)))
+
+    def _score(c: tuple[int, int, int]) -> float:
+        x, y, r = c
+        ideal_x = 0.52 * float(w)
+        ideal_y = 0.58 * float(h)
+        ideal_r = 0.27 * min_side
+        score = 0.0
+        score -= abs(float(x) - ideal_x) / max(1.0, float(w)) * 1.15
+        score -= abs(float(y) - ideal_y) / max(1.0, float(h)) * 1.55
+        score -= abs(float(r) - ideal_r) / max(1.0, ideal_r) * 0.95
+        if 0.18 * float(w) <= float(x) <= 0.82 * float(w):
+            score += 0.30
+        if 0.30 * float(h) <= float(y) <= 0.86 * float(h):
+            score += 0.38
+        if 0.16 * min_side <= float(r) <= 0.36 * min_side:
+            score += 0.56
+        if float(r) < 0.14 * min_side:
+            score -= 0.95
+        if float(r) > 0.42 * min_side:
+            score -= 0.95
+        score += min(0.72, max(0.0, (float(r) / max(1.0, min_side)) - 0.12) * 2.2)
+        if float(y) < 0.28 * float(h):
+            score -= 0.55
+        return score
+
+    return sorted(circles, key=_score, reverse=True)[:2]
+
+
 def make_water_deterministic_row_variants(img_bytes: bytes, max_variants: int = 12) -> list[tuple[str, bytes]]:
     """
     Deterministic geometry-first extractor for dark water-meter photos:
@@ -207,6 +237,75 @@ def make_water_deterministic_row_variants(img_bytes: bytes, max_variants: int = 
     except Exception:
         return out
     return out[:max_variants]
+
+
+def make_round_water_fixed_cell_sheets(img_bytes: bytes, max_sheets: int = 3) -> list[tuple[str, bytes]]:
+    """
+    Build fixed-cell sheets specifically for round water meters.
+    This path is isolated and intended as an additional refinement step,
+    not as a replacement for the main OCR route.
+    """
+    out: list[tuple[str, bytes]] = []
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        im = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if im is None:
+            return out
+        h, w = im.shape[:2]
+
+        gray = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+        gray = cv2.medianBlur(gray, 5)
+        circles = cv2.HoughCircles(
+            gray,
+            cv2.HOUGH_GRADIENT,
+            dp=1.2,
+            minDist=max(30, min(w, h) // 6),
+            param1=90,
+            param2=22,
+            minRadius=max(20, min(w, h) // 12),
+            maxRadius=max(40, min(w, h) // 2),
+        )
+        if circles is None:
+            return out
+        all_circles = _unique_circles([tuple(map(int, c)) for c in np.round(circles[0, :]).astype(int).tolist()])
+        picked = _pick_round_meter_circle(all_circles, w, h)
+        if not picked:
+            return out
+
+        box_specs = (
+            ("round_cells_a", (-0.95, -0.64, 0.58, -0.18)),
+            ("round_cells_b", (-0.92, -0.60, 0.64, -0.16)),
+            ("round_cells_c", (-0.88, -0.58, 0.68, -0.12)),
+        )
+        for ci, (x, y, r) in enumerate(picked, start=1):
+            for prefix, (lx, ty, rx, by) in box_specs:
+                x1, y1, x2, y2 = _clamp_box(
+                    int(round(x + r * lx)),
+                    int(round(y + r * ty)),
+                    int(round(x + r * rx)),
+                    int(round(y + r * by)),
+                    w,
+                    h,
+                )
+                crop = im[y1:y2, x1:x2]
+                if crop.size == 0:
+                    continue
+                pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+                pil = pil.resize((max(1, pil.width * 3), max(1, pil.height * 3)), Image.Resampling.LANCZOS)
+                pil = ImageEnhance.Contrast(pil).enhance(2.0)
+                pil = ImageEnhance.Sharpness(pil).enhance(1.6)
+                pil = pil.filter(ImageFilter.UnsharpMask(radius=1, percent=260, threshold=2))
+                row_bytes = _encode_jpeg(pil, quality=95)
+                fixed = make_fixed_cells_sheet_from_row(row_bytes, black_len=5, red_len=2)
+                if not fixed:
+                    continue
+                sheet_bytes, _ = fixed
+                out.append((f"{prefix}_{ci}", sheet_bytes))
+                if len(out) >= max_sheets:
+                    return out[:max_sheets]
+    except Exception:
+        return out
+    return out[:max_sheets]
 
 
 def make_fixed_cells_sheet_from_row(

@@ -1,4 +1,8 @@
 from app import (
+    _build_water_branch_pools,
+    _build_water_detection_context,
+    _build_water_candidate_scorecard,
+    _build_water_serial_candidate,
     _parse_context_serial_hints,
     _serial_hint_tails,
     _pick_water_candidate_by_serial,
@@ -28,6 +32,9 @@ from app import (
     _pick_red_digits_by_vote,
     _has_red_disagreement_for_integer,
     _water_suspicious_layout_fixes,
+    _water_decision_summary,
+    _rank_water_candidate_scorecards,
+    _water_detection_prefers_top_candidate,
 )
 
 
@@ -572,3 +579,304 @@ def test_has_red_disagreement_for_integer():
         {"reading": 999.243, "red_digits": "243", "confidence": 0.95, "type": "unknown"},
     ]
     assert _has_red_disagreement_for_integer(cands, 999) is True
+
+
+def test_rank_water_candidate_scorecards_penalizes_fullframe_vs_odometer():
+    candidates = [
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-water:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.84,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+    ]
+    ranked = _rank_water_candidate_scorecards(
+        candidates,
+        all_items=candidates,
+        context_prev_values=[987.79, 881.10],
+        serial_hints=["13002714", "13076128"],
+        has_odometer_candidates=True,
+        detection_context={"rectified_support": True, "focused_odometer_support": True},
+    )
+    assert ranked
+    assert ranked[0]["source"] == "face_top_strip"
+    assert ranked[0]["reading"] == 991.89
+    assert ranked[1]["source"] == "fullframe"
+    assert ranked[1]["score_breakdown"]["detection_penalty"] > 0
+
+
+def test_detection_aware_ranking_blocks_legacy_fullframe_sync():
+    candidates = [
+        {
+            "type": "ГВС",
+            "reading": 987.92,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00987",
+            "red_digits": "92",
+            "provider": "openai:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        {
+            "type": "unknown",
+            "reading": 987.79,
+            "serial": "13 002714",
+            "confidence": 0.964,
+            "black_digits": None,
+            "red_digits": None,
+            "provider": "det-water:template",
+            "variant": "water_template",
+            "notes": "",
+        },
+    ]
+    detection_context = {
+        "rectified_support": True,
+        "focused_odometer_support": True,
+        "rectification_strength": 0.9,
+        "preferred_sources": ["face_top_strip", "face_row", "odometer_window", "odometer_row", "cells", "cells_rescue"],
+        "suppressed_sources": ["fullframe", "generic", "layout_fix", "odometer_fullframe"],
+    }
+    ranked = _rank_water_candidate_scorecards(
+        candidates,
+        all_items=candidates,
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=False,
+        detection_context=detection_context,
+    )
+    assert ranked[0]["source"] == "template"
+    assert ranked[1]["source"] == "fullframe"
+    assert _water_detection_prefers_top_candidate(
+        matched=ranked[1],
+        top=ranked[0],
+        detection_context=detection_context,
+    )
+
+
+def test_build_water_serial_candidate_prefers_serial_match_without_overlap_penalty():
+    item = {
+        "type": "unknown",
+        "reading": 877.0,
+        "serial": "13 076128",
+        "confidence": 0.96,
+        "black_digits": None,
+        "red_digits": None,
+        "provider": "det-water:template",
+        "variant": "water_template",
+        "notes": "",
+    }
+    sc = _build_water_serial_candidate(item, serial_hints=["13002714", "13076128"])
+    assert sc is not None
+    assert sc["serial"] == "13076128"
+    assert sc["tail_match"] >= 5
+    assert sc["candidate_score"] > 0.7
+    assert "reading_looks_like_serial" not in sc["suspicious_flags"]
+
+
+def test_build_water_branch_pools_prefers_odometer_items_for_scoring():
+    candidates = [
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-water:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.84,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+    ]
+    serial_pool, odometer_pool = _build_water_branch_pools(candidates, all_water_candidates=candidates)
+    assert len(serial_pool) == 2
+    assert len(odometer_pool) == 1
+    assert odometer_pool[0]["variant"] == "face1_top_strip_2_rescue"
+
+
+def test_build_water_branch_pools_falls_back_when_only_template_exists():
+    candidates = [
+        {
+            "type": "unknown",
+            "reading": 877.0,
+            "serial": "13 076128",
+            "confidence": 0.96,
+            "black_digits": None,
+            "red_digits": None,
+            "provider": "det-water:template",
+            "variant": "water_template",
+            "notes": "",
+        }
+    ]
+    serial_pool, odometer_pool = _build_water_branch_pools(candidates, all_water_candidates=candidates)
+    assert len(serial_pool) == 1
+    assert len(odometer_pool) == 1
+    assert odometer_pool[0]["variant"] == "water_template"
+
+
+def test_water_decision_summary_exposes_branch_winners():
+    winner = _build_water_candidate_scorecard(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.88,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+        all_items=[],
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=True,
+        detection_context={"rectified_support": True, "focused_odometer_support": True},
+    )
+    serial_winner = _build_water_serial_candidate(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.88,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+        serial_hints=["13002714"],
+    )
+    summary = _water_decision_summary(
+        winner=winner,
+        serial_candidate=serial_winner,
+        odometer_candidate=winner,
+        ranked=[winner],
+        override_note="",
+    )
+    assert summary["winner"]["source"] == "face_top_strip"
+    assert summary["winner"]["serial"] == "13002714"
+    assert summary["serial_branch_winner"]["serial"] == "13002714"
+    assert summary["odometer_branch_winner"]["source"] == "face_top_strip"
+    assert summary["top_sources"][0]["source"] == "face_top_strip"
+
+
+def test_build_water_detection_context_exposes_preferences():
+    ctx = _build_water_detection_context(
+        water_face_hint=True,
+        water_row_hint=False,
+        skip_electric_bootstrap=True,
+        quick_serial_mode=False,
+        pre_det_row_variants=[],
+        water_variants=[],
+        variants=[("orig", b"x")],
+        odo_variants=[("odo_window_1", b"x")],
+        meter_face_variants=[("face_1", b"x")],
+        face_top_variants=[("face_top_1", b"x")],
+        face_row_variants=[],
+        odometer_variants=[("odometer_focus_1", b"x")],
+        top_variants=[],
+        global_variants=[],
+        row_variants=[],
+        roi_row_variants=[],
+        box_variants=[],
+        circle_row_variants=[],
+        circle_odo_variants=[],
+        blackhat_row_variants=[],
+    )
+    assert ctx["rectified_support"] is True
+    assert ctx["focused_odometer_support"] is True
+    assert "face_top_strip" in ctx["preferred_sources"]
+    assert "odometer_window" in ctx["preferred_sources"]
+    assert "fullframe" in ctx["suppressed_sources"]
+    assert ctx["rectification_strength"] >= 0.8
+
+
+def test_build_water_candidate_scorecard_uses_detection_preferences():
+    det = _build_water_detection_context(
+        water_face_hint=True,
+        water_row_hint=False,
+        skip_electric_bootstrap=True,
+        quick_serial_mode=False,
+        pre_det_row_variants=[],
+        water_variants=[],
+        variants=[("orig", b"x")],
+        odo_variants=[("odo_window_1", b"x")],
+        meter_face_variants=[("face_1", b"x")],
+        face_top_variants=[("face_top_1", b"x")],
+        face_row_variants=[],
+        odometer_variants=[("odometer_focus_1", b"x")],
+        top_variants=[],
+        global_variants=[],
+        row_variants=[],
+        roi_row_variants=[],
+        box_variants=[],
+        circle_row_variants=[],
+        circle_odo_variants=[],
+        blackhat_row_variants=[],
+    )
+    face = _build_water_candidate_scorecard(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.84,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-odo:gpt-4o",
+            "variant": "face1_top_strip_2_rescue",
+            "notes": "",
+        },
+        all_items=[],
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=True,
+        detection_context=det,
+    )
+    full = _build_water_candidate_scorecard(
+        {
+            "type": "unknown",
+            "reading": 991.89,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00991",
+            "red_digits": "89",
+            "provider": "openai-water:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        all_items=[],
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=True,
+        detection_context=det,
+    )
+    assert face["score_breakdown"]["detection_bonus"] > 0
+    assert full["score_breakdown"]["detection_penalty"] > 0

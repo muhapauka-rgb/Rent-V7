@@ -1,0 +1,74 @@
+{
+  "description": "Curated water hard-cases for OCR iteration. Paths are relative to the local dataset root.",
+  "cases": {
+    "5.jpeg": {
+      "path": "тест/5.jpeg",
+      "tags": ["water", "telegram-hardcase", "serial-13002714", "winner-face-top-strip"],
+      "notes": "Telegram-compressed water hard-case. Current expected reading is 991.89 with final API resolution to ХВС.",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128"
+      },
+      "ocr": {
+        "type": "ГВС",
+        "reading": 991.89,
+        "serial": "13 002714",
+        "winner_source": "face_top_strip",
+        "winner_serial": "13002714",
+        "serial_branch_serial": "13002714",
+        "odometer_branch_source": "face_top_strip"
+      },
+      "api": {
+        "meter_kind": "cold",
+        "meter_type_label": "ХВС",
+        "ocr_reading": 991.89,
+        "ocr_serial": "13 002714",
+        "winner_source": "face_top_strip",
+        "winner_serial": "13002714",
+        "serial_branch_serial": "13002714",
+        "odometer_branch_source": "face_top_strip",
+        "meter_written": true
+      }
+    },
+    "4.jpeg": {
+      "path": "тест/4.jpeg",
+      "tags": ["water", "template-fallback", "serial-13076128"],
+      "notes": "Water hard-case currently stabilized by template-backed ranking fallback. Expected OCR reading is 877.00.",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128"
+      },
+      "ocr": {
+        "type": "unknown",
+        "reading": 877.0,
+        "serial": "13076128",
+        "winner_source": "template",
+        "winner_serial": "13076128",
+        "serial_branch_serial": "13076128",
+        "odometer_branch_source": null
+      },
+      "api": {
+        "meter_kind": "hot",
+        "meter_type_label": "ГВС",
+        "ocr_reading": 877.0,
+        "ocr_serial": "13076128",
+        "winner_source": "template",
+        "winner_serial": "13076128",
+        "serial_branch_serial": "13076128",
+        "odometer_branch_source": null,
+        "meter_written": true
+      }
+    },
+    "photo_2025-12-10 23.31.39.jpeg": {
+      "path": "photo_2025-12-10 23.31.39.jpeg",
+      "tags": ["water", "itelma", "serial-15122066", "round-meter"],
+      "notes": "Round ITELMA water meter. OCR-level expectation is stable reading 148.00 and serial 15-122066.",
+      "ocr_context": {
+        "context_serial_hint": "15122066"
+      },
+      "ocr": {
+        "type": "ГВС",
+        "reading": 148.0,
+        "serial": "15-122066"
+      }
+    }
+  }
+}
