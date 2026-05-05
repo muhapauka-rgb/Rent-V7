@@ -127,6 +127,10 @@ def _compact_row(row: Dict[str, Any]) -> Dict[str, Any]:
             "status": row.get("status"),
             "original_filename": row.get("original_filename"),
             "file_sha256": row.get("file_sha256"),
+            "telegram_message_id": diag.get("telegram_message_id"),
+            "telegram_media_group_id": diag.get("telegram_media_group_id"),
+            "client_batch": diag.get("client_batch"),
+            "selected_file": diag.get("selected_file"),
         },
         "ocr": {
             "trace_id": (diag.get("trace_id") or ocr.get("trace_id")),
@@ -141,7 +145,9 @@ def _compact_row(row: Dict[str, Any]) -> Dict[str, Any]:
             "meter_written": row.get("meter_written"),
             "meter_index": row.get("meter_index"),
             "openai_calls": ocr.get("openai_calls"),
+            "provider_errors": ocr.get("provider_errors") or diag.get("ocr_provider_errors"),
         },
+        "local_recognizer": diag.get("ocr_local_recognizer") or ocr.get("local_recognizer"),
         "water_decision": {
             "summary": summary or None,
             "winner": water_decision.get("winner"),
@@ -172,6 +178,33 @@ def _print_pretty(item: Dict[str, Any]) -> None:
         f"type={ocr.get('type')} reading={ocr.get('reading')} serial={ocr.get('serial')} "
         f"resolved={ocr.get('resolved_type') or ocr.get('resolved_kind')} written={ocr.get('meter_written')}"
     )
+    print(
+        "telegram: "
+        f"message_id={event.get('telegram_message_id')} "
+        f"media_group_id={event.get('telegram_media_group_id')} "
+        f"batch={event.get('client_batch')} "
+        f"sha={event.get('file_sha256')}"
+    )
+    if event.get("selected_file"):
+        sf = event.get("selected_file") or {}
+        print(
+            "selected file: "
+            f"index={sf.get('index')} reason={sf.get('selection_reason')} "
+            f"filename={sf.get('filename')} sha16={sf.get('sha16')} "
+            f"client_sha16={sf.get('client_sha16')} unique={sf.get('client_file_unique_id')}"
+        )
+    if ocr.get("provider_errors"):
+        print(f"provider errors: {ocr.get('provider_errors')}")
+    local = item.get("local_recognizer") or {}
+    if isinstance(local, dict) and local:
+        print(
+            "local recognizer: "
+            f"status={local.get('status')} "
+            f"model={local.get('digit_classifier_enabled')}:{local.get('digit_classifier_version')} "
+            f"winner={local.get('winner')} "
+            f"top_water={local.get('top_water')} "
+            f"top_electric={local.get('top_electric')}"
+        )
     summary = water.get("summary") or {}
     if summary:
         print(

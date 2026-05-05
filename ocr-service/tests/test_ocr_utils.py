@@ -34,6 +34,7 @@ from app import (
     _water_suspicious_layout_fixes,
     _water_decision_summary,
     _rank_water_candidate_scorecards,
+    _water_detection_prefers_top_candidate,
 )
 
 
@@ -618,6 +619,55 @@ def test_rank_water_candidate_scorecards_penalizes_fullframe_vs_odometer():
     assert ranked[0]["reading"] == 991.89
     assert ranked[1]["source"] == "fullframe"
     assert ranked[1]["score_breakdown"]["detection_penalty"] > 0
+
+
+def test_detection_aware_ranking_blocks_legacy_fullframe_sync():
+    candidates = [
+        {
+            "type": "ГВС",
+            "reading": 987.92,
+            "serial": "13 002714",
+            "confidence": 0.90,
+            "black_digits": "00987",
+            "red_digits": "92",
+            "provider": "openai:gpt-4o",
+            "variant": "orig_fullframe",
+            "notes": "",
+        },
+        {
+            "type": "unknown",
+            "reading": 987.79,
+            "serial": "13 002714",
+            "confidence": 0.964,
+            "black_digits": None,
+            "red_digits": None,
+            "provider": "det-water:template",
+            "variant": "water_template",
+            "notes": "",
+        },
+    ]
+    detection_context = {
+        "rectified_support": True,
+        "focused_odometer_support": True,
+        "rectification_strength": 0.9,
+        "preferred_sources": ["face_top_strip", "face_row", "odometer_window", "odometer_row", "cells", "cells_rescue"],
+        "suppressed_sources": ["fullframe", "generic", "layout_fix", "odometer_fullframe"],
+    }
+    ranked = _rank_water_candidate_scorecards(
+        candidates,
+        all_items=candidates,
+        context_prev_values=[987.79],
+        serial_hints=["13002714"],
+        has_odometer_candidates=False,
+        detection_context=detection_context,
+    )
+    assert ranked[0]["source"] == "template"
+    assert ranked[1]["source"] == "fullframe"
+    assert _water_detection_prefers_top_candidate(
+        matched=ranked[1],
+        top=ranked[0],
+        detection_context=detection_context,
+    )
 
 
 def test_build_water_serial_candidate_prefers_serial_match_without_overlap_penalty():

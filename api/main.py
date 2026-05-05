@@ -1,4 +1,8 @@
-from fastapi import FastAPI
+import os
+import time
+from pathlib import Path
+
+from fastapi import FastAPI, Request
 
 from core.config import OCR_URL
 from core.db import db_ready, ensure_tables
@@ -18,6 +22,29 @@ app.include_router(events_router)
 app.include_router(bot_router)
 app.include_router(dashboard_router)
 app.include_router(tariffs_router)
+
+
+ACTIVITY_FILE = os.getenv("RENT_ACTIVITY_FILE", "/runtime/last_activity").strip()
+ACTIVITY_TOUCH_ENABLED = os.getenv("RENT_ACTIVITY_TOUCH", "1").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _touch_activity() -> None:
+    if not ACTIVITY_TOUCH_ENABLED or not ACTIVITY_FILE:
+        return
+    try:
+        path = Path(ACTIVITY_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(time.time())), encoding="ascii")
+    except Exception:
+        # Activity tracking must never break API requests.
+        pass
+
+
+@app.middleware("http")
+async def _activity_middleware(request: Request, call_next):
+    if request.url.path not in {"/health", "/docs", "/openapi.json"}:
+        _touch_activity()
+    return await call_next(request)
 
 
 @app.on_event("startup")

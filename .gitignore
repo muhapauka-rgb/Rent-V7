@@ -21,3 +21,4 @@ dist/
 # local work dirs
 .worktrees/
 tmp/
+.runtime/

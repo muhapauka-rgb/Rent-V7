@@ -11,7 +11,7 @@ services:
       - rent_pg:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
-      interval: 5s
+      interval: ${DB_HEALTHCHECK_INTERVAL:-30s}
       timeout: 5s
       retries: 30
     restart: unless-stopped
@@ -26,8 +26,8 @@ services:
       - "8002:8000"
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()\""]
-      interval: 10s
-      timeout: 5s
+      interval: ${OCR_HEALTHCHECK_INTERVAL:-60s}
+      timeout: 3s
       retries: 10
       start_period: 15s
     restart: unless-stopped
@@ -40,6 +40,10 @@ services:
       TZ: ${TZ:-Europe/Moscow}
       # ВАЖНО: внутри docker-сети ходим по имени сервиса
       OCR_URL: http://ocr-service:8000/recognize
+      RENT_ACTIVITY_FILE: /runtime/last_activity
+      RENT_ACTIVITY_TOUCH: ${RENT_ACTIVITY_TOUCH:-1}
+    volumes:
+      - ./.runtime:/runtime
     ports:
       - "8001:8000"
     depends_on:
@@ -49,8 +53,8 @@ services:
         condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).read()\""]
-      interval: 10s
-      timeout: 5s
+      interval: ${API_HEALTHCHECK_INTERVAL:-60s}
+      timeout: 3s
       retries: 10
       start_period: 15s
     restart: unless-stopped
@@ -59,6 +63,11 @@ services:
     build: ./telegram-bot
     container_name: rent_bot
     env_file: .env
+    environment:
+      RENT_ACTIVITY_FILE: /runtime/last_activity
+      RENT_ACTIVITY_TOUCH: ${RENT_ACTIVITY_TOUCH:-1}
+    volumes:
+      - ./.runtime:/runtime
     depends_on:
       api:
         condition: service_healthy

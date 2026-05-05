@@ -12,6 +12,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, Request, UploadFile, File
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from starlette.concurrency import run_in_threadpool
 from sqlalchemy import text
 from datetime import datetime
 
@@ -56,8 +57,8 @@ WATER_ANOMALY_THRESHOLD = 50.0
 ELECTRIC_ANOMALY_THRESHOLD = 500.0
 WATER_SERIAL_HARD_DELTA = float(os.getenv("WATER_SERIAL_HARD_DELTA", "80.0"))
 ENABLE_AGGRESSIVE_OCR_AUTOFIX = os.getenv("ENABLE_AGGRESSIVE_OCR_AUTOFIX", "0").strip().lower() in ("1", "true", "yes", "on")
-OCR_HTTP_TIMEOUT_SEC = float(os.getenv("OCR_HTTP_TIMEOUT_SEC", "75"))
-OCR_HTTP_TIMEOUT_FLOOR_SEC = float(os.getenv("OCR_HTTP_TIMEOUT_FLOOR_SEC", "70"))
+OCR_HTTP_TIMEOUT_SEC = float(os.getenv("OCR_HTTP_TIMEOUT_SEC", "180"))
+OCR_HTTP_TIMEOUT_FLOOR_SEC = float(os.getenv("OCR_HTTP_TIMEOUT_FLOOR_SEC", "130"))
 OCR_HTTP_RETRIES = int(os.getenv("OCR_HTTP_RETRIES", "1"))
 WATER_INTEGER_ONLY = os.getenv("WATER_INTEGER_ONLY", "0").strip().lower() in ("1", "true", "yes", "on")
 OCR_SERIES_HTTP_TIMEOUT_SEC = float(os.getenv("OCR_SERIES_HTTP_TIMEOUT_SEC", "220"))
@@ -78,6 +79,94 @@ def _kind_to_label(kind: str | None, meter_index: int | None = None) -> str | No
             mi = 1
         return f"Электро T{mi}"
     return None
+
+
+def _normalize_tariff_index_hint(value: Any) -> Optional[int]:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            idx = int(value)
+        except Exception:
+            return None
+        return idx if idx in (1, 2, 3) else None
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+    text_l = text_value.lower()
+    for pat in (
+        r"\bt\s*([123])\b",
+        r"\bт\s*([123])\b",
+        r"\b1[.,]8[.,]([123])\b",
+        r"\btariff[_\s-]*(?:index)?\s*[:=]?\s*([123])\b",
+        r"\bтариф\s*([123])\b",
+    ):
+        m = re.search(pat, text_l)
+        if not m:
+            continue
+        try:
+            idx = int(m.group(1))
+        except Exception:
+            continue
+        if idx in (1, 2, 3):
+            return idx
+    return None
+
+
+def _extract_ocr_tariff_index(ocr_data: dict | None) -> Optional[int]:
+    if not isinstance(ocr_data, dict):
+        return None
+    for key in ("tariff_index", "meter_index", "tariff", "rate_index"):
+        idx = _normalize_tariff_index_hint(ocr_data.get(key))
+        if idx is not None:
+            return idx
+    text_parts = [
+        str(ocr_data.get("notes") or ""),
+        str(ocr_data.get("type") or ""),
+    ]
+    debug = ocr_data.get("debug")
+    if isinstance(debug, list):
+        for item in debug[:5]:
+            if not isinstance(item, dict):
+                continue
+            for key in ("tariff_index", "meter_index", "tariff", "notes", "variant"):
+                idx = _normalize_tariff_index_hint(item.get(key))
+                if idx is not None:
+                    return idx
+                text_parts.append(str(item.get(key) or ""))
+    return _normalize_tariff_index_hint(" ".join(text_parts))
+
+
+def _extract_water_visual_type_hint(ocr_data: dict | None) -> Optional[dict[str, Any]]:
+    if not isinstance(ocr_data, dict):
+        return None
+    raw_hint = ocr_data.get("visual_water_type_hint")
+    if not isinstance(raw_hint, dict):
+        wd = ocr_data.get("water_decision")
+        if isinstance(wd, dict):
+            raw_hint = wd.get("visual_type_hint")
+            if not isinstance(raw_hint, dict):
+                summary = wd.get("summary")
+                if isinstance(summary, dict):
+                    raw_hint = summary.get("visual_type_hint")
+    if not isinstance(raw_hint, dict):
+        return None
+    hint_type = raw_hint.get("type")
+    hint_kind = _ocr_to_kind(str(hint_type or ""))
+    if hint_kind not in ("cold", "hot"):
+        return None
+    try:
+        confidence = float(raw_hint.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    return {
+        "type": str(hint_type or ""),
+        "kind": hint_kind,
+        "confidence": round(float(confidence), 4),
+        "source": raw_hint.get("source"),
+        "reason": raw_hint.get("reason"),
+        "used_for_raw_kind": False,
+    }
 
 
 def _as_image_upload_tuple(blob: bytes, filename: str | None, mime_type: str | None):
@@ -118,6 +207,7 @@ def _call_ocr_with_retries(
     trace_id: str | None = None,
     context_prev_water: str | None = None,
     context_serial_hint: str | None = None,
+    context_serial_prev: str | None = None,
     read_timeout_override_sec: float | None = None,
 ):
     last_exc = None
@@ -129,6 +219,8 @@ def _call_ocr_with_retries(
         post_data["context_prev_water"] = str(context_prev_water)
     if context_serial_hint:
         post_data["context_serial_hint"] = str(context_serial_hint)
+    if context_serial_prev:
+        post_data["context_serial_prev"] = str(context_serial_prev)
     if not post_data:
         post_data = None
     for attempt in range(max(1, OCR_HTTP_RETRIES)):
@@ -164,6 +256,7 @@ def _call_ocr_series_with_retries(
     trace_id: str | None = None,
     context_prev_water: str | None = None,
     context_serial_hint: str | None = None,
+    context_serial_prev: str | None = None,
 ):
     last_exc = None
     post_data: dict[str, str] = {}
@@ -173,6 +266,8 @@ def _call_ocr_series_with_retries(
         post_data["context_prev_water"] = str(context_prev_water)
     if context_serial_hint:
         post_data["context_serial_hint"] = str(context_serial_hint)
+    if context_serial_prev:
+        post_data["context_serial_prev"] = str(context_serial_prev)
     if not post_data:
         post_data = None
 
@@ -254,6 +349,74 @@ def _get_last_reading_before(conn, apartment_id: int, ym: str, meter_type: str, 
         return None
 
 
+def _get_stable_water_context_prev_reading(
+    conn,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    meter_index: int = 1,
+    *,
+    decrease_tolerance: float = 1.0,
+    lookback_limit: int = 4,
+) -> tuple[float | None, dict[str, Any] | None]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT id, ym, value, source, ocr_value
+            FROM meter_readings
+            WHERE apartment_id=:aid
+              AND ym < :ym
+              AND meter_type=:mt
+              AND meter_index=:mi
+            ORDER BY ym DESC
+            LIMIT :lim
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "ym": str(ym),
+            "mt": str(meter_type),
+            "mi": int(meter_index),
+            "lim": int(max(2, lookback_limit)),
+        },
+    ).mappings().all()
+    parsed: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            value = float(row.get("value"))
+        except Exception:
+            continue
+        if not math.isfinite(value) or value <= 0:
+            continue
+        parsed.append(
+            {
+                "id": row.get("id"),
+                "ym": row.get("ym"),
+                "value": value,
+                "source": row.get("source"),
+                "ocr_value": float(row.get("ocr_value")) if row.get("ocr_value") is not None else None,
+            }
+        )
+    if not parsed:
+        return None, {"reason": "no_prior_water_readings", "meter_type": str(meter_type)}
+
+    latest = parsed[0]
+    # For OCR context, a clearly decreasing water history is worse than no history:
+    # it can force the OCR scorer toward an old bad value and hide the real odometer.
+    for older in parsed[1:]:
+        delta = float(latest["value"]) - float(older["value"])
+        if delta < -abs(float(decrease_tolerance)):
+            return None, {
+                "reason": "unstable_decreasing_water_history",
+                "meter_type": str(meter_type),
+                "meter_index": int(meter_index),
+                "candidate": latest,
+                "older": older,
+                "delta": round(delta, 3),
+            }
+    return float(latest["value"]), None
+
+
 def _get_recent_training_water_values(conn, apartment_id: int, ym: str, limit: int = 36) -> list[float]:
     rows = conn.execute(
         text(
@@ -271,6 +434,42 @@ def _get_recent_training_water_values(conn, apartment_id: int, ym: str, limit: i
             """
         ),
         {"aid": int(apartment_id), "ym": str(ym), "lim": int(max(1, limit))},
+    ).fetchall()
+    out: list[float] = []
+    for row in rows:
+        try:
+            v = float(row[0])
+        except Exception:
+            continue
+        if not math.isfinite(v) or v <= 0:
+            continue
+        out.append(v)
+    return out
+
+
+def _get_recent_training_values_for_type(
+    conn,
+    apartment_id: int,
+    ym: str,
+    meter_type: str,
+    limit: int = 16,
+) -> list[float]:
+    rows = conn.execute(
+        text(
+            """
+            SELECT correct_value
+            FROM ocr_training_samples
+            WHERE apartment_id=:aid
+              AND ym <= :ym
+              AND meter_type=:mt
+              AND meter_index=1
+              AND correct_value IS NOT NULL
+              AND correct_value > 0
+            ORDER BY created_at DESC, id DESC
+            LIMIT :lim
+            """
+        ),
+        {"aid": int(apartment_id), "ym": str(ym), "mt": str(meter_type), "lim": int(max(1, limit))},
     ).fetchall()
     out: list[float] = []
     for row in rows:
@@ -530,6 +729,39 @@ def _series_item_needs_recovery(item: dict, prev_values: list[float]) -> bool:
     return False
 
 
+def _single_ocr_result_is_context_sufficient(item: dict, prev_values: list[float], serial_hints: list[str]) -> bool:
+    if not isinstance(item, dict):
+        return False
+    item_type = str(item.get("type") or "").strip().lower()
+    notes = str(item.get("notes") or "")
+    reading = _parse_reading_to_float(item.get("reading"))
+    serial_norm = _normalize_serial(item.get("serial"))
+    tail_match = 0
+    if serial_norm and serial_hints:
+        tail_match = max((_serial_tail_match_len(serial_norm, h) for h in serial_hints), default=0)
+
+    if reading is None:
+        if item_type and item_type != "unknown":
+            return True
+        return tail_match >= 4
+
+    if _looks_like_serial_reading(reading, serial_norm):
+        return False
+    if (
+        "water_no_ok_odometer_winner" in notes
+        or "water_context_far_singleton" in notes
+        or "serial_target_multi_hint_unconfirmed" in notes
+    ):
+        return False
+    if item_type == "электро":
+        return True
+    if item_type and item_type != "unknown":
+        return True
+    if prev_values:
+        return _nearest_prev_distance(reading, prev_values) <= 220.0
+    return tail_match >= 4 and float(item.get("confidence") or 0.0) >= 0.86
+
+
 def _recover_series_missing_with_neighbors(
     results: list[dict],
     *,
@@ -753,6 +985,7 @@ def _call_ocr_series_via_singles(
     trace_id: str | None,
     context_prev_water: str | None,
     context_serial_hint: str | None,
+    context_serial_prev: str | None = None,
 ) -> dict:
     prev_values = _parse_prev_values_context(context_prev_water)
     serial_hints = _parse_serial_hints_context(context_serial_hint)
@@ -776,6 +1009,7 @@ def _call_ocr_series_via_singles(
                 trace_id=att_trace,
                 context_prev_water=context_prev_water,
                 context_serial_hint=context_serial_hint,
+                context_serial_prev=context_serial_prev,
                 read_timeout_override_sec=single_timeout,
             )
             if resp is not None and resp.ok:
@@ -986,6 +1220,92 @@ def _serial_last5_matches(ocr_last5: str, stored_last5: str) -> bool:
     if len(a) >= 4 and len(b) >= 4 and a[-4:] == b[-4:]:
         return True
     return False
+
+
+def _resolve_kind_by_type_and_serial(
+    raw_kind: str | None,
+    serial_norm: str | None,
+    *,
+    cold_serial: str | None = None,
+    hot_serial: str | None = None,
+) -> dict[str, Any]:
+    """
+    API-side business rule:
+    1) raw OCR type is useful, but not authoritative;
+    2) if OCR serial matches apartment cold/hot serial, stored serial ownership wins;
+    3) if serial is absent/unmatched but raw type is known, keep raw type;
+    4) if neither gives a type, the caller must keep the event on review path.
+    """
+    rk = str(raw_kind or "").strip().lower()
+    if rk not in ("cold", "hot", "electric"):
+        rk = None
+
+    s_last5 = _last5_serial(serial_norm)
+    cold_last5 = _last5_serial(cold_serial)
+    hot_last5 = _last5_serial(hot_serial)
+    cold_match = _serial_last5_matches(s_last5, cold_last5)
+    hot_match = _serial_last5_matches(s_last5, hot_last5)
+
+    serial_force_kind: str | None = None
+    serial_match = "none"
+    if s_last5:
+        if cold_match and not hot_match:
+            serial_force_kind = "cold"
+            serial_match = "cold"
+        elif hot_match and not cold_match:
+            serial_force_kind = "hot"
+            serial_match = "hot"
+        elif cold_match and hot_match:
+            serial_match = "ambiguous"
+        elif cold_last5 or hot_last5:
+            serial_match = "mismatch"
+        else:
+            serial_match = "no_profile_serial"
+
+    resolved_kind = serial_force_kind or rk
+    if serial_force_kind:
+        policy = "serial_authoritative"
+    elif rk:
+        policy = "raw_type_without_serial_match"
+    else:
+        policy = "review_no_type_no_serial"
+
+    return {
+        "policy": policy,
+        "raw_kind": rk,
+        "resolved_kind": resolved_kind,
+        "serial_force_kind": serial_force_kind,
+        "serial_match": serial_match,
+        "serial_last5": s_last5 or None,
+        "profile_serial_last5": {
+            "cold": cold_last5 or None,
+            "hot": hot_last5 or None,
+        },
+        "type_conflict": bool(serial_force_kind and rk and rk != serial_force_kind),
+    }
+
+
+def _should_hold_unresolved_water_for_review(
+    *,
+    kind: str | None,
+    ocr_type: str | None,
+    serial_norm: str | None,
+    value_float: float | None,
+    is_water_context: bool,
+    serial_resolution: dict[str, Any] | None,
+) -> bool:
+    if value_float is None:
+        return False
+    if not is_water_context:
+        return False
+    if kind in ("cold", "hot", "electric"):
+        return False
+    if serial_norm:
+        return False
+    if isinstance(serial_resolution, dict) and serial_resolution.get("resolved_kind") in ("cold", "hot", "electric"):
+        return False
+    raw_type = str(ocr_type or "").strip().lower()
+    return raw_type in ("", "unknown", "water", "вода")
 
 
 def _reading_digits(value: float | None) -> str:
@@ -1407,6 +1727,8 @@ _API_REVIEW_TRACE_WARNING_PHASES: dict[str, str] = {
     "water_serial_prev_saved_with_review": "serial_history_gate",
     "ocr_type_conflict": "type_resolution",
     "water_type_uncertain": "type_resolution",
+    "serial_type_override": "type_resolution",
+    "meter_type_unresolved": "type_resolution",
     "retake_overwrite": "write_path",
     "possible_duplicate": "write_path",
 }
@@ -1476,6 +1798,80 @@ def _summarize_water_decision_for_diag(water_decision: dict[str, Any]) -> dict[s
     )
 
 
+def _compact_local_recognizer_candidate(candidate: Any) -> Optional[dict[str, Any]]:
+    if not isinstance(candidate, dict):
+        return None
+    payload = {
+        "kind": candidate.get("kind"),
+        "source": candidate.get("source"),
+        "reading": candidate.get("reading"),
+        "serial": candidate.get("serial"),
+        "digits": candidate.get("digits"),
+        "integer_digits": candidate.get("integer_digits"),
+        "decimal_digits": candidate.get("decimal_digits"),
+        "raw_digits": candidate.get("raw_digits"),
+        "zone_id": candidate.get("zone_id"),
+        "zone_kind": candidate.get("zone_kind"),
+        "candidate_score": candidate.get("candidate_score"),
+        "serial_confidence": candidate.get("serial_confidence"),
+        "serial_source": candidate.get("serial_source"),
+        "geometry_confidence": candidate.get("geometry_confidence"),
+        "model_version": candidate.get("model_version"),
+        "digit_confidences": list(candidate.get("digit_confidences") or [])[:12],
+        "suspicious_flags": list(candidate.get("suspicious_flags") or [])[:5],
+    }
+    return jsonable_encoder({k: v for k, v in payload.items() if v is not None and v != []})
+
+
+def _summarize_local_recognizer_for_diag(local_recognizer: dict[str, Any]) -> dict[str, Any]:
+    zones = [z for z in list(local_recognizer.get("zones") or []) if isinstance(z, dict)]
+    water_candidates = [c for c in list(local_recognizer.get("water_candidates") or []) if isinstance(c, dict)]
+    electric_candidates = [c for c in list(local_recognizer.get("electric_candidates") or []) if isinstance(c, dict)]
+    serial_candidates = [c for c in list(local_recognizer.get("serial_candidates") or []) if isinstance(c, dict)]
+    return jsonable_encoder(
+        {
+            "version": local_recognizer.get("version"),
+            "status": local_recognizer.get("status"),
+            "mode": local_recognizer.get("mode"),
+            "tesseract_enabled": bool(local_recognizer.get("tesseract_enabled")),
+            "digit_classifier_enabled": bool(local_recognizer.get("digit_classifier_enabled")),
+            "digit_classifier_version": local_recognizer.get("digit_classifier_version"),
+            "elapsed_ms": local_recognizer.get("elapsed_ms"),
+            "winner": _compact_local_recognizer_candidate(local_recognizer.get("winner")),
+            "top_water": [
+                item for item in (_compact_local_recognizer_candidate(c) for c in water_candidates[:3]) if item
+            ],
+            "top_electric": [
+                item for item in (_compact_local_recognizer_candidate(c) for c in electric_candidates[:3]) if item
+            ],
+            "top_serial": [
+                {
+                    "source": c.get("source"),
+                    "serial": c.get("serial"),
+                    "serial_confidence": c.get("serial_confidence"),
+                    "zone_id": c.get("zone_id"),
+                    "crop": c.get("crop"),
+                }
+                for c in serial_candidates[:3]
+            ],
+            "zones": [
+                {
+                    "id": z.get("id"),
+                    "source": z.get("source"),
+                    "kind_hint": z.get("kind_hint"),
+                    "bbox": z.get("bbox"),
+                    "digit_like_components": z.get("digit_like_components"),
+                    "geometry_confidence": z.get("geometry_confidence"),
+                    "red_pixel_ratio": z.get("red_pixel_ratio"),
+                    "digit_classifier": z.get("digit_classifier"),
+                    "tesseract_digits": ((z.get("tesseract") or {}).get("digits") if isinstance(z.get("tesseract"), dict) else None),
+                }
+                for z in zones[:5]
+            ],
+        }
+    )
+
+
 def _get_electric_month_snapshot(conn, apartment_id: int, ym: str) -> list[dict[str, Any]]:
     rows = conn.execute(
         text(
@@ -1502,6 +1898,264 @@ def _get_electric_month_snapshot(conn, apartment_id: int, ym: str) -> list[dict[
     return out
 
 
+def _pick_same_file_electric_correction_candidate(
+    previous_events: list[dict[str, Any]],
+    rows_before: list[dict[str, Any]],
+    new_value: Optional[float],
+) -> Optional[dict[str, Any]]:
+    if new_value is None:
+        return None
+
+    rows_by_idx: dict[int, dict[str, Any]] = {}
+    for row in rows_before or []:
+        try:
+            idx = int(row.get("meter_index") or 0)
+        except Exception:
+            continue
+        if idx not in (1, 2, 3):
+            continue
+        rows_by_idx[idx] = dict(row)
+
+    same_value_events: list[dict[str, Any]] = []
+    stale_candidates: list[dict[str, Any]] = []
+    for raw in previous_events or []:
+        row = dict(raw or {})
+        try:
+            idx = int(row.get("meter_index") or 0)
+        except Exception:
+            continue
+        if idx not in (1, 2, 3):
+            continue
+        old_value = _parse_reading_to_float(row.get("meter_value"))
+        if old_value is None:
+            old_value = _parse_reading_to_float(row.get("ocr_reading"))
+        if old_value is None:
+            continue
+        event_item = {
+            "event_id": row.get("id"),
+            "meter_index": idx,
+            "value": float(old_value),
+        }
+        if _same_total(float(old_value), float(new_value)):
+            same_value_events.append(event_item)
+            continue
+
+        db_row = rows_by_idx.get(idx)
+        if not db_row:
+            continue
+        if str(db_row.get("source") or "").strip().lower() != "ocr":
+            continue
+        db_value = _parse_reading_to_float(db_row.get("value"))
+        if db_value is None or not _same_total(float(db_value), float(old_value)):
+            continue
+        stale_candidates.append(event_item)
+
+    if not stale_candidates:
+        return None
+
+    chosen = stale_candidates[0]
+    assigned_idx = int(chosen["meter_index"])
+    duplicate_indices: list[int] = []
+    duplicate_event_ids: list[Any] = []
+    for item in same_value_events:
+        try:
+            idx = int(item.get("meter_index") or 0)
+        except Exception:
+            continue
+        if idx not in (1, 2, 3) or idx == assigned_idx:
+            continue
+        db_row = rows_by_idx.get(idx)
+        if not db_row:
+            continue
+        if str(db_row.get("source") or "").strip().lower() != "ocr":
+            continue
+        db_value = _parse_reading_to_float(db_row.get("value"))
+        if db_value is None or not _same_total(float(db_value), float(new_value)):
+            continue
+        if idx not in duplicate_indices:
+            duplicate_indices.append(idx)
+        duplicate_event_ids.append(item.get("event_id"))
+
+    return {
+        "reason": "same_file_ocr_correction",
+        "stale_event_id": chosen.get("event_id"),
+        "assigned_meter_index": assigned_idx,
+        "previous_value": float(chosen["value"]),
+        "new_value": float(new_value),
+        "same_value_event_ids": [item.get("event_id") for item in same_value_events],
+        "duplicate_indices": duplicate_indices,
+        "duplicate_event_ids": duplicate_event_ids,
+    }
+
+
+def _try_apply_same_file_electric_correction(
+    conn,
+    *,
+    apartment_id: int,
+    ym: str,
+    file_sha256: Optional[str],
+    photo_event_id: Optional[int],
+    new_value: Optional[float],
+    rows_before: list[dict[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not file_sha256 or new_value is None:
+        return None
+    previous = conn.execute(
+        text(
+            """
+            SELECT id, meter_index, meter_value, ocr_reading, created_at
+            FROM photo_events
+            WHERE apartment_id=:aid
+              AND ym=:ym
+              AND file_sha256=:sha
+              AND meter_kind='electric'
+              AND meter_written=true
+              AND (:peid IS NULL OR id <> :peid)
+            ORDER BY created_at DESC, id DESC
+            LIMIT 12
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "ym": str(ym),
+            "sha": str(file_sha256),
+            "peid": int(photo_event_id) if photo_event_id is not None else None,
+        },
+    ).mappings().all()
+    correction = _pick_same_file_electric_correction_candidate(
+        [dict(row) for row in (previous or [])],
+        rows_before,
+        float(new_value),
+    )
+    if not correction:
+        return None
+
+    assigned_idx = int(correction["assigned_meter_index"])
+    previous_value = float(correction["previous_value"])
+    result = conn.execute(
+        text(
+            """
+            UPDATE meter_readings
+            SET value=:new_value,
+                source='ocr',
+                ocr_value=:new_value,
+                updated_at=now()
+            WHERE apartment_id=:aid
+              AND ym=:ym
+              AND meter_type='electric'
+              AND meter_index=:idx
+              AND source='ocr'
+              AND abs(value - :previous_value) <= 0.01
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "ym": str(ym),
+            "idx": int(assigned_idx),
+            "previous_value": float(previous_value),
+            "new_value": float(new_value),
+        },
+    )
+    if int(getattr(result, "rowcount", 0) or 0) <= 0:
+        return None
+
+    deleted_duplicate_indices: list[int] = []
+    for idx in list(correction.get("duplicate_indices") or []):
+        try:
+            dup_idx = int(idx)
+        except Exception:
+            continue
+        if dup_idx not in (1, 2, 3) or dup_idx == assigned_idx:
+            continue
+        dup_result = conn.execute(
+            text(
+                """
+                DELETE FROM meter_readings
+                WHERE apartment_id=:aid
+                  AND ym=:ym
+                  AND meter_type='electric'
+                  AND meter_index=:idx
+                  AND source='ocr'
+                  AND abs(value - :new_value) <= 0.01
+                """
+            ),
+            {
+                "aid": int(apartment_id),
+                "ym": str(ym),
+                "idx": int(dup_idx),
+                "new_value": float(new_value),
+            },
+        )
+        if int(getattr(dup_result, "rowcount", 0) or 0) > 0:
+            deleted_duplicate_indices.append(int(dup_idx))
+
+    correction["deleted_duplicate_indices"] = deleted_duplicate_indices
+    return jsonable_encoder(correction)
+
+
+def _pick_same_file_cross_month_reuse_candidate(
+    previous_events: list[dict[str, Any]],
+    ym: str,
+) -> Optional[dict[str, Any]]:
+    target_ym = str(ym or "").strip()
+    if not target_ym:
+        return None
+    # Same-month repeats are normal retakes/corrections. A file may have older
+    # cross-month history as well, but that must not block a current-month retake.
+    for raw in previous_events or []:
+        row = dict(raw or {})
+        if str(row.get("ym") or "").strip() == target_ym:
+            return None
+    for raw in previous_events or []:
+        row = dict(raw or {})
+        prev_ym = str(row.get("ym") or "").strip()
+        if not prev_ym or prev_ym == target_ym:
+            continue
+        return jsonable_encoder(
+            {
+                "reason": "same_file_cross_month_reuse",
+                "previous_event_id": row.get("id"),
+                "previous_ym": prev_ym,
+                "current_ym": target_ym,
+                "previous_meter_kind": row.get("meter_kind"),
+                "previous_meter_index": row.get("meter_index"),
+                "previous_meter_value": row.get("meter_value"),
+            }
+        )
+    return None
+
+
+def _find_same_file_cross_month_reuse(
+    conn,
+    *,
+    apartment_id: int,
+    ym: str,
+    file_sha256: Optional[str],
+    photo_event_id: Optional[int],
+) -> Optional[dict[str, Any]]:
+    if not file_sha256:
+        return None
+    rows = conn.execute(
+        text(
+            """
+            SELECT id, ym, meter_kind, meter_index, meter_value, created_at
+            FROM photo_events
+            WHERE apartment_id=:aid
+              AND file_sha256=:sha
+              AND (:peid IS NULL OR id <> :peid)
+            ORDER BY created_at DESC, id DESC
+            LIMIT 12
+            """
+        ),
+        {
+            "aid": int(apartment_id),
+            "sha": str(file_sha256),
+            "peid": int(photo_event_id) if photo_event_id is not None else None,
+        },
+    ).mappings().all()
+    return _pick_same_file_cross_month_reuse_candidate([dict(row) for row in (rows or [])], str(ym))
+
+
 def _set_electric_assignment_debug(
     diag: dict[str, Any],
     *,
@@ -1513,6 +2167,7 @@ def _set_electric_assignment_debug(
     incoming_value: Optional[float],
     mode: Optional[str],
     close_idx: Optional[int],
+    tariff_index: Optional[int],
     meter_index_mode: Optional[str],
     requested_meter_index: Optional[int],
     assigned_meter_index: Optional[int],
@@ -1529,6 +2184,7 @@ def _set_electric_assignment_debug(
             "incoming_value": (float(incoming_value) if incoming_value is not None else None),
             "mode": (str(mode) if mode else None),
             "close_idx": (int(close_idx) if close_idx is not None else None),
+            "tariff_index": (int(tariff_index) if tariff_index is not None else None),
             "meter_index_mode": (str(meter_index_mode) if meter_index_mode is not None else None),
             "requested_meter_index": (int(requested_meter_index) if requested_meter_index is not None else None),
             "assigned_meter_index": (int(assigned_meter_index) if assigned_meter_index is not None else None),
@@ -1626,11 +2282,28 @@ def _set_api_review_trace(
             incoming_value=electric_assignment.get("incoming_value"),
             mode=electric_assignment.get("mode"),
             close_idx=electric_assignment.get("close_idx"),
+            tariff_index=electric_assignment.get("tariff_index"),
             meter_index_mode=electric_assignment.get("meter_index_mode"),
             requested_meter_index=electric_assignment.get("requested_meter_index"),
             assigned_meter_index=electric_assignment.get("assigned_meter_index"),
             rows_before=electric_assignment.get("rows_before"),
             rows_after=electric_assignment.get("rows_after"),
+        )
+
+    meter_resolution = diag.get("meter_resolution") if isinstance(diag.get("meter_resolution"), dict) else None
+    if meter_resolution:
+        _append(
+            "type_resolution",
+            "meter_resolution_policy",
+            policy=meter_resolution.get("policy"),
+            raw_kind=meter_resolution.get("raw_kind"),
+            resolved_kind=meter_resolution.get("resolved_kind"),
+            serial_force_kind=meter_resolution.get("serial_force_kind"),
+            serial_match=meter_resolution.get("serial_match"),
+            serial_last5=meter_resolution.get("serial_last5"),
+            profile_serial_last5=meter_resolution.get("profile_serial_last5"),
+            type_conflict=meter_resolution.get("type_conflict"),
+            has_serial=meter_resolution.get("has_serial"),
         )
 
     _append(
@@ -1697,6 +2370,8 @@ def _ocr_payload_quality(payload: Any) -> float:
         score += 0.9
     if "electric_seed_display_fast_path" in notes:
         score += 2.5
+    if _electric_has_display_support(payload):
+        score += 2.4
     if any(tag in variant for tag in ("direct_bridge", "prefix_tail", "integer_bridge", "display", "cells", "template", "det_", "tess")):
         score += 1.2
     if any(tag in provider for tag in (":display", ":cells", ":integer", ":fraction", "display-hybrid")):
@@ -1705,7 +2380,76 @@ def _ocr_payload_quality(payload: Any) -> float:
         score -= 1.5
     if "provider=openai:gpt-4o; variant=orig_fullframe" in notes:
         score -= 1.0
+    if _is_uncorroborated_electric_fullframe(payload):
+        score -= 2.0
     return score
+
+
+def _electric_has_display_support(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("type") or "").strip().lower() != "электро":
+        return False
+    notes = str(payload.get("notes") or "").strip().lower()
+    variant = str(payload.get("variant") or "").strip().lower()
+    provider = str(payload.get("provider") or "").strip().lower()
+    support_markers = (
+        "provider=openai-electric",
+        "openai-electric:",
+        "electric_mercury_bridge_forced",
+        "electric_seeded_display",
+        "electric_seed_display_fast_path",
+        "variant=electric_ed_",
+        "electric_ed_",
+        "display-hybrid",
+        ":display",
+        ":cells",
+        ":integer",
+        ":fraction",
+        "direct_bridge",
+        "prefix_tail",
+        "integer_bridge",
+    )
+    if any(marker in notes for marker in support_markers):
+        return True
+    if any(marker in variant for marker in ("electric_ed_", "direct_bridge", "prefix_tail", "integer_bridge", "display", "cells", "template", "det_", "tess")):
+        return True
+    if any(marker in provider for marker in ("openai-electric", ":display", ":cells", ":integer", ":fraction", "display-hybrid")):
+        return True
+    for cand in list(payload.get("debug") or [])[:12]:
+        if not isinstance(cand, dict):
+            continue
+        if str(cand.get("type") or payload.get("type") or "").strip().lower() not in ("электро", "electric"):
+            continue
+        if _parse_reading_to_float(cand.get("reading")) is None:
+            continue
+        c_provider = str(cand.get("provider") or "").strip().lower()
+        c_variant = str(cand.get("variant") or "").strip().lower()
+        if "openai-electric" in c_provider or any(marker in c_provider for marker in (":display", ":cells", ":integer", ":fraction")):
+            return True
+        if any(marker in c_variant for marker in ("electric_ed_", "direct_bridge", "prefix_tail", "integer_bridge", "display", "cells", "template", "det_", "tess")):
+            return True
+    return False
+
+
+def _is_uncorroborated_electric_fullframe(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("type") or "").strip().lower() != "электро":
+        return False
+    if _parse_reading_to_float(payload.get("reading")) is None:
+        return False
+    if _electric_has_display_support(payload):
+        return False
+    variant = str(payload.get("variant") or "").strip().lower()
+    provider = str(payload.get("provider") or "").strip().lower()
+    notes = str(payload.get("notes") or "").strip().lower()
+    return bool(
+        "orig_fullframe" in variant
+        or provider == "openai:gpt-4o"
+        or "variant=orig_fullframe" in notes
+        or "provider=openai:gpt-4o; variant=orig_fullframe" in notes
+    )
 
 
 def _needs_electric_quality_retry(payload: Any) -> bool:
@@ -1719,6 +2463,10 @@ def _needs_electric_quality_retry(payload: Any) -> bool:
     digits = "".join(ch for ch in str(payload.get("digits") or "") if ch.isdigit())
     if "electric_seed_display_fast_path" in notes:
         return False
+    if _electric_has_display_support(payload):
+        return False
+    if _is_uncorroborated_electric_fullframe(payload):
+        return True
     if any(tag in variant for tag in ("direct_bridge", "prefix_tail", "integer_bridge")):
         return False
     if ("orig_fullframe" in variant) or (provider == "openai:gpt-4o") or ("variant=orig_fullframe" in notes):
@@ -1737,6 +2485,36 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     chat_id = form.get("chat_id") or "unknown"
     telegram_username = form.get("telegram_username") or None
     phone = form.get("phone") or None
+    telegram_message_id = form.get("telegram_message_id") or None
+    telegram_media_group_id = form.get("telegram_media_group_id") or None
+    client_file_sha256 = (str(form.get("client_file_sha256") or "").strip().lower() or None)
+    client_file_size_raw = (str(form.get("client_file_size") or "").strip() or None)
+    client_original_filename = (str(form.get("client_original_filename") or "").strip() or None)
+    client_file_unique_id = (str(form.get("client_file_unique_id") or "").strip() or None)
+    client_batch_kind = (str(form.get("client_batch_kind") or "").strip() or None)
+    client_batch_item_index = (str(form.get("client_batch_item_index") or "").strip() or None)
+    client_batch_total = (str(form.get("client_batch_total") or "").strip() or None)
+    if telegram_message_id is not None:
+        try:
+            diag["telegram_message_id"] = int(str(telegram_message_id).strip())
+        except Exception:
+            diag["telegram_message_id"] = str(telegram_message_id)
+    if telegram_media_group_id is not None and str(telegram_media_group_id).strip():
+        diag["telegram_media_group_id"] = str(telegram_media_group_id).strip()
+    if client_file_sha256:
+        diag["client_file_sha256"] = client_file_sha256
+    if client_file_size_raw:
+        diag["client_file_size"] = client_file_size_raw
+    if client_original_filename:
+        diag["client_original_filename"] = client_original_filename
+    if client_file_unique_id:
+        diag["client_file_unique_id"] = client_file_unique_id
+    if client_batch_kind or client_batch_item_index or client_batch_total:
+        diag["client_batch"] = {
+            "kind": client_batch_kind,
+            "item_index": client_batch_item_index,
+            "total": client_batch_total,
+        }
     t0 = time.monotonic()
 
     # month (ym) for this photo event. Bot may send it; otherwise default to current month.
@@ -1822,8 +2600,46 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     selected_filename = str(photo_payloads[selected_idx].get("filename") or "photo.jpg")
     selected_mime = str(photo_payloads[selected_idx].get("mime") or "image/jpeg")
     file_sha256 = hashlib.sha256(blob).hexdigest()
+
+    def _refresh_selected_file_diag(reason: str) -> None:
+        diag["selected_file"] = {
+            "index": int(selected_idx),
+            "files_count": int(len(photo_payloads)),
+            "filename": selected_filename,
+            "mime": selected_mime,
+            "size_bytes": int(len(blob)),
+            "sha256": file_sha256,
+            "sha16": file_sha256[:16],
+            "selection_reason": str(reason),
+        }
+        if client_file_sha256:
+            diag["selected_file"]["client_sha256"] = client_file_sha256
+            diag["selected_file"]["client_sha16"] = client_file_sha256[:16]
+        if client_original_filename:
+            diag["selected_file"]["client_original_filename"] = client_original_filename
+        if client_file_unique_id:
+            diag["selected_file"]["client_file_unique_id"] = client_file_unique_id
+        if client_batch_kind or client_batch_item_index or client_batch_total:
+            diag["selected_file"]["client_batch"] = {
+                "kind": client_batch_kind,
+                "item_index": client_batch_item_index,
+                "total": client_batch_total,
+            }
+
+    _refresh_selected_file_diag("initial")
+    if client_file_sha256 and client_file_sha256 != file_sha256:
+        diag["warnings"].append(
+            {
+                "client_file_sha_mismatch": {
+                    "client_sha16": client_file_sha256[:16],
+                    "api_sha16": file_sha256[:16],
+                    "client_filename": client_original_filename,
+                    "api_filename": selected_filename,
+                }
+            }
+        )
     logger.info(
-        "photo_event start trace_id=%s chat_id=%s ym=%s files_count=%s selected_file=%s mime=%s size_bytes=%s",
+        "photo_event start trace_id=%s chat_id=%s ym=%s files_count=%s selected_file=%s mime=%s size_bytes=%s sha16=%s",
         trace_id,
         str(chat_id),
         str(ym),
@@ -1831,11 +2647,12 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         selected_filename,
         selected_mime,
         len(blob),
+        file_sha256[:16],
     )
 
     if db_ready():
         try:
-            ensure_tables()
+            await run_in_threadpool(ensure_tables)
         except Exception as e:
             diag["errors"].append({"db_ensure_tables_error": str(e)})
 
@@ -1850,8 +2667,10 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
 
     context_prev_water: str | None = None
     context_serial_hint: str | None = None
+    context_serial_prev: str | None = None
     prev_vals: list[float] = []
     serial_hints: list[str] = []
+    serial_prev_pairs: list[tuple[str, float]] = []
     if db_ready() and apartment_id:
         try:
             prev_ym = _prev_ym(str(ym))
@@ -1861,7 +2680,12 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     text("SELECT cold_serial, hot_serial FROM apartments WHERE id=:aid LIMIT 1"),
                     {"aid": int(apartment_id)},
                 ).mappings().first()
+                apt_serials: dict[str, str | None] = {}
                 if apt_row:
+                    apt_serials = {
+                        "cold": apt_row.get("cold_serial"),
+                        "hot": apt_row.get("hot_serial"),
+                    }
                     for raw_serial in (apt_row.get("cold_serial"), apt_row.get("hot_serial")):
                         s_norm = _normalize_serial(raw_serial)
                         if not s_norm:
@@ -1870,6 +2694,39 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         if len(sd) < 4 or sd in serial_hints:
                             continue
                         serial_hints.append(sd)
+                meter_prev_by_type: dict[str, float] = {}
+                skipped_meter_prev_by_type: dict[str, dict[str, Any]] = {}
+                for mt in ("cold", "hot"):
+                    pv, pv_diag = _get_stable_water_context_prev_reading(
+                        conn,
+                        int(apartment_id),
+                        str(ym),
+                        mt,
+                        1,
+                    )
+                    if pv_diag is not None:
+                        skipped_meter_prev_by_type[mt] = pv_diag
+                    if pv is None:
+                        continue
+                    try:
+                        meter_prev_by_type[mt] = float(pv)
+                    except Exception:
+                        continue
+                if skipped_meter_prev_by_type:
+                    diag["warnings"].append({"water_context_history_skipped": skipped_meter_prev_by_type})
+                training_prev_by_type: dict[str, float] = {}
+                for mt in ("cold", "hot"):
+                    typed_training = _get_recent_training_values_for_type(conn, int(apartment_id), str(ym), mt, limit=16)
+                    if not typed_training:
+                        continue
+                    typed_cluster = _select_water_context_values(
+                        typed_training,
+                        max_values=1,
+                        support_tol=180.0,
+                        cluster_only_if_any=True,
+                    )
+                    if typed_cluster:
+                        training_prev_by_type[mt] = float(typed_cluster[0])
                 # Prefer human-corrected history for OCR context (more reliable than stale meter_readings).
                 training_vals = _get_recent_training_water_values(conn, int(apartment_id), str(ym), limit=40)
                 if training_vals:
@@ -1883,16 +2740,17 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         prev_vals.extend(clustered)
                         use_training_cluster = True
                 if not use_training_cluster:
-                    for mt in ("cold", "hot"):
-                        pv = _get_prev_reading(conn, int(apartment_id), prev_ym, mt, 1)
-                        if pv is None:
-                            pv = _get_last_reading_before(conn, int(apartment_id), str(ym), mt, 1)
-                        if pv is None:
-                            continue
-                        try:
-                            prev_vals.append(float(pv))
-                        except Exception:
-                            continue
+                    prev_vals.extend(float(v) for v in meter_prev_by_type.values())
+                for mt in ("cold", "hot"):
+                    raw_prev_for_serial = training_prev_by_type.get(mt, meter_prev_by_type.get(mt))
+                    if raw_prev_for_serial is None:
+                        continue
+                    pv_for_serial = float(raw_prev_for_serial)
+                    s_norm = _normalize_serial(apt_serials.get(mt) if apt_row else None)
+                    sd = "".join(ch for ch in str(s_norm or "") if ch.isdigit())
+                    if len(sd) < 4:
+                        continue
+                    serial_prev_pairs.append((sd, pv_for_serial))
             if prev_vals:
                 prev_vals = _select_water_context_values(
                     prev_vals,
@@ -1904,6 +2762,16 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 context_prev_water = ",".join(f"{v:.3f}" for v in prev_vals[:3])
             if serial_hints:
                 context_serial_hint = ",".join(serial_hints[:3])
+            if serial_prev_pairs:
+                seen_serial_prev: set[str] = set()
+                parts: list[str] = []
+                for sd, pv in serial_prev_pairs:
+                    if sd in seen_serial_prev:
+                        continue
+                    seen_serial_prev.add(sd)
+                    parts.append(f"{sd}={float(pv):.3f}")
+                context_serial_prev = ";".join(parts)
+                diag["ocr_context_serial_prev"] = context_serial_prev
         except Exception as e:
             diag["warnings"].append({"ocr_context_prepare_failed": str(e)})
 
@@ -1916,21 +2784,72 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             (bytes(p["blob"]), str(p.get("filename") or "photo.jpg"), str(p.get("mime") or "image/jpeg"))
             for p in photo_payloads
         ]
-        ocr_resp, ocr_exc = _call_ocr_series_with_retries(
+        ocr_resp, ocr_exc = await run_in_threadpool(
+            _call_ocr_series_with_retries,
             series_photos,
             trace_id=trace_id,
             context_prev_water=context_prev_water,
             context_serial_hint=context_serial_hint,
+            context_serial_prev=context_serial_prev,
         )
     else:
-        ocr_resp, ocr_exc = _call_ocr_with_retries(
-            blob,
-            filename=selected_filename,
-            mime_type=selected_mime,
-            trace_id=trace_id,
-            context_prev_water=context_prev_water,
-            context_serial_hint=context_serial_hint,
-        )
+        ocr_resp = None
+        ocr_exc = None
+        fast_prev_values = _parse_prev_values_context(context_prev_water)
+        fast_serial_hints = _parse_serial_hints_context(context_serial_hint)
+        context_free_primary = False
+        context_free_primary_sufficient = True
+        if context_free_primary:
+            fast_resp, fast_exc = await run_in_threadpool(
+                _call_ocr_with_retries,
+                blob,
+                filename=selected_filename,
+                mime_type=selected_mime,
+                trace_id=trace_id,
+                context_prev_water=None,
+                context_serial_hint=None,
+                read_timeout_override_sec=min(60.0, max(35.0, float(OCR_HTTP_TIMEOUT_SEC))),
+            )
+            if fast_resp is not None and fast_resp.ok:
+                ocr_resp, ocr_exc = fast_resp, None
+                try:
+                    fast_json = fast_resp.json()
+                except Exception:
+                    fast_json = {}
+                fast_payload = fast_json if isinstance(fast_json, dict) else {}
+                context_free_primary_sufficient = _single_ocr_result_is_context_sufficient(
+                    fast_payload,
+                    fast_prev_values,
+                    fast_serial_hints,
+                )
+                diag["warnings"].append(
+                    {
+                        "ocr_context_free_primary": {
+                            "type": fast_payload.get("type"),
+                            "reading": fast_payload.get("reading"),
+                            "serial": fast_payload.get("serial"),
+                            "sufficient": bool(context_free_primary_sufficient),
+                        }
+                    }
+                )
+            elif fast_resp is not None:
+                ocr_resp, ocr_exc = fast_resp, None
+                diag["warnings"].append(f"ocr_context_free_primary_http_{fast_resp.status_code}")
+            elif fast_exc is not None:
+                ocr_resp, ocr_exc = None, fast_exc
+                diag["warnings"].append({"ocr_context_free_primary_error": str(fast_exc)})
+
+        if (not context_free_primary) and ocr_resp is None and ocr_exc is None:
+            ocr_resp, ocr_exc = await run_in_threadpool(
+                _call_ocr_with_retries,
+                blob,
+                filename=selected_filename,
+                mime_type=selected_mime,
+                trace_id=trace_id,
+                context_prev_water=context_prev_water,
+                context_serial_hint=context_serial_hint,
+                context_serial_prev=context_serial_prev,
+            )
     diag["ocr_latency_ms"] = int((time.monotonic() - ocr_t0) * 1000)
     if ocr_resp is not None:
         ocr_http_ok = bool(ocr_resp.ok)
@@ -1959,6 +2878,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         selected_filename = str(photo_payloads[selected_idx].get("filename") or selected_filename)
                         selected_mime = str(photo_payloads[selected_idx].get("mime") or selected_mime)
                         file_sha256 = hashlib.sha256(blob).hexdigest()
+                        _refresh_selected_file_diag("ocr_series_service_local_rescore")
                     diag["ocr_series"] = {
                         "files_count": int(series_local.get("files_count") or len(photo_payloads)),
                         "best_index": selected_idx,
@@ -1983,6 +2903,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             selected_filename = str(photo_payloads[selected_idx].get("filename") or selected_filename)
                             selected_mime = str(photo_payloads[selected_idx].get("mime") or selected_mime)
                             file_sha256 = hashlib.sha256(blob).hexdigest()
+                            _refresh_selected_file_diag("ocr_series_best_index")
                         diag["ocr_series"] = {
                             "files_count": int(ocr_json.get("files_count") or len(photo_payloads)),
                             "best_index": selected_idx,
@@ -1993,12 +2914,82 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         diag["warnings"].append("ocr_series_bad_response")
             else:
                 ocr_data = ocr_json
+                if context_free_primary and (not context_free_primary_sufficient):
+                    raw_reading = _parse_reading_to_float((ocr_data or {}).get("reading")) if isinstance(ocr_data, dict) else None
+                    if isinstance(ocr_data, dict) and raw_reading is not None:
+                        diag["warnings"].append(
+                            {
+                                "ocr_context_free_primary_reading_rejected": {
+                                    "reading": raw_reading,
+                                    "type": ocr_data.get("type"),
+                                    "serial": ocr_data.get("serial"),
+                                }
+                            }
+                        )
+                        ocr_data["reading"] = None
+                        if str(ocr_data.get("type") or "").strip().lower() == "unknown":
+                            ocr_data["confidence"] = min(float(ocr_data.get("confidence") or 0.0), 0.45)
         else:
             diag["warnings"].append(f"ocr_http_{ocr_resp.status_code}")
     else:
         diag["warnings"].append("ocr_unavailable")
         if ocr_exc is not None:
             diag["warnings"].append({"ocr_error": str(ocr_exc)})
+
+    primary_ocr_timed_out = bool(ocr_exc is not None and "timed out" in str(ocr_exc).lower())
+    context_free_fallback_used = False
+    if (
+        len(photo_payloads) == 1
+        and (not isinstance(ocr_data, dict))
+        and (context_prev_water or context_serial_hint)
+        and (not context_free_primary)
+        and (not primary_ocr_timed_out)
+    ):
+        context_free_fallback_used = True
+        diag["warnings"].append("ocr_context_free_fallback")
+        try:
+            fallback_resp, fallback_exc = await run_in_threadpool(
+                _call_ocr_with_retries,
+                blob,
+                filename=selected_filename,
+                mime_type=selected_mime,
+                trace_id=f"{trace_id}-ctxfree",
+                context_prev_water=None,
+                context_serial_hint=None,
+                read_timeout_override_sec=min(60.0, max(35.0, float(OCR_HTTP_TIMEOUT_SEC))),
+            )
+            if fallback_resp is not None and fallback_resp.ok:
+                fallback_json = fallback_resp.json()
+                if isinstance(fallback_json, dict):
+                    ocr_data = fallback_json
+                    ocr_http_ok = True
+                    ocr_http_status = int(fallback_resp.status_code)
+                    diag["warnings"].append(
+                        {
+                            "ocr_context_free_fallback_used": {
+                                "type": fallback_json.get("type"),
+                                "reading": fallback_json.get("reading"),
+                                "serial": fallback_json.get("serial"),
+                            }
+                        }
+                    )
+                else:
+                    diag["warnings"].append("ocr_context_free_fallback_bad_json")
+            else:
+                if fallback_resp is not None:
+                    diag["warnings"].append(f"ocr_context_free_fallback_http_{fallback_resp.status_code}")
+                if fallback_exc is not None:
+                    diag["warnings"].append({"ocr_context_free_fallback_error": str(fallback_exc)})
+        except Exception as e:
+            diag["warnings"].append({"ocr_context_free_fallback_exception": str(e)})
+    elif (
+        len(photo_payloads) == 1
+        and (not isinstance(ocr_data, dict))
+        and (context_prev_water or context_serial_hint)
+        and (not context_free_primary)
+        and primary_ocr_timed_out
+    ):
+        diag["warnings"].append("ocr_context_free_fallback_skipped_after_timeout")
 
     # Before doing a second OCR pass, try to recover a strong water reading
     # from odometer-style debug candidates already returned by OCR. This avoids
@@ -2051,50 +3042,97 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 if odo_pool:
                     promoted = max(odo_pool, key=lambda c: float(c.get("confidence") or 0.0))
             if promoted and promoted.get("reading") is not None:
-                ocr_data["reading"] = float(promoted.get("reading"))
-                if (not str(ocr_data.get("type") or "").strip()) or existing_type == "unknown":
-                    ocr_data["type"] = promoted.get("type")
-                if (not ocr_data.get("serial")) and promoted.get("serial"):
-                    ocr_data["serial"] = promoted.get("serial")
-                diag["warnings"].append(
-                    {
-                        "ocr_debug_promoted_before_retry": {
-                            "reading": float(promoted.get("reading")),
-                            "variant": promoted.get("variant"),
-                            "provider": promoted.get("provider"),
-                            "prev_ref": promoted_prev,
-                            "delta": promoted_delta,
-                        }
-                    }
+                promoted_reading = _parse_reading_to_float(promoted.get("reading"))
+                promoted_dist = _nearest_prev_distance(promoted_reading, prev_vals) if prev_vals else float("inf")
+                serial_norm_promoted = _normalize_serial(promoted.get("serial") or ocr_data.get("serial"))
+                serial_like = _looks_like_serial_reading(promoted_reading, serial_norm_promoted)
+                safe_promote = bool(
+                    promoted_reading is not None
+                    and (not serial_like)
+                    and (
+                        (prev_vals and promoted_dist <= 220.0)
+                        or (not prev_vals and float(promoted.get("confidence") or 0.0) >= 0.86)
+                    )
                 )
+                if safe_promote:
+                    ocr_data["reading"] = float(promoted_reading)
+                    if (not str(ocr_data.get("type") or "").strip()) or existing_type == "unknown":
+                        ocr_data["type"] = promoted.get("type")
+                    if (not ocr_data.get("serial")) and promoted.get("serial"):
+                        ocr_data["serial"] = promoted.get("serial")
+                    diag["warnings"].append(
+                        {
+                            "ocr_debug_promoted_before_retry": {
+                                "reading": float(promoted_reading),
+                                "variant": promoted.get("variant"),
+                                "provider": promoted.get("provider"),
+                                "prev_ref": promoted_prev,
+                                "delta": promoted_delta,
+                            }
+                        }
+                    )
+                else:
+                    diag["warnings"].append(
+                        {
+                            "ocr_debug_promotion_rejected": {
+                                "reading": promoted_reading,
+                                "variant": promoted.get("variant"),
+                                "provider": promoted.get("provider"),
+                                "context_distance": None if not math.isfinite(promoted_dist) else round(float(promoted_dist), 3),
+                                "serial_like": bool(serial_like),
+                            }
+                        }
+                    )
 
     # Single-photo safety retry:
     # if OCR returned unknown/empty (or transport failed), give the same image one extra chance
     # without changing the rest of the decision tree.
     single_retry_needed = False
-    if len(photo_payloads) == 1:
+    single_retry_skip_reason = None
+    if len(photo_payloads) == 1 and (not context_free_fallback_used) and (not context_free_primary):
         if not isinstance(ocr_data, dict):
-            single_retry_needed = True
+            if primary_ocr_timed_out:
+                single_retry_skip_reason = "primary_timeout"
+            else:
+                single_retry_needed = True
         else:
             existing_type = str(ocr_data.get("type") or "").strip().lower()
             existing_notes = str(ocr_data.get("notes") or "").strip().lower()
             existing_reading = _parse_reading_to_float(ocr_data.get("reading"))
+            has_water_context = bool(context_prev_water or context_serial_hint)
+            waterish_empty_result = bool(
+                has_water_context
+                and existing_reading is None
+                and (
+                    existing_type in ("", "unknown", "хвс", "гвс", "cold", "hot", "water")
+                    or bool(ocr_data.get("serial"))
+                    or isinstance(ocr_data.get("water_decision"), dict)
+                    or isinstance(diag.get("ocr_water_decision"), dict)
+                )
+            )
             if existing_reading is None and (
                 existing_type in ("", "unknown") or "openai_empty_response" in existing_notes
             ):
-                single_retry_needed = True
+                if waterish_empty_result:
+                    single_retry_skip_reason = "water_empty_result"
+                else:
+                    single_retry_needed = True
             elif _needs_electric_quality_retry(ocr_data):
                 single_retry_needed = True
+    if single_retry_skip_reason:
+        diag["warnings"].append({"ocr_single_second_pass_skipped": single_retry_skip_reason})
     if single_retry_needed:
         diag["warnings"].append("ocr_single_second_pass")
         try:
-            retry_resp, retry_exc = _call_ocr_with_retries(
+            retry_resp, retry_exc = await run_in_threadpool(
+                _call_ocr_with_retries,
                 blob,
                 filename=selected_filename,
                 mime_type=selected_mime,
                 trace_id=f"{trace_id}-sp2",
                 context_prev_water=context_prev_water,
                 context_serial_hint=context_serial_hint,
+                context_serial_prev=context_serial_prev,
                 read_timeout_override_sec=max(float(OCR_HTTP_TIMEOUT_SEC), 110.0),
             )
             if retry_resp is not None and retry_resp.ok:
@@ -2140,15 +3178,81 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     diag["warnings"].append({"ocr_single_second_pass_error": str(retry_exc)})
         except Exception as e:
             diag["warnings"].append({"ocr_single_second_pass_exception": str(e)})
+
+    # Electric safety retry:
+    # A generic full-frame read can be confidently wrong on simple LCD photos
+    # (e.g. 2834 instead of 2634). If the winner is not display-localized,
+    # force a context-free OCR pass so electric display crops get a clean shot.
+    if len(photo_payloads) == 1 and _is_uncorroborated_electric_fullframe(ocr_data):
+        diag["warnings"].append("ocr_electric_context_free_retry")
+        try:
+            ef_resp, ef_exc = await run_in_threadpool(
+                _call_ocr_with_retries,
+                blob,
+                filename=selected_filename,
+                mime_type=selected_mime,
+                trace_id=f"{trace_id}-electric-cf",
+                context_prev_water=None,
+                context_serial_hint=None,
+                context_serial_prev=None,
+                read_timeout_override_sec=max(float(OCR_HTTP_TIMEOUT_SEC), 130.0),
+            )
+            if ef_resp is not None and ef_resp.ok:
+                ef_json = ef_resp.json()
+                current_score = _ocr_payload_quality(ocr_data)
+                retry_score = _ocr_payload_quality(ef_json)
+                retry_reading = _parse_reading_to_float((ef_json or {}).get("reading")) if isinstance(ef_json, dict) else None
+                if (
+                    isinstance(ef_json, dict)
+                    and retry_reading is not None
+                    and (
+                        _electric_has_display_support(ef_json)
+                        or retry_score > current_score + 0.75
+                    )
+                ):
+                    ocr_data = ef_json
+                    ocr_http_ok = True
+                    ocr_http_status = int(ef_resp.status_code)
+                    diag["warnings"].append(
+                        {
+                            "ocr_electric_context_free_retry_quality": {
+                                "current_score": round(float(current_score), 4),
+                                "retry_score": round(float(retry_score), 4),
+                                "chosen": "retry",
+                                "reading": float(retry_reading),
+                                "display_supported": bool(_electric_has_display_support(ef_json)),
+                            }
+                        }
+                    )
+                else:
+                    diag["warnings"].append(
+                        {
+                            "ocr_electric_context_free_retry_quality": {
+                                "current_score": round(float(current_score), 4),
+                                "retry_score": round(float(retry_score), 4),
+                                "chosen": "current",
+                            }
+                        }
+                    )
+            else:
+                if ef_resp is not None:
+                    diag["warnings"].append(f"ocr_electric_context_free_retry_http_{ef_resp.status_code}")
+                if ef_exc is not None:
+                    diag["warnings"].append({"ocr_electric_context_free_retry_error": str(ef_exc)})
+        except Exception as e:
+            diag["warnings"].append({"ocr_electric_context_free_retry_exception": str(e)})
+
     # Safety fallback for multi-photo batch:
     # when /recognize-series fails or times out, run single-image OCR per file and pick best locally.
     if len(photo_payloads) > 1 and (not isinstance(ocr_data, dict)):
         try:
-            series_fallback = _call_ocr_series_via_singles(
+            series_fallback = await run_in_threadpool(
+                _call_ocr_series_via_singles,
                 series_photos,
                 trace_id=trace_id,
                 context_prev_water=context_prev_water,
                 context_serial_hint=context_serial_hint,
+                context_serial_prev=context_serial_prev,
             )
             best = series_fallback.get("best")
             if isinstance(best, dict):
@@ -2163,6 +3267,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     selected_filename = str(photo_payloads[selected_idx].get("filename") or selected_filename)
                     selected_mime = str(photo_payloads[selected_idx].get("mime") or selected_mime)
                     file_sha256 = hashlib.sha256(blob).hexdigest()
+                    _refresh_selected_file_diag("ocr_series_single_fallback")
                 diag["ocr_series"] = {
                     "files_count": int(series_fallback.get("files_count") or len(photo_payloads)),
                     "best_index": selected_idx,
@@ -2188,19 +3293,51 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     ocr_reading = None
     ocr_confidence = None
     ocr_serial = None
+    ocr_tariff_index = None
+    ocr_water_visual_type_hint = None
     if isinstance(ocr_data, dict):
         ocr_type = ocr_data.get("type")
         ocr_reading = ocr_data.get("reading")
         ocr_confidence = ocr_data.get("confidence")
         ocr_serial = ocr_data.get("serial")
+        ocr_tariff_index = _extract_ocr_tariff_index(ocr_data)
+        if ocr_tariff_index is not None:
+            ocr_data["tariff_index"] = int(ocr_tariff_index)
+            diag["ocr_tariff_index"] = int(ocr_tariff_index)
         if ocr_data.get("trace_id"):
             diag["ocr_trace_id"] = ocr_data.get("trace_id")
+        ocr_water_visual_type_hint = _extract_water_visual_type_hint(ocr_data)
+        if ocr_water_visual_type_hint is not None:
+            diag["ocr_water_visual_type_hint"] = jsonable_encoder(ocr_water_visual_type_hint)
+        if ocr_data.get("provider_errors"):
+            try:
+                diag["ocr_provider_errors"] = list(ocr_data.get("provider_errors") or [])[:8]
+            except Exception:
+                diag["ocr_provider_errors"] = ocr_data.get("provider_errors")
+        if isinstance(ocr_data.get("local_recognizer"), dict):
+            try:
+                diag["ocr_local_recognizer"] = _summarize_local_recognizer_for_diag(
+                    dict(ocr_data.get("local_recognizer") or {})
+                )
+            except Exception as e:
+                diag["warnings"].append({"ocr_local_recognizer_parse_failed": str(e)})
 
     kind = _ocr_to_kind(ocr_type)
+    if (
+        kind is None
+        and isinstance(ocr_water_visual_type_hint, dict)
+        and ocr_water_visual_type_hint.get("kind") in ("cold", "hot")
+        and float(ocr_water_visual_type_hint.get("confidence") or 0.0) >= 0.64
+    ):
+        kind = str(ocr_water_visual_type_hint.get("kind"))
+        ocr_water_visual_type_hint["used_for_raw_kind"] = True
+        diag["ocr_water_visual_type_hint"] = jsonable_encoder(ocr_water_visual_type_hint)
     value_float = _parse_reading_to_float(ocr_reading)
     serial_norm = _normalize_serial(ocr_serial)
+    raw_kind_before_serial = kind
     serial_force_kind = None
-    if db_ready() and apartment_id and serial_norm:
+    serial_resolution = _resolve_kind_by_type_and_serial(kind, serial_norm)
+    if db_ready() and apartment_id:
         try:
             with engine.begin() as conn:
                 apt_row = conn.execute(
@@ -2208,19 +3345,49 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     {"aid": int(apartment_id)},
                 ).mappings().first()
             if apt_row:
-                s_last5 = _last5_serial(serial_norm)
-                cold_last5 = _last5_serial(apt_row.get("cold_serial"))
-                hot_last5 = _last5_serial(apt_row.get("hot_serial"))
-                cold_match = _serial_last5_matches(s_last5, cold_last5)
-                hot_match = _serial_last5_matches(s_last5, hot_last5)
-                if cold_match and not hot_match:
-                    serial_force_kind = "cold"
-                elif hot_match and not cold_match:
-                    serial_force_kind = "hot"
+                serial_resolution = _resolve_kind_by_type_and_serial(
+                    kind,
+                    serial_norm,
+                    cold_serial=apt_row.get("cold_serial"),
+                    hot_serial=apt_row.get("hot_serial"),
+                )
+                serial_force_kind = serial_resolution.get("serial_force_kind")
         except Exception as e:
             diag["warnings"].append({"serial_route_prepare_failed": str(e)})
-    if serial_force_kind and kind not in ("cold", "hot"):
+    else:
+        serial_force_kind = serial_resolution.get("serial_force_kind")
+    if serial_force_kind:
         kind = str(serial_force_kind)
+    elif serial_resolution.get("resolved_kind"):
+        kind = str(serial_resolution.get("resolved_kind"))
+    serial_resolution["resolved_kind"] = kind if kind in ("cold", "hot", "electric") else None
+    serial_resolution["raw_ocr_type"] = (str(ocr_type) if ocr_type is not None else None)
+    serial_resolution["has_serial"] = bool(serial_norm)
+    if isinstance(ocr_water_visual_type_hint, dict):
+        serial_resolution["visual_type_hint"] = ocr_water_visual_type_hint
+    diag["meter_resolution"] = jsonable_encoder(serial_resolution)
+    if not serial_resolution.get("resolved_kind"):
+        diag["warnings"].append(
+            {
+                "meter_type_unresolved": {
+                    "raw_ocr_type": (str(ocr_type) if ocr_type is not None else None),
+                    "has_serial": bool(serial_norm),
+                    "serial_match": serial_resolution.get("serial_match"),
+                    "policy": serial_resolution.get("policy"),
+                }
+            }
+        )
+    if serial_resolution.get("type_conflict"):
+        diag["warnings"].append(
+            {
+                "serial_type_override": {
+                    "raw_kind": raw_kind_before_serial,
+                    "serial_kind": serial_force_kind,
+                    "serial_last5": serial_resolution.get("serial_last5"),
+                    "policy": serial_resolution.get("policy"),
+                }
+            }
+        )
     try:
         ocr_conf = float(ocr_confidence) if ocr_confidence is not None else 0.0
     except Exception:
@@ -2251,6 +3418,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     "ranked": list((odometer_branch or {}).get("ranked") or [])[:5],
                 } if odometer_branch else None,
                 "detection": water_decision.get("detection"),
+                "context_serial_prev": water_decision.get("context_serial_prev"),
             }
         except Exception as e:
             diag["warnings"].append({"ocr_water_decision_parse_failed": str(e)})
@@ -2263,6 +3431,25 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     is_water_context = (kind in ("cold", "hot")) or (
         is_water_unknown and (is_water_debug or bool(serial_norm) or is_water_template_hint)
     )
+    unresolved_water_review_only = _should_hold_unresolved_water_for_review(
+        kind=kind,
+        ocr_type=(str(ocr_type) if ocr_type is not None else None),
+        serial_norm=serial_norm,
+        value_float=value_float,
+        is_water_context=bool(is_water_context),
+        serial_resolution=serial_resolution,
+    )
+    if unresolved_water_review_only:
+        diag["warnings"].append(
+            {
+                "water_type_unresolved_review_only": {
+                    "policy": "review_no_type_no_serial",
+                    "raw_ocr_type": (str(ocr_type) if ocr_type is not None else None),
+                    "reading": value_float,
+                    "has_serial": bool(serial_norm),
+                }
+            }
+        )
 
     # Guard: OCR may mistakenly read serial number as meter reading.
     # Try to recover from debug candidates first; otherwise mark as unknown reading.
@@ -2279,7 +3466,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             break
         if fallback:
             value_float = float(fallback.get("reading"))
-            kind = _ocr_to_kind(fallback.get("type"))
+            fallback_kind = _ocr_to_kind(fallback.get("type"))
+            kind = str(serial_force_kind) if serial_force_kind in ("cold", "hot") else fallback_kind
             if isinstance(ocr_data, dict):
                 ocr_data["reading"] = float(value_float)
                 ocr_data["type"] = fallback.get("type")
@@ -2290,6 +3478,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         "to": value_float,
                         "variant": fallback.get("variant"),
                         "provider": fallback.get("provider"),
+                        "resolved_kind_after_correction": kind,
                     }
                 }
             )
@@ -2416,7 +3605,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         # accept only meaningful improvement; otherwise block write
                         if abs(candidate_v - float(prev_ref)) + 120.0 < abs(old_v - float(prev_ref)):
                             value_float = candidate_v
-                            kind = _ocr_to_kind(best_c.get("type")) or kind
+                            candidate_kind = _ocr_to_kind(best_c.get("type"))
+                            kind = str(serial_force_kind) if serial_force_kind in ("cold", "hot") else (candidate_kind or kind)
                             if isinstance(ocr_data, dict):
                                 ocr_data["reading"] = float(value_float)
                                 ocr_data["type"] = best_c.get("type")
@@ -2532,7 +3722,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             )
             if best_c and best_c.get("reading") is not None:
                 value_float = float(best_c.get("reading"))
-                kind = _ocr_to_kind(best_c.get("type")) or kind
+                candidate_kind = _ocr_to_kind(best_c.get("type"))
+                kind = str(serial_force_kind) if serial_force_kind in ("cold", "hot") else (candidate_kind or kind)
                 if isinstance(ocr_data, dict):
                     ocr_data["reading"] = float(value_float)
                     ocr_data["type"] = best_c.get("type")
@@ -2577,9 +3768,50 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         if isinstance(ocr_data, dict):
             ocr_data["reading"] = value_float
 
+    unresolved_water_review_only = _should_hold_unresolved_water_for_review(
+        kind=kind,
+        ocr_type=(str(ocr_type) if ocr_type is not None else None),
+        serial_norm=serial_norm,
+        value_float=value_float,
+        is_water_context=bool(is_water_context),
+        serial_resolution=serial_resolution,
+    )
+    if unresolved_water_review_only and not any(
+        isinstance(w, dict) and "water_type_unresolved_review_only" in w for w in (diag.get("warnings") or [])
+    ):
+        diag["warnings"].append(
+            {
+                "water_type_unresolved_review_only": {
+                    "policy": "review_no_type_no_serial",
+                    "raw_ocr_type": (str(ocr_type) if ocr_type is not None else None),
+                    "reading": value_float,
+                    "has_serial": bool(serial_norm),
+                }
+            }
+        )
+
+    electric_uncorroborated_review_only = bool(_is_uncorroborated_electric_fullframe(ocr_data))
+    if electric_uncorroborated_review_only:
+        diag["warnings"].append(
+            {
+                "electric_uncorroborated_fullframe_review_only": {
+                    "policy": "review_no_display_localized_electric_candidate",
+                    "reading": value_float,
+                    "raw_ocr_type": (str(ocr_type) if ocr_type is not None else None),
+                    "notes": (str((ocr_data or {}).get("notes") or "")[:220] if isinstance(ocr_data, dict) else None),
+                }
+            }
+        )
+
     # 2.1) history-safe electric repair: if OCR likely dropped a single integer digit,
     # recover it only when one inserted-digit candidate is meaningfully closer to prior values.
-    if db_ready() and apartment_id and kind == "electric" and value_float is not None:
+    if (
+        db_ready()
+        and apartment_id
+        and kind == "electric"
+        and value_float is not None
+        and (not electric_uncorroborated_review_only)
+    ):
         try:
             with engine.begin() as conn:
                 fixed_value, fix_diag = _maybe_fix_missing_digit_electric(conn, int(apartment_id), str(ym), float(value_float))
@@ -2595,10 +3827,14 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     ydisk_path = None
     if ydisk_ready():
         try:
-            ydisk_path = upload_to_ydisk(
+            upload_meter_type_label = str(ocr_type or "unknown")
+            if kind in ("cold", "hot"):
+                upload_meter_type_label = _kind_to_label(str(kind), 1) or upload_meter_type_label
+            ydisk_path = await run_in_threadpool(
+                upload_to_ydisk,
                 str(chat_id),
                 chat_name=telegram_username or f"chat_{chat_id}",
-                meter_type_label=str(ocr_type or "unknown"),
+                meter_type_label=upload_meter_type_label,
                 original_filename=selected_filename,
                 content=blob,
             )
@@ -2679,8 +3915,33 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
     wrote_meter = False
     # ym already defined above
     assigned_meter_index = int(meter_index)
+    same_file_cross_month_review_only = False
+    same_file_cross_month_reuse: Optional[dict[str, Any]] = None
+    if db_ready() and apartment_id and photo_event_id and file_sha256:
+        try:
+            with engine.begin() as conn:
+                same_file_cross_month_reuse = _find_same_file_cross_month_reuse(
+                    conn,
+                    apartment_id=int(apartment_id),
+                    ym=str(ym),
+                    file_sha256=file_sha256,
+                    photo_event_id=int(photo_event_id),
+                )
+            if same_file_cross_month_reuse:
+                same_file_cross_month_review_only = True
+                diag["warnings"].append({"same_file_cross_month_reuse": same_file_cross_month_reuse})
+        except Exception as e:
+            diag["warnings"].append({"same_file_cross_month_reuse_check_failed": str(e)})
 
-    if db_ready() and apartment_id and (value_float is not None) and (kind or is_water_context):
+    if (
+        db_ready()
+        and apartment_id
+        and (value_float is not None)
+        and (kind or is_water_context)
+        and (not unresolved_water_review_only)
+        and (not electric_uncorroborated_review_only)
+        and (not same_file_cross_month_review_only)
+    ):
         try:
             # 6.0) anomaly check vs previous month (absolute thresholds)
             anomaly = False
@@ -2986,6 +4247,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             electric_assignment_mode = None
             electric_close_idx = None
             electric_retake_warning = None
+            electric_write_blocked_reason = None
+            electric_assignment_done = False
             electric_rows_before: list[dict[str, Any]] = []
             electric_rows_after: list[dict[str, Any]] = []
 
@@ -2993,6 +4256,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                 # By default always auto-sort.
                 # First: if value is very close to an existing one, overwrite that slot.
                 close_idx = None
+                tariff_idx = int(ocr_tariff_index) if ocr_tariff_index in (1, 2, 3) else None
                 prev_manual = None
                 prev_manual_value = None
                 with engine.begin() as conn:
@@ -3012,19 +4276,49 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         ),
                         {"aid": int(apartment_id), "ym": str(ym)},
                     ).fetchall()
-                    best = None
-                    for mi, v in (rows or []):
-                        if v is None:
-                            continue
-                        try:
-                            diff = abs(float(v) - float(value_float))
-                        except Exception:
-                            continue
-                        if diff <= ELECTRIC_RETAKE_THRESHOLD:
-                            if (best is None) or (diff < best[0]):
-                                best = (diff, int(mi))
-                        if best:
-                            close_idx = int(best[1])
+                    same_file_correction = _try_apply_same_file_electric_correction(
+                        conn,
+                        apartment_id=int(apartment_id),
+                        ym=str(ym),
+                        file_sha256=file_sha256,
+                        photo_event_id=(int(photo_event_id) if photo_event_id is not None else None),
+                        new_value=(float(value_float) if value_float is not None else None),
+                        rows_before=electric_rows_before,
+                    )
+                    if same_file_correction:
+                        assigned_meter_index = int(same_file_correction["assigned_meter_index"])
+                        electric_close_idx = int(assigned_meter_index)
+                        electric_assignment_mode = "same_file_correction"
+                        electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
+                        diag["warnings"].append({"electric_same_file_correction": same_file_correction})
+                        electric_assignment_done = True
+                    if (not electric_assignment_done) and tariff_idx is not None:
+                        expected_int = int(electric_expected or 0)
+                        if expected_int < 3 and tariff_idx > max(1, expected_int):
+                            # The photo explicitly says T3 while the apartment profile expects
+                            # only T1/T2. Keep the exact target index for review, but do not
+                            # silently write a value that contradicts the configured contract.
+                            assigned_meter_index = int(tariff_idx)
+                            electric_assignment_mode = "tariff_index_exceeds_expected_review"
+                            electric_rows_after = list(electric_rows_before)
+                            electric_write_blocked_reason = {
+                                "reason": "tariff_index_exceeds_expected",
+                                "expected": int(electric_expected or 0),
+                                "expected_snapshot": (
+                                    int(electric_expected_snapshot) if electric_expected_snapshot is not None else None
+                                ),
+                                "tariff_index": int(tariff_idx),
+                                "incoming_value": float(value_float),
+                                "assigned_meter_index": int(assigned_meter_index),
+                                "rows_before": electric_rows_before,
+                                "ydisk_path": ydisk_path,
+                            }
+                            water_write_blocked = True
+                            diag["warnings"].append(
+                                {"electric_tariff_index_exceeds_expected_review": dict(electric_write_blocked_reason)}
+                            )
+                            electric_assignment_done = True
+                        else:
                             try:
                                 row = conn.execute(
                                     text(
@@ -3035,13 +4329,85 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                         LIMIT 1
                                         """
                                     ),
-                                    {"aid": int(apartment_id), "ym": str(ym), "mi": int(close_idx)},
+                                    {"aid": int(apartment_id), "ym": str(ym), "mi": int(tariff_idx)},
                                 ).fetchone()
                                 if row and str(row[1]) == "manual":
                                     prev_manual = True
                                     prev_manual_value = float(row[0])
                             except Exception:
                                 pass
+                            assigned_meter_index = _write_electric_explicit(
+                                conn,
+                                int(apartment_id),
+                                ym,
+                                int(tariff_idx),
+                                float(value_float),
+                            )
+                            electric_close_idx = int(assigned_meter_index)
+                            electric_assignment_mode = "tariff_index_write"
+                            electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
+                            electric_assignment_done = True
+
+                    best = None
+                    if not electric_assignment_done:
+                        for mi, v in (rows or []):
+                            if v is None:
+                                continue
+                            try:
+                                diff = abs(float(v) - float(value_float))
+                            except Exception:
+                                continue
+                            if diff <= ELECTRIC_RETAKE_THRESHOLD:
+                                if (best is None) or (diff < best[0]):
+                                    best = (diff, int(mi))
+                    if (not electric_assignment_done) and best:
+                        close_idx = int(best[1])
+                        try:
+                            row = conn.execute(
+                                text(
+                                    """
+                                    SELECT value, source
+                                    FROM meter_readings
+                                    WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric' AND meter_index=:mi
+                                    LIMIT 1
+                                    """
+                                ),
+                                {"aid": int(apartment_id), "ym": str(ym), "mi": int(close_idx)},
+                            ).fetchone()
+                            if row and str(row[1]) == "manual":
+                                prev_manual = True
+                                prev_manual_value = float(row[0])
+                        except Exception:
+                            pass
+                        if bool(electric_extra_pending) and int(electric_expected or 0) < 3:
+                            # Do not normalize/drop the extra pending value during retake.
+                            # The admin review state must keep all observed electric values.
+                            conn.execute(
+                                text(
+                                    """
+                                    INSERT INTO meter_readings(apartment_id, ym, meter_type, meter_index, value, source, ocr_value)
+                                    VALUES(:aid,:ym,'electric',:idx,:val,'ocr',:ocr)
+                                    ON CONFLICT (apartment_id, ym, meter_type, meter_index) DO UPDATE SET
+                                        value=EXCLUDED.value,
+                                        source=EXCLUDED.source,
+                                        ocr_value=EXCLUDED.ocr_value,
+                                        updated_at=now()
+                                    """
+                                ),
+                                {
+                                    "aid": int(apartment_id),
+                                    "ym": str(ym),
+                                    "idx": int(close_idx),
+                                    "val": float(value_float),
+                                    "ocr": float(value_float),
+                                },
+                            )
+                            assigned_meter_index = int(close_idx)
+                            electric_close_idx = int(close_idx)
+                            electric_assignment_mode = "retake_overwrite_keep_extra_pending"
+                            electric_retake_warning = int(close_idx)
+                            electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
+                        else:
                             _write_electric_overwrite_then_sort(
                                 conn,
                                 int(apartment_id),
@@ -3056,7 +4422,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                             electric_retake_warning = int(close_idx)
                             electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
 
-                if close_idx is None:
+                if (not electric_assignment_done) and close_idx is None:
                     if (meter_index_mode == "explicit") and (raw_meter_index is not None):
                         with engine.begin() as conn:
                             try:
@@ -3111,14 +4477,106 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     prev_manual_value = float(best[1])
                             except Exception:
                                 pass
-                        assigned_meter_index = _assign_and_write_electric_sorted(
-                            int(apartment_id),
-                            ym,
-                            float(value_float),
-                        )
-                        electric_assignment_mode = "auto_sorted_write"
-                        with engine.begin() as conn:
-                            electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
+                        if bool(electric_extra_pending) and int(electric_expected or 0) < 3:
+                            # When the month is already in "extra electric value needs admin review",
+                            # never replace the extra slot with another distinct OCR value.
+                            # Keep the new observation in photo_events and review trail only.
+                            assigned_meter_index = max(1, min(3, int(electric_expected_snapshot or electric_expected or 2) + 1))
+                            electric_assignment_mode = "extra_pending_unmapped_review"
+                            electric_rows_after = list(electric_rows_before)
+                            electric_write_blocked_reason = {
+                                "reason": "extra_pending_unmapped",
+                                "expected": int(electric_expected or 0),
+                                "expected_snapshot": (
+                                    int(electric_expected_snapshot) if electric_expected_snapshot is not None else None
+                                ),
+                                "incoming_value": float(value_float),
+                                "assigned_meter_index": int(assigned_meter_index),
+                                "rows_before": electric_rows_before,
+                                "ydisk_path": ydisk_path,
+                            }
+                            water_write_blocked = True
+                            diag["warnings"].append(
+                                {"electric_extra_pending_unmapped_review": dict(electric_write_blocked_reason)}
+                            )
+                            try:
+                                with engine.begin() as conn:
+                                    exists = conn.execute(
+                                        text(
+                                            """
+                                            SELECT 1
+                                            FROM meter_review_flags
+                                            WHERE apartment_id=:aid AND ym=:ym AND meter_type='electric'
+                                              AND meter_index=:mi AND status='open'
+                                              AND reason='electric_extra_pending_unmapped'
+                                            LIMIT 1
+                                            """
+                                        ),
+                                        {
+                                            "aid": int(apartment_id),
+                                            "ym": str(ym),
+                                            "mi": int(assigned_meter_index),
+                                        },
+                                    ).fetchone()
+                                    if not exists:
+                                        conn.execute(
+                                            text(
+                                                """
+                                                INSERT INTO meter_review_flags(
+                                                    apartment_id, ym, meter_type, meter_index, status, reason, comment, created_at, resolved_at
+                                                )
+                                                VALUES(:aid, :ym, 'electric', :mi, 'open', 'electric_extra_pending_unmapped', :comment, now(), NULL)
+                                                """
+                                            ),
+                                            {
+                                                "aid": int(apartment_id),
+                                                "ym": str(ym),
+                                                "mi": int(assigned_meter_index),
+                                                "comment": json.dumps(electric_write_blocked_reason, ensure_ascii=False),
+                                            },
+                                        )
+                                    username = (telegram_username or "").strip().lstrip("@").lower() or "Без username"
+                                    related = json.dumps(
+                                        {
+                                            "ym": str(ym),
+                                            "meter_type": "electric",
+                                            "meter_index": int(assigned_meter_index),
+                                            "ydisk_path": ydisk_path,
+                                        },
+                                        ensure_ascii=False,
+                                    )
+                                    msg = (
+                                        "Лишнее электрическое показание требует сопоставления администратором. "
+                                        f"Значение: {float(value_float)}. Файл: {ydisk_path}"
+                                    )
+                                    conn.execute(
+                                        text(
+                                            """
+                                            INSERT INTO notifications(
+                                                chat_id, telegram_username, apartment_id, type, message, related, status, created_at
+                                            )
+                                            VALUES(:chat_id, :username, :apartment_id, 'electric_extra_pending_unmapped', :message, CAST(:related AS JSONB), 'unread', now())
+                                            """
+                                        ),
+                                        {
+                                            "chat_id": str(chat_id),
+                                            "username": username,
+                                            "apartment_id": int(apartment_id),
+                                            "message": msg,
+                                            "related": related,
+                                        },
+                                    )
+                            except Exception as e:
+                                diag["warnings"].append({"electric_extra_pending_review_flag_failed": str(e)})
+                        else:
+                            assigned_meter_index = _assign_and_write_electric_sorted(
+                                int(apartment_id),
+                                ym,
+                                float(value_float),
+                            )
+                            electric_assignment_mode = "auto_sorted_write"
+                            with engine.begin() as conn:
+                                electric_rows_after = _get_electric_month_snapshot(conn, int(apartment_id), str(ym))
 
                 assigned_meter_index = _resolve_electric_assigned_index(
                     electric_rows_after,
@@ -3145,6 +4603,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                     incoming_value=(float(value_float) if value_float is not None else None),
                     mode=electric_assignment_mode,
                     close_idx=electric_close_idx,
+                    tariff_index=ocr_tariff_index,
                     meter_index_mode=meter_index_mode,
                     requested_meter_index=(int(raw_meter_index) if raw_meter_index is not None else None),
                     assigned_meter_index=int(assigned_meter_index),
@@ -3355,17 +4814,16 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                     if db_ready() and photo_event_id:
                                         try:
                                             diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
-                                            with engine.begin() as conn:
-                                                conn.execute(
-                                                    text(
-                                                        """
-                                                        UPDATE photo_events
-                                                        SET diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
-                                                        WHERE id = :id
-                                                        """
-                                                    ),
-                                                    {"id": int(photo_event_id), "diag_json": diag_json_str},
-                                                )
+                                            conn.execute(
+                                                text(
+                                                    """
+                                                    UPDATE photo_events
+                                                    SET diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                                                    WHERE id = :id
+                                                    """
+                                                ),
+                                                {"id": int(photo_event_id), "diag_json": diag_json_str},
+                                            )
                                         except Exception:
                                             pass
                                     return JSONResponse(
@@ -3391,6 +4849,18 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                         except Exception:
                             force_kind = None
                             force_no_sort = False
+
+                        if force_kind in ("cold", "hot") and kind != force_kind:
+                            diag["warnings"].append(
+                                {
+                                    "serial_type_override": {
+                                        "raw_kind": kind,
+                                        "serial_kind": str(force_kind),
+                                        "policy": "serial_authoritative_write_path",
+                                    }
+                                }
+                            )
+                            kind = str(force_kind)
 
                         # Hard serial+history sanity:
                         # if serial maps to a specific water meter, keep value near that meter's previous reading.
@@ -3425,7 +4895,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
                                         if best_serial and best_serial.get("reading") is not None:
                                             old_v = float(value_float)
                                             value_float = float(best_serial.get("reading"))
-                                            kind = _ocr_to_kind(best_serial.get("type")) or kind
+                                            candidate_kind = _ocr_to_kind(best_serial.get("type"))
+                                            kind = str(force_kind) if force_kind in ("cold", "hot") else (candidate_kind or kind)
                                             if isinstance(ocr_data, dict):
                                                 ocr_data["reading"] = float(value_float)
                                                 ocr_data["type"] = best_serial.get("type")
@@ -3965,6 +5436,123 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         except Exception as e:
             diag["errors"].append({"meter_write_failed": str(e)})
 
+    if unresolved_water_review_only and db_ready() and photo_event_id:
+        try:
+            _set_api_review_trace(
+                diag,
+                ym=str(ym),
+                apartment_id=(int(apartment_id) if apartment_id is not None else None),
+                raw_ocr_type=(str(ocr_type) if ocr_type is not None else None),
+                raw_ocr_reading=ocr_reading,
+                raw_ocr_serial=(str(ocr_serial) if ocr_serial is not None else None),
+                resolved_meter_kind=None,
+                resolved_meter_label=None,
+                assigned_meter_index=int(assigned_meter_index),
+                meter_written=False,
+                event_status="needs_review",
+                photo_event_id=int(photo_event_id),
+                ydisk_path=ydisk_path,
+                reason_override="water_type_unresolved",
+                serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
+            )
+            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE photo_events
+                        SET
+                            meter_written = false,
+                            stage = 'needs_review',
+                            stage_updated_at = now(),
+                            meter_kind = NULL,
+                            meter_value = :meter_value,
+                            diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": int(photo_event_id),
+                        "meter_value": (float(value_float) if value_float is not None else None),
+                        "diag_json": diag_json_str,
+                    },
+                )
+        except Exception as e:
+            diag["warnings"].append({"water_type_unresolved_review_update_failed": str(e)})
+
+    if electric_uncorroborated_review_only and db_ready() and photo_event_id:
+        try:
+            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE photo_events
+                        SET
+                            meter_written = false,
+                            stage = 'needs_review',
+                            stage_updated_at = now(),
+                            meter_kind = COALESCE(:meter_kind, meter_kind),
+                            meter_value = :meter_value,
+                            diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": int(photo_event_id),
+                        "meter_kind": str(kind) if kind is not None else None,
+                        "meter_value": (float(value_float) if value_float is not None else None),
+                        "diag_json": diag_json_str,
+                    },
+                )
+        except Exception as e:
+            diag["warnings"].append({"electric_uncorroborated_review_update_failed": str(e)})
+
+    if same_file_cross_month_review_only and db_ready() and photo_event_id:
+        try:
+            _set_api_review_trace(
+                diag,
+                ym=str(ym),
+                apartment_id=(int(apartment_id) if apartment_id is not None else None),
+                raw_ocr_type=(str(ocr_type) if ocr_type is not None else None),
+                raw_ocr_reading=ocr_reading,
+                raw_ocr_serial=(str(ocr_serial) if ocr_serial is not None else None),
+                resolved_meter_kind=(str(kind) if kind is not None else None),
+                resolved_meter_label=_kind_to_label((str(kind) if kind is not None else None), assigned_meter_index),
+                assigned_meter_index=int(assigned_meter_index),
+                meter_written=False,
+                event_status="needs_review",
+                photo_event_id=int(photo_event_id),
+                ydisk_path=ydisk_path,
+                reason_override="same_file_cross_month_reuse",
+                serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
+            )
+            diag_json_str = json.dumps(diag, ensure_ascii=False) if diag is not None else None
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE photo_events
+                        SET
+                            meter_written = false,
+                            stage = 'needs_review',
+                            stage_updated_at = now(),
+                            meter_kind = COALESCE(:meter_kind, meter_kind),
+                            meter_value = :meter_value,
+                            diag_json = CASE WHEN :diag_json IS NULL THEN diag_json ELSE CAST(:diag_json AS JSONB) END
+                        WHERE id = :id
+                        """
+                    ),
+                    {
+                        "id": int(photo_event_id),
+                        "meter_kind": str(kind) if kind is not None else None,
+                        "meter_value": (float(value_float) if value_float is not None else None),
+                        "diag_json": diag_json_str,
+                    },
+                )
+        except Exception as e:
+            diag["warnings"].append({"same_file_cross_month_review_update_failed": str(e)})
+
     # 6.5) auto-send sum
     if db_ready() and apartment_id:
         try:
@@ -4007,6 +5595,8 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             "water_type_uncertain",
             "ocr_type_conflict",
             "serial_mismatch",
+            "serial_type_override",
+            "meter_type_unresolved",
         }
         gate_notes: list[dict | str] = []
         for warning in list(diag.get("warnings") or []):
@@ -4025,6 +5615,13 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
             ocr_data["resolved_kind"] = resolved_meter_kind
         if resolved_meter_label:
             ocr_data["resolved_type"] = resolved_meter_label
+    final_review_reason = None
+    if unresolved_water_review_only and not wrote_meter:
+        final_review_reason = "water_type_unresolved"
+    elif electric_uncorroborated_review_only and not wrote_meter:
+        final_review_reason = "electric_uncorroborated_fullframe"
+    elif same_file_cross_month_review_only and not wrote_meter:
+        final_review_reason = "same_file_cross_month_reuse"
 
     _set_api_review_trace(
         diag,
@@ -4040,6 +5637,7 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         event_status=("meter_written" if wrote_meter else "needs_review"),
         photo_event_id=(int(photo_event_id) if photo_event_id is not None else None),
         ydisk_path=ydisk_path,
+        reason_override=final_review_reason,
         serial_force_kind=(str(serial_force_kind) if serial_force_kind else None),
     )
 
@@ -4052,7 +5650,11 @@ async def photo_event(request: Request, file: UploadFile = File(None)):
         "photo_event_id": photo_event_id,
         "ydisk_path": ydisk_path,
         "apartment_id": apartment_id,
-        "event_status": status,
+        "event_status": (
+            "needs_review"
+            if ((unresolved_water_review_only or electric_uncorroborated_review_only or same_file_cross_month_review_only) and not wrote_meter)
+            else status
+        ),
         "ocr": ocr_data,
         "meter_kind": resolved_meter_kind,
         "meter_type_label": resolved_meter_label,

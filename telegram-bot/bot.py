@@ -6,9 +6,11 @@ import io
 import uuid
 import aiohttp
 import time
+import hashlib
 from typing import Optional, Dict, Any, List, Tuple
 from datetime import datetime
 from contextvars import ContextVar
+from pathlib import Path
 
 import logging
 logging.basicConfig(level=logging.INFO)
@@ -29,14 +31,16 @@ from aiogram.dispatcher.middlewares import BaseMiddleware
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_BASE = os.getenv("API_BASE", "http://api:8000").strip()
+ACTIVITY_FILE = os.getenv("RENT_ACTIVITY_FILE", "/runtime/last_activity").strip()
+ACTIVITY_TOUCH_ENABLED = os.getenv("RENT_ACTIVITY_TOUCH", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # ---- Timeouts (seconds)
 # IMPORTANT:
 # - bot must not block event-loop; all HTTP is done in threads
 # - API can be slow because of WebDAV upload; allow longer read timeout
-HTTP_CONNECT_TIMEOUT = 10
-HTTP_READ_TIMEOUT_PHOTO = 180
-HTTP_READ_TIMEOUT_FAST = 25
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_READ_TIMEOUT_PHOTO = float(os.getenv("HTTP_READ_TIMEOUT_PHOTO", "360"))
+HTTP_READ_TIMEOUT_FAST = float(os.getenv("HTTP_READ_TIMEOUT_FAST", "25"))
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(bot)
@@ -52,6 +56,18 @@ TG_FETCH_RETRY_EXC = (
     OSError,
     ConnectionError,
 )
+
+
+def _touch_activity() -> None:
+    if not ACTIVITY_TOUCH_ENABLED or not ACTIVITY_FILE:
+        return
+    try:
+        path = Path(ACTIVITY_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(str(int(time.time())), encoding="ascii")
+    except Exception:
+        # Activity tracking must not break Telegram update handling.
+        pass
 
 
 async def _retry_tg_send(coro_factory):
@@ -119,6 +135,14 @@ async def _download_tg_file(file_id: str) -> tuple[bytes, str]:
     stream = await _retry_tg_fetch(lambda: bot.download_file(f.file_path), op="download_file", file_id=file_id)
     payload = stream.read()
     return payload, str(f.file_path or "")
+
+
+def _file_unique_id_from_filename(filename: Optional[str]) -> Optional[str]:
+    name = str(filename or "").strip()
+    m = re.match(r"^photo_(.+)\.[A-Za-z0-9]+$", name)
+    if not m:
+        return None
+    return m.group(1)
 
 
 def _track_background_task(task: asyncio.Task) -> None:
@@ -219,6 +243,7 @@ class DebugUpdatesMiddleware(BaseMiddleware):
         except Exception:
             logging.exception("DEBUG_UPDATE failed")
         finally:
+            _touch_activity()
             if chat_id is not None:
                 CURRENT_CHAT_ID.set(chat_id)
 
@@ -244,7 +269,7 @@ MEDIA_GROUP_PENDING: Dict[Tuple[int, str], int] = {}
 MEDIA_GROUP_LAST_ACTIVITY: Dict[Tuple[int, str], float] = {}
 MEDIA_GROUP_ACKED: set[Tuple[int, str]] = set()
 MEDIA_GROUP_COLLECT_SEC = float(os.getenv("MEDIA_GROUP_COLLECT_SEC", "1.4"))
-SEQUENTIAL_PHOTO_BUFFER: Dict[int, List[Tuple[bytes, str, str]]] = {}
+SEQUENTIAL_PHOTO_BUFFER: Dict[int, List[Tuple[int, types.Message, bytes, str, str]]] = {}
 SEQUENTIAL_PHOTO_ANCHOR: Dict[int, types.Message] = {}
 SEQUENTIAL_PHOTO_TASKS: Dict[int, asyncio.Task] = {}
 SEQUENTIAL_PHOTO_ACKED: set[int] = set()
@@ -493,11 +518,17 @@ async def _http_get(url: str, *, params=None, read_timeout=HTTP_READ_TIMEOUT_FAS
 async def _post_photo_event(
     *,
     chat_id: int,
+    telegram_message_id: Optional[int] = None,
+    telegram_media_group_id: Optional[str] = None,
     telegram_username: Optional[str],
     phone: Optional[str],
     ym: str,
     meter_index: int,
     meter_index_mode: str = "auto",
+    client_file_unique_id: Optional[str] = None,
+    batch_item_index: Optional[int] = None,
+    batch_total: Optional[int] = None,
+    batch_kind: Optional[str] = None,
     file_bytes: Optional[bytes] = None,
     filename: Optional[str] = None,
     mime_type: Optional[str] = None,
@@ -535,6 +566,27 @@ async def _post_photo_event(
         "meter_index": str(meter_index),
         "meter_index_mode": str(meter_index_mode or "auto"),
     }
+    if file_payloads and len(file_payloads) == 1:
+        fb, fn, _mt = file_payloads[0]
+        data["client_file_sha256"] = hashlib.sha256(fb or b"").hexdigest()
+        data["client_file_size"] = str(len(fb or b""))
+        data["client_original_filename"] = str(fn or "")
+    elif file_bytes is not None:
+        data["client_file_sha256"] = hashlib.sha256(file_bytes or b"").hexdigest()
+        data["client_file_size"] = str(len(file_bytes or b""))
+        data["client_original_filename"] = str(filename or "")
+    if telegram_message_id is not None:
+        data["telegram_message_id"] = str(telegram_message_id)
+    if telegram_media_group_id:
+        data["telegram_media_group_id"] = str(telegram_media_group_id)
+    if client_file_unique_id:
+        data["client_file_unique_id"] = str(client_file_unique_id)
+    if batch_kind:
+        data["client_batch_kind"] = str(batch_kind)
+    if batch_item_index is not None:
+        data["client_batch_item_index"] = str(int(batch_item_index))
+    if batch_total is not None:
+        data["client_batch_total"] = str(int(batch_total))
     resp = await _http_post(url, data=data, files=files, read_timeout=HTTP_READ_TIMEOUT_PHOTO)
     payload = resp.json() if resp.ok else None
     return {
@@ -1008,6 +1060,10 @@ async def _handle_file_message(
     filename: Optional[str] = None,
     mime_type: Optional[str] = None,
     file_payloads: Optional[List[Tuple[bytes, str, str]]] = None,
+    client_file_unique_id: Optional[str] = None,
+    batch_item_index: Optional[int] = None,
+    batch_total: Optional[int] = None,
+    batch_kind: Optional[str] = None,
     response_prefix: str = "",
     allow_long_progress: bool = True,
 ):
@@ -1022,20 +1078,28 @@ async def _handle_file_message(
     if not payloads:
         await message.reply("Не удалось прочитать файл(ы). Пришлите фото ещё раз.", reply_markup=_kb_main())
         return _build_batch_result("error", reason="empty_payload")
+    if client_file_unique_id is None and len(payloads) == 1:
+        client_file_unique_id = _file_unique_id_from_filename(payloads[0][1])
 
     payload_summary = [
         {
             "filename": str(fn or "file.bin"),
             "bytes": len(b or b""),
             "mime": str(mt or "application/octet-stream"),
+            "sha16": hashlib.sha256(b or b"").hexdigest()[:16],
+            "file_unique_id": _file_unique_id_from_filename(fn),
         }
         for b, fn, mt in payloads
     ]
     logging.info(
-        "HANDLE_FILE start: chat_id=%s message_id=%s prefix=%r payloads=%s",
+        "HANDLE_FILE start: chat_id=%s message_id=%s prefix=%r batch=%s/%s:%s file_unique_id=%s payloads=%s",
         message.chat.id,
         message.message_id,
         response_prefix,
+        batch_item_index,
+        batch_total,
+        batch_kind,
+        client_file_unique_id,
         payload_summary,
     )
 
@@ -1099,21 +1163,31 @@ async def _handle_file_message(
             )
             r = await _post_photo_event(
                 chat_id=message.chat.id,
+                telegram_message_id=int(message.message_id),
+                telegram_media_group_id=(str(message.media_group_id) if message.media_group_id else None),
                 telegram_username=username,
                 phone=phone,
                 ym=ym,
                 meter_index=meter_index,
                 meter_index_mode="auto",
+                client_file_unique_id=client_file_unique_id,
+                batch_item_index=batch_item_index,
+                batch_total=batch_total,
+                batch_kind=batch_kind,
                 file_payloads=payloads,
             )
             logging.info(
-                "HANDLE_FILE backend_done: chat_id=%s message_id=%s prefix=%r http=%s trace_id=%s server_trace_id=%s",
+                "HANDLE_FILE backend_done: chat_id=%s message_id=%s prefix=%r batch=%s/%s:%s http=%s trace_id=%s server_trace_id=%s selected_file=%s",
                 message.chat.id,
                 message.message_id,
                 response_prefix,
+                batch_item_index,
+                batch_total,
+                batch_kind,
                 r.get("status_code"),
                 r.get("trace_id"),
                 r.get("server_trace_id"),
+                ((r.get("json") or {}).get("diag") or {}).get("selected_file") if isinstance(r.get("json"), dict) else None,
             )
         except requests.exceptions.ReadTimeout:
             await _reply_here(
@@ -1384,6 +1458,10 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
                     result = await _handle_file_message(
                         item_message,
                         file_payloads=[(payload, filename, mime)],
+                        client_file_unique_id=_file_unique_id_from_filename(filename),
+                        batch_item_index=idx,
+                        batch_total=total_items,
+                        batch_kind="media_group",
                         response_prefix=f"Фото {idx}/{total_items}.\n",
                         allow_long_progress=False,
                     )
@@ -1396,7 +1474,7 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
                         idx,
                         total_items,
                         item_message.message_id,
-                        (result or {}).get("status"),
+                        (result or {}).get("kind"),
                     )
                 except Exception:
                     logging.exception(
@@ -1409,7 +1487,14 @@ async def _flush_media_group(key: Tuple[int, str]) -> None:
                     batch_results.append(_build_batch_result("error", reason="handler_exception"))
         else:
             _mid, item_message, payload, filename, mime = items[0]
-            await _handle_file_message(item_message, file_payloads=[(payload, filename, mime)])
+            await _handle_file_message(
+                item_message,
+                file_payloads=[(payload, filename, mime)],
+                client_file_unique_id=_file_unique_id_from_filename(filename),
+                batch_item_index=1,
+                batch_total=1,
+                batch_kind="media_group",
+            )
         summary_text = _build_batch_summary(batch_results)
         if summary_text:
             await _safe_progress_message(key[0], summary_text)
@@ -1432,7 +1517,7 @@ async def _flush_sequential_photos(chat_id: int) -> None:
         anchor = SEQUENTIAL_PHOTO_ANCHOR.pop(chat_id, None)
         if not items or anchor is None:
             return
-        batch = items[:SEQUENTIAL_PHOTO_MAX_BATCH]
+        batch = list(items)
         logging.info(
             "TG sequential flush: chat_id=%s items=%s",
             chat_id,
@@ -1444,26 +1529,56 @@ async def _flush_sequential_photos(chat_id: int) -> None:
                 "Распознавание еще идет. Пришлю результат по каждому фото отдельно.",
                 delay_sec=float(LONG_PROCESS_NOTICE_SEC),
             )
-            for idx, item in enumerate(batch, start=1):
+            total_items = len(batch)
+            for idx, (_mid, item_message, payload, filename, mime) in enumerate(batch, start=1):
                 try:
+                    logging.info(
+                        "TG sequential item_start: chat_id=%s item=%s/%s message_id=%s filename=%s bytes=%s",
+                        chat_id,
+                        idx,
+                        total_items,
+                        item_message.message_id,
+                        filename,
+                        len(payload),
+                    )
                     result = await _handle_file_message(
-                        anchor,
-                        file_payloads=[item],
-                        response_prefix=f"Фото {idx}/{len(batch)}.\n",
+                        item_message,
+                        file_payloads=[(payload, filename, mime)],
+                        client_file_unique_id=_file_unique_id_from_filename(filename),
+                        batch_item_index=idx,
+                        batch_total=total_items,
+                        batch_kind="sequential",
+                        response_prefix=f"Фото {idx}/{total_items}.\n",
                         allow_long_progress=False,
                     )
                     if result:
                         batch_results.append(result)
+                    logging.info(
+                        "TG sequential item_done: chat_id=%s item=%s/%s message_id=%s result=%s",
+                        chat_id,
+                        idx,
+                        total_items,
+                        item_message.message_id,
+                        (result or {}).get("kind"),
+                    )
                 except Exception:
                     logging.exception(
                         "sequential item failed: chat_id=%s item=%s/%s",
                         chat_id,
                         idx,
-                        len(batch),
+                        total_items,
                     )
                     batch_results.append(_build_batch_result("error", reason="handler_exception"))
         else:
-            await _handle_file_message(anchor, file_payloads=batch)
+            _mid, item_message, payload, filename, mime = batch[0]
+            await _handle_file_message(
+                item_message,
+                file_payloads=[(payload, filename, mime)],
+                client_file_unique_id=_file_unique_id_from_filename(filename),
+                batch_item_index=1,
+                batch_total=1,
+                batch_kind="sequential",
+            )
         summary_text = _build_batch_summary(batch_results)
         if summary_text:
             await _safe_progress_message(chat_id, summary_text)
@@ -1477,7 +1592,7 @@ async def _flush_sequential_photos(chat_id: int) -> None:
 
 def _queue_sequential_photo(message: types.Message, payload: bytes, filename: str, mime: str) -> None:
     chat_id = int(message.chat.id)
-    SEQUENTIAL_PHOTO_BUFFER.setdefault(chat_id, []).append((payload, filename, mime))
+    SEQUENTIAL_PHOTO_BUFFER.setdefault(chat_id, []).append((int(message.message_id), message, payload, filename, mime))
     if chat_id not in SEQUENTIAL_PHOTO_ANCHOR:
         SEQUENTIAL_PHOTO_ANCHOR[chat_id] = message
     task = SEQUENTIAL_PHOTO_TASKS.get(chat_id)
@@ -1516,10 +1631,11 @@ async def _download_and_queue_media_group_photo(
     try:
         payload, _file_path = await _download_tg_file(file_id)
         logging.info(
-            "TG photo downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
+            "TG photo downloaded: chat_id=%s message_id=%s bytes=%s sha16=%s file_id=%s",
             message.chat.id,
             message.message_id,
             len(payload),
+            hashlib.sha256(payload).hexdigest()[:16],
             file_id,
         )
         MEDIA_GROUP_BUFFER.setdefault(key, []).append(
@@ -1557,10 +1673,11 @@ async def _download_and_queue_single_photo(message: types.Message, *, file_id: s
     try:
         payload, _file_path = await _download_tg_file(file_id)
         logging.info(
-            "TG photo downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
+            "TG photo downloaded: chat_id=%s message_id=%s bytes=%s sha16=%s file_id=%s",
             message.chat.id,
             message.message_id,
             len(payload),
+            hashlib.sha256(payload).hexdigest()[:16],
             file_id,
         )
         _queue_sequential_photo(
@@ -1586,10 +1703,11 @@ async def _download_and_handle_document(message: types.Message) -> None:
     try:
         payload, _file_path = await _download_tg_file(doc.file_id)
         logging.info(
-            "TG document downloaded: chat_id=%s message_id=%s bytes=%s file_id=%s",
+            "TG document downloaded: chat_id=%s message_id=%s bytes=%s sha16=%s file_id=%s",
             message.chat.id,
             message.message_id,
             len(payload),
+            hashlib.sha256(payload).hexdigest()[:16],
             doc.file_id,
         )
         await _handle_file_message(

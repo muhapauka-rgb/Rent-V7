@@ -3,6 +3,9 @@
   "cases": {
     "5.jpeg": {
       "path": "тест/5.jpeg",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128"
+      },
       "ocr": {
         "type": "ГВС",
         "reading": 991.89,
@@ -26,6 +29,9 @@
     },
     "4.jpeg": {
       "path": "тест/4.jpeg",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128"
+      },
       "ocr": {
         "type": "unknown",
         "reading": 877.0,

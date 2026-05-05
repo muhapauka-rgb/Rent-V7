@@ -1,0 +1,163 @@
+{
+  "description": "Recent Telegram JPEG baseline from photo_events #723..#728 on 2026-05-05. Image files are not committed; run with --dataset-root /private/tmp/rentv7_recent_20260505 after downloading them from Telegram.",
+  "cases": {
+    "recent_01_electric_2634": {
+      "path": "recent_01_electric_2634.jpg",
+      "tags": ["telegram", "electric", "baseline", "photo_event_723"],
+      "sha16": "c18b437613e76153",
+      "notes": "Observed production result from photo_event #723.",
+      "ocr": {
+        "sha16": "c18b437613e76153",
+        "type": "Электро",
+        "reading": 2634.0
+      },
+      "api": {
+        "sha16": "c18b437613e76153",
+        "meter_kind": "electric",
+        "meter_type_label": "Электро T1",
+        "ocr_reading": 2634.0,
+        "meter_written": true
+      }
+    },
+    "recent_02_hot_881_10": {
+      "path": "recent_02_hot_881_10.jpg",
+      "tags": ["telegram", "water", "hot", "serial-13076128", "baseline", "photo_event_724"],
+      "sha16": "11bcb46e13c802f2",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128",
+        "context_serial_prev": "13002714=1003.200;13076128=878.774"
+      },
+      "notes": "Observed production result from photo_event #724.",
+      "ocr": {
+        "sha16": "11bcb46e13c802f2",
+        "type": "ГВС",
+        "reading": 881.1,
+        "serial": "13 076128",
+        "winner_source": "template",
+        "winner_serial": "13076128"
+      },
+      "api": {
+        "sha16": "11bcb46e13c802f2",
+        "meter_kind": "hot",
+        "meter_type_label": "ГВС",
+        "ocr_reading": 881.1,
+        "ocr_serial": "13 076128",
+        "winner_source": "template",
+        "winner_serial": "13076128",
+        "meter_written": true
+      }
+    },
+    "recent_03_cold_1003_21": {
+      "path": "recent_03_cold_1003_21.jpg",
+      "tags": ["telegram", "water", "cold", "serial-13002714", "baseline", "photo_event_725"],
+      "sha16": "602a21a3fd11832b",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128",
+        "context_serial_prev": "13002714=1003.200;13076128=878.774"
+      },
+      "notes": "Observed production result from photo_event #725.",
+      "ocr": {
+        "sha16": "602a21a3fd11832b",
+        "type": "unknown",
+        "reading": 1003.21,
+        "serial": "13002714",
+        "winner_source": "template",
+        "winner_serial": "13002714"
+      },
+      "api": {
+        "sha16": "602a21a3fd11832b",
+        "meter_kind": "cold",
+        "meter_type_label": "ХВС",
+        "ocr_reading": 1003.21,
+        "ocr_serial": "13002714",
+        "winner_source": "template",
+        "winner_serial": "13002714",
+        "meter_written": true
+      }
+    },
+    "recent_04_cold_987_79": {
+      "path": "recent_04_cold_987_79.jpg",
+      "tags": ["telegram", "water", "cold", "serial-13002714", "baseline", "photo_event_726"],
+      "sha16": "a18f29c75b82e0fc",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128",
+        "context_serial_prev": "13002714=1003.200;13076128=878.774"
+      },
+      "notes": "Observed production result from photo_event #726.",
+      "ocr": {
+        "sha16": "a18f29c75b82e0fc",
+        "type": "ГВС",
+        "reading": 987.79,
+        "serial": "13 002714",
+        "winner_source": "template",
+        "winner_serial": "13002714"
+      },
+      "api": {
+        "sha16": "a18f29c75b82e0fc",
+        "meter_kind": "cold",
+        "meter_type_label": "ХВС",
+        "ocr_reading": 987.79,
+        "ocr_serial": "13 002714",
+        "winner_source": "template",
+        "winner_serial": "13002714",
+        "meter_written": true
+      }
+    },
+    "recent_05_hot_871_52": {
+      "path": "recent_05_hot_871_52.jpg",
+      "tags": ["telegram", "water", "hot", "serial-13076128", "baseline", "photo_event_727"],
+      "sha16": "a30118497f4bd2f8",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128",
+        "context_serial_prev": "13002714=1003.200;13076128=878.774"
+      },
+      "notes": "Observed production result from photo_event #727.",
+      "ocr": {
+        "sha16": "a30118497f4bd2f8",
+        "type": "ГВС",
+        "reading": 871.52,
+        "serial": "13 076128",
+        "winner_source": "template",
+        "winner_serial": "13076128"
+      },
+      "api": {
+        "sha16": "a30118497f4bd2f8",
+        "meter_kind": "hot",
+        "meter_type_label": "ГВС",
+        "ocr_reading": 871.52,
+        "ocr_serial": "13 076128",
+        "winner_source": "template",
+        "winner_serial": "13076128",
+        "meter_written": true
+      }
+    },
+    "recent_06_cold_999_67": {
+      "path": "recent_06_cold_999_67.jpg",
+      "tags": ["telegram", "water", "cold", "serial-13002714", "baseline", "photo_event_728"],
+      "sha16": "8d13aafea8381ded",
+      "ocr_context": {
+        "context_serial_hint": "13002714,13076128",
+        "context_serial_prev": "13002714=1003.200;13076128=878.774"
+      },
+      "notes": "Observed production result from photo_event #728.",
+      "ocr": {
+        "sha16": "8d13aafea8381ded",
+        "type": "ХВС",
+        "reading": 999.67,
+        "serial": "13 002714",
+        "winner_source": "template",
+        "winner_serial": "13002714"
+      },
+      "api": {
+        "sha16": "8d13aafea8381ded",
+        "meter_kind": "cold",
+        "meter_type_label": "ХВС",
+        "ocr_reading": 999.67,
+        "ocr_serial": "13 002714",
+        "winner_source": "template",
+        "winner_serial": "13002714",
+        "meter_written": true
+      }
+    }
+  }
+}

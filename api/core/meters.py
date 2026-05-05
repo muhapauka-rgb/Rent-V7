@@ -202,10 +202,12 @@ def _write_water_ocr_with_uncertainty(
             )
 
         # после пересортировки определяем фактический тип текущего значения
-        if abs(float(value) - float(cold_item["value"])) <= 1e-9 and abs(float(value) - float(hot_item["value"])) <= 1e-9:
-            assigned_type = "cold"
-        else:
-            assigned_type = "cold" if float(value) >= float(hot_item["value"]) else "hot"
+        assigned_type = _assigned_type_after_water_sort(
+            float(value),
+            hot_value=float(hot_item["value"]),
+            cold_value=float(cold_item["value"]),
+            fallback_kind=kind,
+        )
 
         # если есть неопределённость — подсветить только значение, которому соответствует это фото
         if uncertain:
@@ -218,6 +220,32 @@ def _write_water_ocr_with_uncertainty(
         _ensure_review_flag(conn, int(apartment_id), str(ym), str(kind), 1, _WATER_UNCERTAIN_REASON)
 
     return str(kind)
+
+
+def _assigned_type_after_water_sort(
+    value: float,
+    *,
+    hot_value: float,
+    cold_value: float,
+    fallback_kind: str | None = None,
+) -> str:
+    """
+    Return which sorted water slot belongs to the current incoming value.
+    Sorting itself is min->hot/max->cold; this helper avoids treating the hot
+    value as cold just because it is >= itself.
+    """
+    val = float(value)
+    hot = float(hot_value)
+    cold = float(cold_value)
+    fallback = str(fallback_kind or "").lower().strip()
+    eps = 1e-9
+    if abs(val - hot) <= eps and abs(val - cold) <= eps:
+        return fallback if fallback in ("cold", "hot") else "cold"
+    if abs(val - hot) <= eps:
+        return "hot"
+    if abs(val - cold) <= eps:
+        return "cold"
+    return "cold" if abs(val - cold) <= abs(val - hot) else "hot"
 
 
 def _normalize_water_after_manual(conn, apartment_id: int, ym: str) -> None:
